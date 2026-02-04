@@ -312,18 +312,18 @@ class LoopManager:
                 '  "new_loops": [\n'
                 '    {"type": "commitment|decision|friction|habit|thread", "text": "...", "confidence": 0-1, '
                 '"salience": 1-5, "time_horizon": "today|this_week|ongoing", '
-                '"due_date": "YYYY-MM-DD" | null, "entity_refs": ["..."], "tags": ["..."], "reason": "..."}\n'
+                '"due_date": "YYYY-MM-DD" | null, "entity_refs": ["..."], "tags": ["..."], "reason": "max 12 words"}\n'
                 "  ],\n"
-                '  "reinforced_loops": [ {"loop_id": "...", "confidence": 0-1, "reason": "..."} ],\n'
-                '  "completed_loops": [ {"loop_id": "...", "confidence": 0-1, "reason": "...", '
+                '  "reinforced_loops": [ {"loop_id": "...", "confidence": 0-1, "reason": "max 12 words"} ],\n'
+                '  "completed_loops": [ {"loop_id": "...", "confidence": 0-1, "reason": "max 12 words", '
                 '"evidence_text": "...", "evidence_type": "explicit|implicit"} ],\n'
-                '  "dropped_loops":   [ {"loop_id": "...", "confidence": 0-1, "reason": "..."} ]\n'
+                '  "dropped_loops":   [ {"loop_id": "...", "confidence": 0-1, "reason": "max 12 words"} ]\n'
                 "}\n"
             )
 
             response = await self.llm_client._call_llm(
                 prompt=prompt,
-                max_tokens=300,
+                max_tokens=600,
                 temperature=0.1,
                 task="loops"
             )

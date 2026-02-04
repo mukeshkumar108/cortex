@@ -219,6 +219,8 @@ JSON:"""
             }
             if self.reasoning_enabled:
                 payload["reasoning"] = {"enabled": True}
+            if task == "loops":
+                payload["response_format"] = {"type": "json_object"}
 
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(
