@@ -34,7 +34,7 @@ Last updated: 2026-02-04
 - `loops` (PK: id)
 - `user_identity` (PK: tenant_id, user_id)
 - `schema_migrations`
-- `identity_cache` (present but not used)
+- `identity_cache` (legacy; present but unused)
 
 ### Key columns
 - `session_buffer`: messages (jsonb array), rolling_summary (text), closed_at (timestamptz)
@@ -79,7 +79,7 @@ Last updated: 2026-02-04
 - Folding falls back to safe behavior or reschedules; outbox retries continue.
 
 ## 5) /brief read-path contract + Graphiti query strategy
-- Tier 1: Postgres (identity, workingMemory, rollingSummary, activeLoops, nudgeCandidates)
+- Tier 1: Postgres (identity from `user_identity`, workingMemory, rollingSummary, activeLoops, nudgeCandidates)
 - Tier 2: Graphiti (facts/entities) only if `query` is provided
 - `reference_time=now` is passed to Graphiti search calls when supported
 - `episodeBridge` is fetched from latest session summary episode
@@ -138,4 +138,3 @@ Last updated: 2026-02-04
 - Example: user says “I just had a fight with Ashley.”
   - If Ashley exists in Graphiti, orchestrator should call `/brief` with `query: "Ashley"` or a short user query.
   - /brief will return facts/entities if Graphiti has them; otherwise only local memory.
-
