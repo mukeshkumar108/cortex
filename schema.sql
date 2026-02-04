@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS session_buffer (
     updated_at TIMESTAMP DEFAULT NOW(),
     PRIMARY KEY (tenant_id, session_id),
     CONSTRAINT session_buffer_messages_len_check
-        CHECK (jsonb_array_length(COALESCE(messages, '[]'::jsonb)) <= 6)
+        CHECK (jsonb_array_length(COALESCE(messages, '[]'::jsonb)) <= 12)
 );
 
 CREATE INDEX IF NOT EXISTS idx_session_buffer_user 

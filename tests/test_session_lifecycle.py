@@ -250,7 +250,7 @@ async def test_rolling_summary():
             transport=ASGITransport(app=app),
             base_url="http://test"
         ) as client:
-            for i in range(8):
+            for i in range(14):
                 await client.post(
                     "/ingest",
                     json={
@@ -282,7 +282,7 @@ async def test_rolling_summary():
         messages = row["messages"]
         if isinstance(messages, str):
             messages = json.loads(messages)
-        assert len(messages) == 6
+        assert len(messages) == 12
     finally:
         await conn.close()
 

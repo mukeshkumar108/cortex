@@ -3,7 +3,7 @@ Ingestion Pipeline - Sliding Window Architecture
 
 Flow:
 1. Add turn to session buffer
-2. If buffer exceeds 6 turns, trigger janitor (background)
+2. If buffer exceeds 12 messages, trigger janitor (background)
 3. Check for session close (gap > 30 min)
 4. Extract loops from recent turns (background)
 5. Return immediately (don't block on background tasks)
@@ -73,16 +73,37 @@ async def ingest(
             timestamp=request.timestamp
         )
 
-        # 3. IF BUFFER EXCEEDED, TRIGGER JANITOR (background)
-        if oldest_turn:
-            logger.info(f"Buffer exceeded 6 turns, triggering janitor for {session_id}")
-            background_tasks.add_task(
-                session.janitor_process,
+        # 3. IF BUFFER EXCEEDED, TRIGGER JANITOR (background, gated)
+        if oldest_turn and request.role == "user":
+            outbox_count = await session.get_outbox_count(
                 tenant_id=request.tenantId,
                 session_id=session_id,
-                user_id=request.userId,
-                graphiti_client=graphiti_client
+                user_id=request.userId
             )
+            last_run = await session.get_last_janitor_run_at(
+                tenant_id=request.tenantId,
+                session_id=session_id
+            )
+            now_ts = datetime.utcnow()
+            elapsed = (now_ts - last_run).total_seconds() if last_run else None
+            if outbox_count >= 8 and (elapsed is None or elapsed >= 60):
+                await session.set_last_janitor_run_at(
+                    tenant_id=request.tenantId,
+                    session_id=session_id,
+                    ts=now_ts
+                )
+                logger.info(
+                    f"Triggering janitor for {session_id} "
+                    f"(reason=threshold+cooldown, outbox_count={outbox_count}, "
+                    f"elapsed={int(elapsed) if elapsed is not None else 'none'}s)"
+                )
+                background_tasks.add_task(
+                    session.janitor_process,
+                    tenant_id=request.tenantId,
+                    session_id=session_id,
+                    user_id=request.userId,
+                    graphiti_client=graphiti_client
+                )
 
         # 4. IDENTITY UPDATES (best-effort, cheap)
         updates = extract_identity_updates(request.text)

@@ -22,7 +22,7 @@ def _db_url() -> str:
 
 
 @pytest.mark.asyncio
-async def test_sliding_window_never_exceeds_6():
+async def test_sliding_window_never_exceeds_12():
     tenant = f"tenant-{uuid4().hex}"
     user = f"user-{uuid4().hex}"
     session_id = f"session-{uuid4().hex}"
@@ -52,13 +52,13 @@ async def test_sliding_window_never_exceeds_6():
         )
         if isinstance(messages, str):
             messages = json.loads(messages)
-        assert len(messages) <= 6
+        assert len(messages) <= 12
     finally:
         await conn.close()
 
 
 @pytest.mark.asyncio
-async def test_concurrent_ingest_never_exceeds_6():
+async def test_concurrent_ingest_never_exceeds_12():
     tenant = f"tenant-{uuid4().hex}"
     user = f"user-{uuid4().hex}"
     session_id = f"session-{uuid4().hex}"
@@ -96,7 +96,7 @@ async def test_concurrent_ingest_never_exceeds_6():
         )
         if isinstance(messages, str):
             messages = json.loads(messages)
-        assert len(messages) <= 6
+        assert len(messages) <= 12
 
         outbox_count = await conn.fetchval(
             """
@@ -108,7 +108,7 @@ async def test_concurrent_ingest_never_exceeds_6():
             user,
             session_id
         )
-        assert outbox_count == total_turns - 6
+        assert outbox_count == total_turns - 12
     finally:
         await conn.close()
 
@@ -121,7 +121,7 @@ async def test_eviction_writes_outbox():
     now = datetime.utcnow()
 
     async with app.router.lifespan_context(app):
-        for i in range(7):
+        for i in range(13):
             await session_module.add_turn(
                 tenant_id=tenant,
                 session_id=session_id,
@@ -162,7 +162,7 @@ async def test_janitor_marks_outbox_sent():
     llm_client._call_llm = lambda *args, **kwargs: asyncio.sleep(0, result="summary")
 
     async with app.router.lifespan_context(app):
-        for i in range(7):
+        for i in range(13):
             await session_module.add_turn(
                 tenant_id=tenant,
                 session_id=session_id,
@@ -208,7 +208,7 @@ async def test_janitor_accepts_add_episode_without_metadata_param():
             raise AssertionError("add_episode should not be called when per-turn is disabled")
 
     async with app.router.lifespan_context(app):
-        for i in range(7):
+        for i in range(13):
             await session_module.add_turn(
                 tenant_id=tenant,
                 session_id=session_id,
@@ -256,7 +256,7 @@ async def test_janitor_dead_letters_permanent_errors():
         settings = session_module._manager.settings
         original = settings.graphiti_per_turn
         settings.graphiti_per_turn = True
-        for i in range(7):
+        for i in range(13):
             await session_module.add_turn(
                 tenant_id=tenant,
                 session_id=session_id,
@@ -307,7 +307,7 @@ async def test_janitor_retries_transient_errors_with_backoff():
         settings = session_module._manager.settings
         original = settings.graphiti_per_turn
         settings.graphiti_per_turn = True
-        for i in range(7):
+        for i in range(13):
             await session_module.add_turn(
                 tenant_id=tenant,
                 session_id=session_id,
@@ -352,7 +352,7 @@ async def test_internal_drain_endpoint_drains_outbox():
     llm_client._call_llm = lambda *args, **kwargs: asyncio.sleep(0, result="summary")
 
     async with app.router.lifespan_context(app):
-        for i in range(7):
+        for i in range(13):
             await session_module.add_turn(
                 tenant_id=tenant,
                 session_id=session_id,
@@ -400,7 +400,7 @@ async def test_drain_claims_null_next_attempt_at():
     llm_client._call_llm = lambda *args, **kwargs: asyncio.sleep(0, result="summary")
 
     async with app.router.lifespan_context(app):
-        for i in range(7):
+        for i in range(13):
             await session_module.add_turn(
                 tenant_id=tenant,
                 session_id=session_id,
@@ -453,7 +453,7 @@ async def test_drain_budget_returns_quickly():
                 return {"success": True}
 
         graphiti_client.add_episode = _SlowGraph().add_episode
-        for i in range(7):
+        for i in range(13):
             await session_module.add_turn(
                 tenant_id=tenant,
                 session_id=session_id,
@@ -514,7 +514,7 @@ async def test_outbox_retry_on_graphiti_failure():
         settings = session_module._manager.settings
         original = settings.graphiti_per_turn
         settings.graphiti_per_turn = True
-        for i in range(7):
+        for i in range(13):
             await session_module.add_turn(
                 tenant_id=tenant,
                 session_id=session_id,
@@ -585,7 +585,7 @@ async def test_outbox_folding_not_repeated_on_retry():
         original = settings.graphiti_per_turn
         settings.graphiti_per_turn = True
         graphiti_client.add_episode = _flaky_add_episode
-        for i in range(7):
+        for i in range(13):
             await session_module.add_turn(
                 tenant_id=tenant,
                 session_id=session_id,
@@ -692,7 +692,7 @@ async def test_tenant_isolation_outbox():
     llm_client._call_llm = lambda *args, **kwargs: asyncio.sleep(0, result="summary")
 
     async with app.router.lifespan_context(app):
-        for i in range(7):
+        for i in range(13):
             await session_module.add_turn(
                 tenant_id=tenant_a,
                 session_id=session_id,
@@ -701,7 +701,7 @@ async def test_tenant_isolation_outbox():
                 text=f"turn {i}",
                 timestamp=(now + timedelta(seconds=i)).isoformat() + "Z"
             )
-        for i in range(7):
+        for i in range(13):
             await session_module.add_turn(
                 tenant_id=tenant_b,
                 session_id=session_id,
@@ -732,8 +732,8 @@ async def test_tenant_isolation_outbox():
             tenant_b,
             session_id
         )
-        assert count_a == 7
-        assert count_b == 7
+        assert count_a == 13
+        assert count_b == 13
         assert f"{tenant_a}__{user}" in fake_graph.group_ids
         assert f"{tenant_b}__{user}" in fake_graph.group_ids
     finally:

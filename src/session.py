@@ -2,8 +2,8 @@
 Session Manager - Sliding Window Architecture
 
 The session_buffer is a sliding window, not a growing log:
-- Always contains: 1 rolling_summary + last 6 raw turns
-- When a 7th turn arrives, oldest turn gets folded into rolling_summary and sent to Graphiti
+- Always contains: 1 rolling_summary + last 12 messages (6 user+assistant turns)
+- When a 13th message arrives, oldest message gets folded into rolling_summary and sent to Graphiti
 - Buffer size stays constant
 
 Rolling summary is a compressor, not a memory:
@@ -28,7 +28,7 @@ from .openrouter_client import get_llm_client
 logger = logging.getLogger(__name__)
 
 # Constants
-MAX_BUFFER_SIZE = 6
+MAX_BUFFER_SIZE = 12
 MAX_OUTBOX_ATTEMPTS = 5
 OUTBOX_BASE_BACKOFF_SECONDS = 5
 OUTBOX_MAX_BACKOFF_SECONDS = 300
@@ -234,6 +234,57 @@ class SessionManager:
             turn["text"],
             ts
         )
+
+    async def get_outbox_count(
+        self,
+        tenant_id: str,
+        session_id: str,
+        user_id: str
+    ) -> int:
+        query = """
+            SELECT COUNT(*)
+            FROM graphiti_outbox
+            WHERE tenant_id = $1 AND session_id = $2 AND user_id = $3
+              AND status = 'pending'
+        """
+        return int(await self.db.fetchval(query, tenant_id, session_id, user_id) or 0)
+
+    async def get_last_janitor_run_at(
+        self,
+        tenant_id: str,
+        session_id: str
+    ) -> Optional[datetime]:
+        query = """
+            SELECT session_state->>'last_janitor_run_at' AS last_run
+            FROM session_buffer
+            WHERE tenant_id = $1 AND session_id = $2
+        """
+        row = await self.db.fetchone(query, tenant_id, session_id)
+        if not row or not row.get("last_run"):
+            return None
+        try:
+            return datetime.fromisoformat(row["last_run"].replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    async def set_last_janitor_run_at(
+        self,
+        tenant_id: str,
+        session_id: str,
+        ts: datetime
+    ) -> None:
+        query = """
+            UPDATE session_buffer
+            SET session_state = jsonb_set(
+                COALESCE(session_state, '{}'::jsonb),
+                '{last_janitor_run_at}',
+                to_jsonb($3::text),
+                true
+            ),
+                updated_at = NOW()
+            WHERE tenant_id = $1 AND session_id = $2
+        """
+        await self.db.execute(query, tenant_id, session_id, ts.isoformat())
 
     async def _save_buffer(self, buffer: Dict[str, Any]) -> None:
         """Save buffer to database"""
@@ -758,7 +809,7 @@ Do not include filler or meta-commentary."""
         tenant_id: str,
         session_id: str
     ) -> List[Message]:
-        """Get working memory (last 6 turns) from buffer"""
+        """Get working memory (last 12 messages) from buffer"""
         try:
             query = """
                 SELECT messages FROM session_buffer
@@ -1130,6 +1181,35 @@ async def janitor_process(
     if _manager is None:
         raise RuntimeError("SessionManager not initialized")
     await _manager.janitor_process(tenant_id, session_id, user_id, graphiti_client)
+
+
+async def get_outbox_count(
+    tenant_id: str,
+    session_id: str,
+    user_id: str
+) -> int:
+    if _manager is None:
+        raise RuntimeError("SessionManager not initialized")
+    return await _manager.get_outbox_count(tenant_id, session_id, user_id)
+
+
+async def get_last_janitor_run_at(
+    tenant_id: str,
+    session_id: str
+) -> Optional[datetime]:
+    if _manager is None:
+        raise RuntimeError("SessionManager not initialized")
+    return await _manager.get_last_janitor_run_at(tenant_id, session_id)
+
+
+async def set_last_janitor_run_at(
+    tenant_id: str,
+    session_id: str,
+    ts: datetime
+) -> None:
+    if _manager is None:
+        raise RuntimeError("SessionManager not initialized")
+    await _manager.set_last_janitor_run_at(tenant_id, session_id, ts)
 
 
 async def drain_outbox(
