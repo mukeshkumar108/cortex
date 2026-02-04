@@ -172,7 +172,8 @@ async def _extract_loops_from_recent_turns(
             persona_id=persona_id,
             user_text=recent_turns[-1]["text"],
             recent_turns=recent_context,
-            source_turn_ts=datetime.fromisoformat(source_turn_ts.replace('Z', '+00:00'))
+            source_turn_ts=datetime.fromisoformat(source_turn_ts.replace('Z', '+00:00')),
+            session_id=session_id
         )
 
         logger.info(f"Loop extraction completed for session {session_id}")

@@ -278,7 +278,8 @@ class LoopManager:
         persona_id: str,
         user_text: str,
         recent_turns: List[Dict[str, Any]],
-        source_turn_ts: datetime
+        source_turn_ts: datetime,
+        session_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Extract loops from conversation context using LLM.
@@ -303,11 +304,27 @@ class LoopManager:
             prompt = (
                 "You are Synapse Loops v1. Use semantic meaning; be language-agnostic.\n"
                 "Primary goal: procedural memory with low noise.\n\n"
+                "Rules (low-noise):\n"
+                "- Only create a new loop if it is:\n"
+                "  (a) actionable commitment with future intent OR\n"
+                "  (b) recurring habit/pattern OR\n"
+                "  (c) persistent friction OR\n"
+                "  (d) ongoing thread/project OR\n"
+                "  (e) durable decision affecting future actions.\n"
+                "- Do NOT create loops for one-off ephemeral actions like \"going for a walk today\" unless it is a habit/plan to repeat.\n"
+                "- type=\"habit\": require signals like \"often\", \"always\", \"every day/week\", \"I keep\", \"habit\", \"routine\".\n"
+                "- type=\"thread\": require multi-step or ongoing work (project).\n"
+                "- type=\"friction\": require repeated struggle/pattern language.\n"
+                "- type=\"decision\": must be a stable choice that affects future actions.\n"
+                "- \"text\" must be <= 12 words and start with a verb where possible.\n"
+                "- \"reason\" max 12 words.\n\n"
                 "INPUT:\n"
                 f"- current_user_turn: {user_text}\n"
                 f"- recent_context (last 1-2 turns):\n{recent_context}\n"
                 f"- active_loops (id/type/text/salience): {json.dumps(loops_block)}\n\n"
-                "OUTPUT: strict JSON only, no prose.\n"
+                "OUTPUT: strict JSON only, no prose. ALL keys must be present and arrays (possibly empty).\n"
+                "Empty output example:\n"
+                "{\"new_loops\":[],\"reinforced_loops\":[],\"completed_loops\":[],\"dropped_loops\":[]}\n"
                 "{\n"
                 '  "new_loops": [\n'
                 '    {"type": "commitment|decision|friction|habit|thread", "text": "...", "confidence": 0-1, '
@@ -324,25 +341,31 @@ class LoopManager:
             response = await self.llm_client._call_llm(
                 prompt=prompt,
                 max_tokens=600,
-                temperature=0.1,
+                temperature=0.0,
                 task="loops"
             )
 
-            if not response or not str(response).strip():
+            if not response or (isinstance(response, str) and not response.strip()):
                 logger.warning("LLM returned empty response for loop extraction")
                 return {"new_loops": 0, "completions": 0}
 
-            raw = str(response).strip()
-            extracted = self._parse_loop_json(raw)
+            extracted = self._safe_parse_loop_payload(response)
             if extracted is None:
-                preview = raw[:500].replace("\n", "\\n")
-                logger.warning(f"Loop JSON parse failed; response preview: {preview}")
+                preview = ""
+                if isinstance(response, str):
+                    preview = response[:300].replace("\n", "\\n")
+                request_id = uuid4().hex
+                logger.warning(
+                    f"Loop JSON parse failed (request_id={request_id}, session_id={session_id}); "
+                    f"response preview: {preview}"
+                )
                 return {"new_loops": 0, "completions": 0}
 
             if not isinstance(extracted, dict):
                 logger.warning("Loop extraction response was not a JSON object")
                 return {"new_loops": 0, "completions": 0}
 
+            extracted = self._normalize_loop_payload(extracted)
             new_loops = extracted.get("new_loops") or []
             reinforced = extracted.get("reinforced_loops") or []
             completed = extracted.get("completed_loops") or []
@@ -692,10 +715,14 @@ class LoopManager:
         return embedding
 
     @staticmethod
-    def _parse_loop_json(raw: str) -> Optional[Dict[str, Any]]:
-        if not raw or not str(raw).strip():
+    def _safe_parse_loop_payload(raw: Any) -> Optional[Dict[str, Any]]:
+        if raw is None:
             return None
-        text = str(raw).strip()
+        if isinstance(raw, dict):
+            return raw
+        if not isinstance(raw, str):
+            return None
+        text = raw.strip()
         if text.startswith("```"):
             text = text.strip("`").strip()
         text = text.replace("\r", "")
@@ -715,6 +742,15 @@ class LoopManager:
                 return json.loads(repaired)
             except json.JSONDecodeError:
                 return None
+
+    @staticmethod
+    def _normalize_loop_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "new_loops": payload.get("new_loops") or [],
+            "reinforced_loops": payload.get("reinforced_loops") or [],
+            "completed_loops": payload.get("completed_loops") or [],
+            "dropped_loops": payload.get("dropped_loops") or []
+        }
 
     async def _check_similarity(
         self,
@@ -841,11 +877,12 @@ async def extract_and_create_loops(
     persona_id: str,
     user_text: str,
     recent_turns: List[Dict[str, Any]],
-    source_turn_ts: datetime
+    source_turn_ts: datetime,
+    session_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """Extract and create loops from conversation context"""
     if _manager is None:
         raise RuntimeError("LoopManager not initialized")
     return await _manager.extract_and_create_loops(
-        tenant_id, user_id, persona_id, user_text, recent_turns, source_turn_ts
+        tenant_id, user_id, persona_id, user_text, recent_turns, source_turn_ts, session_id
     )

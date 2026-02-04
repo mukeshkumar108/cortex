@@ -104,6 +104,45 @@ async def test_loop_extraction_types(loop_type, due_date):
 
 
 @pytest.mark.asyncio
+async def test_loop_prompt_contains_rules_and_empty_example():
+    tenant = f"tenant-{uuid4().hex}"
+    user = f"user-{uuid4().hex}"
+    persona = "persona"
+    now = datetime.utcnow()
+    captured = {}
+
+    llm_client = get_llm_client()
+
+    async def _capture(*args, **kwargs):
+        captured["prompt"] = kwargs.get("prompt") or (args[0] if args else "")
+        return json.dumps({
+            "new_loops": [],
+            "reinforced_loops": [],
+            "completed_loops": [],
+            "dropped_loops": []
+        })
+
+    async with app.router.lifespan_context(app):
+        if loops_module._manager is not None:
+            async def _embed(_text):
+                return _ZERO_VECTOR_1536
+            loops_module._manager._generate_embedding = _embed
+        llm_client._call_llm = _capture
+        await loops_module.extract_and_create_loops(
+            tenant_id=tenant,
+            user_id=user,
+            persona_id=persona,
+            user_text="test context",
+            recent_turns=[{"role": "user", "text": "test context"}],
+            source_turn_ts=now
+        )
+
+    prompt = captured.get("prompt", "")
+    assert "\"new_loops\":[],\"reinforced_loops\":[],\"completed_loops\":[],\"dropped_loops\":[]" in prompt
+    assert "Only create a new loop if it is" in prompt
+
+
+@pytest.mark.asyncio
 async def test_salience_bump_on_existing_loop():
     tenant = f"tenant-{uuid4().hex}"
     user = f"user-{uuid4().hex}"
