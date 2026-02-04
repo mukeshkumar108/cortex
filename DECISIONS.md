@@ -65,7 +65,7 @@ session_buffer (tenant_id, session_id)
 - Writes to session_buffer immediately; background tasks handle heavy work
 
 ## Model Routing Policy v1
-- summary → `OPENROUTER_MODEL_SUMMARY` (default `amazon/nova-micro`)
+- summary → `OPENROUTER_MODEL_SUMMARY` (default `amazon/nova-micro-v1`)
 - loops → `OPENROUTER_MODEL_LOOPS` (default `xiaomi/mimo-v2-flash`)
 - session_episode → `OPENROUTER_MODEL_SESSION_EPISODE` (default `xiaomi/mimo-v2-flash`)
 - fallback → `OPENROUTER_MODEL_FALLBACK` (default `mistral/ministral-3b`)
@@ -82,4 +82,3 @@ session_buffer (tenant_id, session_id)
 - No deterministic identity extraction from regex beyond lightweight hints
 - No automatic recall; orchestrator must pass `query`
 - No metrics/alerts (logging only)
-

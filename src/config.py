@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     openrouter_api_key: Optional[str] = None  # Falls back to openai_api_key
     openrouter_model: str = "anthropic/claude-3.5-haiku"
     llm_timeout: int = 10  # seconds
-    openrouter_model_summary: str = "amazon/nova-micro"
+    openrouter_model_summary: str = "amazon/nova-micro-v1"
     openrouter_model_loops: str = "xiaomi/mimo-v2-flash"
     openrouter_model_session_episode: str = "xiaomi/mimo-v2-flash"
     openrouter_model_fallback: str = "mistral/ministral-3b"
