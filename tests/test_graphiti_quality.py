@@ -78,6 +78,34 @@ async def test_search_uses_rerank_and_reference_time():
 
 
 @pytest.mark.asyncio
+async def test_blank_query_skips_graphiti_search():
+    class _FakeGraph:
+        def __init__(self):
+            self.last_kwargs = None
+
+        async def search(self, **kwargs):
+            self.last_kwargs = kwargs
+            return []
+
+    fake_graph = _FakeGraph()
+    graphiti_client.client = fake_graph
+    graphiti_client._initialized = True
+
+    async with app.router.lifespan_context(app):
+        await build_briefing(
+            tenant_id="tenant",
+            user_id="user",
+            persona_id="persona",
+            session_id=None,
+            query="   ",
+            now=datetime.utcnow(),
+            graphiti_client=graphiti_client
+        )
+
+    assert fake_graph.last_kwargs is None
+
+
+@pytest.mark.asyncio
 async def test_episode_bridge_returned_for_new_session():
     async def _recent(*_args, **_kwargs):
         return [{"name": "session_summary_abc", "text": "welcome back"}]

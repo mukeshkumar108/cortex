@@ -10,6 +10,7 @@ from typing import List, Optional, Dict, Any
 from uuid import UUID, uuid4
 from datetime import datetime
 import logging
+import re
 import json
 import openai
 from .db import Database
@@ -334,6 +335,8 @@ class LoopManager:
             raw = str(response).strip()
             if raw.startswith("```"):
                 raw = raw.strip("`").strip()
+            raw = raw.replace("\r", "")
+            raw = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", raw)
             if not raw.startswith("{"):
                 start = raw.find("{")
                 end = raw.rfind("}")

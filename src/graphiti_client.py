@@ -195,6 +195,8 @@ class GraphitiClient:
         Returns fact strings representing relationships and attributes
         extracted by Graphiti's LLM. Formats facts as readable sentences.
         """
+        if not query or not str(query).strip():
+            return []
         if not self._initialized:
             await self.initialize()
         if not self._initialized or self.client is None:
@@ -271,6 +273,8 @@ class GraphitiClient:
         Returns entity summaries representing people, places, concepts
         extracted by Graphiti's LLM. Filters out edges/predicates.
         """
+        if not query or not str(query).strip():
+            return []
         if not self._initialized:
             await self.initialize()
         if not self._initialized or self.client is None:
