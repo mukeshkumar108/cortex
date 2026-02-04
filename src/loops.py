@@ -333,19 +333,10 @@ class LoopManager:
                 return {"new_loops": 0, "completions": 0}
 
             raw = str(response).strip()
-            if raw.startswith("```"):
-                raw = raw.strip("`").strip()
-            raw = raw.replace("\r", "")
-            raw = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", raw)
-            if not raw.startswith("{"):
-                start = raw.find("{")
-                end = raw.rfind("}")
-                if start != -1 and end != -1 and end > start:
-                    raw = raw[start:end + 1]
-            try:
-                extracted = json.loads(raw)
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse loop extraction JSON: {e}")
+            extracted = self._parse_loop_json(raw)
+            if extracted is None:
+                preview = raw[:500].replace("\n", "\\n")
+                logger.warning(f"Loop JSON parse failed; response preview: {preview}")
                 return {"new_loops": 0, "completions": 0}
 
             if not isinstance(extracted, dict):
@@ -699,6 +690,31 @@ class LoopManager:
         if isinstance(embedding, list):
             return "[" + ",".join(str(x) for x in embedding) + "]"
         return embedding
+
+    @staticmethod
+    def _parse_loop_json(raw: str) -> Optional[Dict[str, Any]]:
+        if not raw or not str(raw).strip():
+            return None
+        text = str(raw).strip()
+        if text.startswith("```"):
+            text = text.strip("`").strip()
+        text = text.replace("\r", "")
+        text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+        text = text.replace("“", "\"").replace("”", "\"").replace("’", "'")
+        if not text.startswith("{"):
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                text = text[start:end + 1]
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Try removing trailing commas
+            repaired = re.sub(r",(\s*[}\]])", r"\1", text)
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError:
+                return None
 
     async def _check_similarity(
         self,
