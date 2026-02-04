@@ -1,0 +1,181 @@
+"""
+Ingestion Pipeline - Sliding Window Architecture
+
+Flow:
+1. Add turn to session buffer
+2. If buffer exceeds 6 turns, trigger janitor (background)
+3. Check for session close (gap > 30 min)
+4. Extract loops from recent turns (background)
+5. Return immediately (don't block on background tasks)
+
+No extraction, no regex gates - pure LLM understanding.
+"""
+
+from datetime import datetime
+from typing import Optional
+from uuid import UUID, uuid4
+import logging
+from fastapi import BackgroundTasks
+from .models import IngestRequest, IngestResponse
+from .graphiti_client import GraphitiClient
+from . import session, loops
+from .utils import is_noise, extract_identity_updates
+from . import identity
+from .config import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+async def ingest(
+    request: IngestRequest,
+    graphiti_client: GraphitiClient,
+    background_tasks: BackgroundTasks
+) -> IngestResponse:
+    """
+    Ingestion pipeline with sliding window architecture.
+
+    Returns immediately - all heavy lifting happens in background.
+    """
+    try:
+        # Parse timestamp
+        timestamp = datetime.fromisoformat(request.timestamp.replace('Z', '+00:00'))
+
+        # Resolve session ID (prefer top-level, then metadata, else auto-generate)
+        session_id = request.sessionId or (request.metadata.get('sessionId') if request.metadata else None)
+        if not session_id:
+            session_id = f"session-{uuid4().hex}"
+
+        # 1. CHECK FOR SESSION CLOSE (gap > 30 min)
+        should_close = await session.should_close_session(
+            tenant_id=request.tenantId,
+            session_id=session_id,
+            current_time=timestamp
+        )
+
+        if should_close:
+            logger.info(f"Closing session {session_id} due to 30min gap")
+            background_tasks.add_task(
+                session.close_session,
+                tenant_id=request.tenantId,
+                session_id=session_id,
+                user_id=request.userId,
+                graphiti_client=graphiti_client,
+                persona_id=request.personaId
+            )
+
+        # 2. ADD TURN TO BUFFER (returns oldest_turn if evicted)
+        oldest_turn = await session.add_turn(
+            tenant_id=request.tenantId,
+            session_id=session_id,
+            user_id=request.userId,
+            role=request.role,
+            text=request.text,
+            timestamp=request.timestamp
+        )
+
+        # 3. IF BUFFER EXCEEDED, TRIGGER JANITOR (background)
+        if oldest_turn:
+            logger.info(f"Buffer exceeded 6 turns, triggering janitor for {session_id}")
+            background_tasks.add_task(
+                session.janitor_process,
+                tenant_id=request.tenantId,
+                session_id=session_id,
+                user_id=request.userId,
+                graphiti_client=graphiti_client
+            )
+
+        # 4. IDENTITY UPDATES (best-effort, cheap)
+        updates = extract_identity_updates(request.text)
+        if updates:
+            try:
+                await identity.update_identity(request.tenantId, request.userId, updates)
+            except Exception as e:
+                logger.warning(f"Identity update failed: {e}")
+
+        # 5. CHECK IF NOISE
+        if is_noise(request.text):
+            logger.info(f"Skipping noise: {request.text[:50]}")
+            return IngestResponse(
+                status="skipped",
+                sessionId=session_id,
+                graphitiAdded=False
+            )
+
+        # 6. LOOP EXTRACTION (background, on recent turns)
+        # Only for user messages (unless assistant is enabled)
+        settings = get_settings()
+        if request.role == "user" or settings.loops_include_assistant_turns:
+            background_tasks.add_task(
+                _extract_loops_from_recent_turns,
+                tenant_id=request.tenantId,
+                session_id=session_id,
+                user_id=request.userId,
+                persona_id=request.personaId,
+                graphiti_client=graphiti_client
+            )
+
+        # 7. RETURN IMMEDIATELY
+        return IngestResponse(
+            status="ingested",
+            sessionId=session_id,
+            identityUpdates=None,
+            loopsDetected=None,
+            loopsCompleted=None,
+            graphitiAdded=True  # Janitor sends to Graphiti in background
+        )
+
+    except Exception as e:
+        logger.error(f"Ingestion failed: {e}")
+        return IngestResponse(
+            status="error",
+            sessionId=session_id if 'session_id' in locals() else None,
+            graphitiAdded=False
+        )
+
+
+async def _extract_loops_from_recent_turns(
+    tenant_id: str,
+    session_id: str,
+    user_id: str,
+    persona_id: str,
+    graphiti_client: GraphitiClient
+) -> None:
+    """
+    Extract loops from recent conversation turns using LLM.
+
+    This runs in the background and analyzes the last 3 turns for:
+    - New loops (commitments, habits, threads, frictions)
+    - Loop completions
+    """
+    try:
+        # Get recent turns from buffer
+        buffer = await session.get_or_create_buffer(tenant_id, session_id, user_id)
+        recent_turns = buffer["messages"][-3:] if len(buffer["messages"]) >= 3 else buffer["messages"]
+
+        if not recent_turns:
+            logger.debug("No recent turns to analyze for loops")
+            return
+
+        # Build minimal recent context (last 1-2 turns)
+        recent_context = recent_turns[-2:]
+
+        # Call loop extraction
+        source_turn_ts = None
+        if recent_turns:
+            source_turn_ts = recent_turns[-1].get("timestamp")
+        if not source_turn_ts:
+            source_turn_ts = datetime.utcnow().isoformat() + "Z"
+
+        await loops.extract_and_create_loops(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            persona_id=persona_id,
+            user_text=recent_turns[-1]["text"],
+            recent_turns=recent_context,
+            source_turn_ts=datetime.fromisoformat(source_turn_ts.replace('Z', '+00:00'))
+        )
+
+        logger.info(f"Loop extraction completed for session {session_id}")
+
+    except Exception as e:
+        logger.error(f"Failed to extract loops from recent turns: {e}")
