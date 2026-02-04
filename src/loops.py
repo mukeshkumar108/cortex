@@ -53,6 +53,7 @@ class LoopManager:
 
             # Generate embedding for the loop text
             embedding = await self._generate_embedding(text)
+            embedding_value = self._format_embedding(embedding)
             parsed_due_date = None
             if isinstance(due_date, str) and due_date:
                 try:
@@ -93,7 +94,7 @@ class LoopManager:
                 parsed_due_date,
                 entity_refs or [],
                 tags or [],
-                embedding,
+                embedding_value,
                 metadata or {}
             )
 
@@ -326,12 +327,20 @@ class LoopManager:
                 task="loops"
             )
 
-            if not response:
+            if not response or not str(response).strip():
                 logger.warning("LLM returned empty response for loop extraction")
                 return {"new_loops": 0, "completions": 0}
 
+            raw = str(response).strip()
+            if raw.startswith("```"):
+                raw = raw.strip("`").strip()
+            if not raw.startswith("{"):
+                start = raw.find("{")
+                end = raw.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    raw = raw[start:end + 1]
             try:
-                extracted = json.loads(response.strip())
+                extracted = json.loads(raw)
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse loop extraction JSON: {e}")
                 return {"new_loops": 0, "completions": 0}
@@ -681,6 +690,12 @@ class LoopManager:
         except Exception as e:
             logger.error(f"Failed to generate embedding: {e}")
             raise
+
+    @staticmethod
+    def _format_embedding(embedding: Any) -> Any:
+        if isinstance(embedding, list):
+            return "[" + ",".join(str(x) for x in embedding) + "]"
+        return embedding
 
     async def _check_similarity(
         self,
