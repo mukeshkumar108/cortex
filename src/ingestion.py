@@ -19,8 +19,7 @@ from fastapi import BackgroundTasks
 from .models import IngestRequest, IngestResponse
 from .graphiti_client import GraphitiClient
 from . import session, loops
-from .utils import is_noise, extract_identity_updates
-from . import identity
+from .utils import is_noise
 from .config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -105,13 +104,8 @@ async def ingest(
                     graphiti_client=graphiti_client
                 )
 
-        # 4. IDENTITY UPDATES (best-effort, cheap)
-        updates = extract_identity_updates(request.text)
-        if updates:
-            try:
-                await identity.update_identity(request.tenantId, request.userId, updates)
-            except Exception as e:
-                logger.warning(f"Identity update failed: {e}")
+        # 4. IDENTITY UPDATES
+        # Disabled: identity is derived from Graphiti and cached in Postgres.
 
         # 5. CHECK IF NOISE
         if is_noise(request.text):

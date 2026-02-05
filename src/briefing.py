@@ -14,7 +14,7 @@ from typing import Optional, List
 import logging
 from .models import BriefResponse, TemporalAuthority, Fact, Entity, Message, NudgeCandidate
 from .graphiti_client import GraphitiClient
-from . import session, loops, identity
+from . import session, loops, identity_cache
 from .utils import get_time_of_day, format_time_gap
 
 logger = logging.getLogger(__name__)
@@ -39,8 +39,12 @@ async def build_briefing(
         # 1. TEMPORAL AUTHORITY (always present)
         temporal_authority = _build_temporal_authority(now)
 
-        # 2. IDENTITY (canonical from Postgres)
-        identity_data = await identity.ensure_identity_exists(tenant_id, user_id)
+        # 2. IDENTITY (derived from Graphiti, cached in Postgres)
+        identity_data = await identity_cache.get_identity_for_brief(
+            tenant_id,
+            user_id,
+            graphiti_client
+        )
 
         # 3. SESSION BUFFER (rolling summary + working memory)
         rolling_summary = ""

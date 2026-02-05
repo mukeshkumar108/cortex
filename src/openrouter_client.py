@@ -25,6 +25,7 @@ class OpenRouterClient:
         self.model_summary = getattr(self.settings, 'openrouter_model_summary', 'amazon/nova-micro')
         self.model_loops = getattr(self.settings, 'openrouter_model_loops', 'xiaomi/mimo-v2-flash')
         self.model_session_episode = getattr(self.settings, 'openrouter_model_session_episode', 'xiaomi/mimo-v2-flash')
+        self.model_identity = getattr(self.settings, 'openrouter_model_identity', self.model_summary)
         self.model_fallback = getattr(self.settings, 'openrouter_model_fallback', 'mistral/ministral-3b')
         self.reasoning_enabled = bool(getattr(self.settings, 'openrouter_reasoning_enabled', False))
         self.timeout = float(getattr(self.settings, 'llm_timeout', 10))
@@ -185,7 +186,7 @@ JSON:"""
         prompt: str,
         max_tokens: int = 500,
         temperature: float = 0.7,
-        task: Literal["summary", "loops", "session_episode", "generic"] = "generic"
+        task: Literal["summary", "loops", "session_episode", "identity", "generic"] = "generic"
     ) -> Optional[str]:
         """
         Make a request to OpenRouter API with timeout.
@@ -206,6 +207,8 @@ JSON:"""
                 model = self.model_loops
             elif task == "session_episode":
                 model = self.model_session_episode
+            elif task == "identity":
+                model = self.model_identity
             elif task == "generic":
                 model = self.model
 
@@ -219,7 +222,7 @@ JSON:"""
             }
             if self.reasoning_enabled:
                 payload["reasoning"] = {"enabled": True}
-            if task == "loops":
+            if task in {"loops", "identity"}:
                 payload["response_format"] = {"type": "json_object"}
 
             async with httpx.AsyncClient(timeout=self.timeout) as client:

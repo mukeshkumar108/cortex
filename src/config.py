@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     openrouter_model_summary: str = "amazon/nova-micro-v1"
     openrouter_model_loops: str = "xiaomi/mimo-v2-flash"
     openrouter_model_session_episode: str = "xiaomi/mimo-v2-flash"
+    openrouter_model_identity: str = "amazon/nova-micro-v1"
     openrouter_model_fallback: str = "mistral/ministral-3b"
     openrouter_reasoning_enabled: bool = False
 
@@ -39,6 +40,9 @@ class Settings(BaseSettings):
     outbox_drain_limit: int = 200
     outbox_drain_budget_seconds: float = 2.0
     outbox_drain_per_row_timeout_seconds: float = 8.0
+
+    # Identity cache
+    identity_cache_ttl_hours: int = 6
 
     # Logging
     log_level: str = "INFO"

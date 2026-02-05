@@ -25,10 +25,9 @@ Last updated: 2026-02-04
 ## Memory Architecture Decisions
 
 ### Identity
-- Canonical identity stored in `user_identity` (jsonb)
-- Default identity uses `name=null`, not a placeholder string
-- Identity updates are extracted from user text (lightweight heuristic)
-- If name is unknown, orchestrator should avoid using a name in replies
+- Canonical identity is derived from Graphiti and cached in `identity_cache`
+- `user_identity` is legacy and no longer updated by ingestion
+- Identity cache is best-effort; if unknown, orchestrator should avoid using a name in replies
 
 ### Session Buffer (Working Memory)
 ```

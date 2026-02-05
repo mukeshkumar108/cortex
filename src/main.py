@@ -10,6 +10,7 @@ from .config import get_settings
 from .db import Database
 from .graphiti_client import GraphitiClient
 from . import session, loops, identity
+from . import identity_cache
 from .ingestion import ingest as process_ingest
 from .briefing import build_briefing
 from .migrate import run_migrations
@@ -53,6 +54,7 @@ async def lifespan(app: FastAPI):
         session.init_session_manager(db)
         loops.init_loop_manager(db)
         identity.init_identity_manager(db)
+        identity_cache.init_identity_cache_manager(db)
         logger.info("All managers initialized")
 
         settings = get_settings()
