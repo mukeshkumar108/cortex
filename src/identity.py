@@ -12,7 +12,7 @@ class IdentityManager:
         self.db = db
 
     async def get_identity(self, tenant_id: str, user_id: str) -> Optional[Dict[str, Any]]:
-        """Get user identity"""
+        """Legacy identity store (deprecated): Graphiti is the source of semantic identity."""
         try:
             query = """
                 SELECT data
@@ -64,6 +64,8 @@ class IdentityManager:
 
             updates = dict(updates) if updates else {}
             candidate_name = updates.get("name")
+            name_explicit = bool(updates.get("name_explicit"))
+            updates.pop("name_explicit", None)
             existing_name = existing.get("name") if isinstance(existing, dict) else None
             existing_is_default = bool(existing.get("isDefault")) if isinstance(existing, dict) else True
 
@@ -72,7 +74,7 @@ class IdentityManager:
                     updates.pop("name", None)
                 else:
                     existing_good = bool(existing_name) and not _is_placeholder_name(existing_name)
-                    if not existing_is_default and existing_good:
+                    if not name_explicit and not existing_is_default and existing_good:
                         updates.pop("name", None)
             elif "name" in updates:
                 updates.pop("name", None)

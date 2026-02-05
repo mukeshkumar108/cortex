@@ -5,10 +5,9 @@ Flow:
 1. Add turn to session buffer
 2. If buffer exceeds 12 messages, trigger janitor (background)
 3. Check for session close (gap > 30 min)
-4. Extract loops from recent turns (background)
-5. Return immediately (don't block on background tasks)
+4. Return immediately (don't block on background tasks)
 
-No extraction, no regex gates - pure LLM understanding.
+Graphiti-native: no local semantic extraction on ingest.
 """
 
 from datetime import datetime
@@ -18,9 +17,8 @@ import logging
 from fastapi import BackgroundTasks
 from .models import IngestRequest, IngestResponse
 from .graphiti_client import GraphitiClient
-from . import session, loops
+from . import session
 from .utils import is_noise
-from .config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -116,27 +114,14 @@ async def ingest(
                 graphitiAdded=False
             )
 
-        # 6. LOOP EXTRACTION (background, on recent turns)
-        # Only for user messages (unless assistant is enabled)
-        settings = get_settings()
-        if request.role == "user" or settings.loops_include_assistant_turns:
-            background_tasks.add_task(
-                _extract_loops_from_recent_turns,
-                tenant_id=request.tenantId,
-                session_id=session_id,
-                user_id=request.userId,
-                persona_id=request.personaId,
-                graphiti_client=graphiti_client
-            )
-
-        # 7. RETURN IMMEDIATELY
+        # 6. RETURN IMMEDIATELY
         return IngestResponse(
             status="ingested",
             sessionId=session_id,
             identityUpdates=None,
             loopsDetected=None,
             loopsCompleted=None,
-            graphitiAdded=True  # Janitor sends to Graphiti in background
+            graphitiAdded=False
         )
 
     except Exception as e:
@@ -146,52 +131,3 @@ async def ingest(
             sessionId=session_id if 'session_id' in locals() else None,
             graphitiAdded=False
         )
-
-
-async def _extract_loops_from_recent_turns(
-    tenant_id: str,
-    session_id: str,
-    user_id: str,
-    persona_id: str,
-    graphiti_client: GraphitiClient
-) -> None:
-    """
-    Extract loops from recent conversation turns using LLM.
-
-    This runs in the background and analyzes the last 3 turns for:
-    - New loops (commitments, habits, threads, frictions)
-    - Loop completions
-    """
-    try:
-        # Get recent turns from buffer
-        buffer = await session.get_or_create_buffer(tenant_id, session_id, user_id)
-        recent_turns = buffer["messages"][-3:] if len(buffer["messages"]) >= 3 else buffer["messages"]
-
-        if not recent_turns:
-            logger.debug("No recent turns to analyze for loops")
-            return
-
-        # Build minimal recent context (last 1-2 turns)
-        recent_context = recent_turns[-2:]
-
-        # Call loop extraction
-        source_turn_ts = None
-        if recent_turns:
-            source_turn_ts = recent_turns[-1].get("timestamp")
-        if not source_turn_ts:
-            source_turn_ts = datetime.utcnow().isoformat() + "Z"
-
-        await loops.extract_and_create_loops(
-            tenant_id=tenant_id,
-            user_id=user_id,
-            persona_id=persona_id,
-            user_text=recent_turns[-1]["text"],
-            recent_turns=recent_context,
-            source_turn_ts=datetime.fromisoformat(source_turn_ts.replace('Z', '+00:00')),
-            session_id=session_id
-        )
-
-        logger.info(f"Loop extraction completed for session {session_id}")
-
-    except Exception as e:
-        logger.error(f"Failed to extract loops from recent turns: {e}")

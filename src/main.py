@@ -5,12 +5,20 @@ import asyncio
 from datetime import datetime
 import logging
 
-from .models import IngestRequest, BriefRequest, IngestResponse, BriefResponse
+from .models import (
+    IngestRequest,
+    BriefRequest,
+    IngestResponse,
+    BriefResponse,
+    MemoryQueryRequest,
+    MemoryQueryResponse,
+    Fact,
+    Entity,
+)
 from .config import get_settings
 from .db import Database
 from .graphiti_client import GraphitiClient
-from . import session, loops, identity
-from . import identity_cache
+from . import session
 from .ingestion import ingest as process_ingest
 from .briefing import build_briefing
 from .migrate import run_migrations
@@ -52,10 +60,7 @@ async def lifespan(app: FastAPI):
 
         # Initialize managers
         session.init_session_manager(db)
-        loops.init_loop_manager(db)
-        identity.init_identity_manager(db)
-        identity_cache.init_identity_cache_manager(db)
-        logger.info("All managers initialized")
+        logger.info("Session manager initialized")
 
         settings = get_settings()
         if settings.idle_close_enabled:
@@ -144,10 +149,7 @@ async def ingest(request: IngestRequest, background_tasks: BackgroundTasks):
 
     This endpoint:
     - Adds messages to session buffer
-    - Extracts identity updates
-    - Stores episodic memory in Graphiti
-    - Detects and creates loops (commitments, habits, frictions)
-    - Updates session state (mood, activity, location)
+    - Triggers background janitor (folding + outbox)
     """
     try:
         logger.info(f"Ingesting message from {request.tenantId}:{request.userId}")
@@ -162,17 +164,14 @@ async def ingest(request: IngestRequest, background_tasks: BackgroundTasks):
 @app.post("/brief", response_model=BriefResponse)
 async def brief(request: BriefRequest):
     """
-    Generate a comprehensive briefing for the AI companion.
+    Generate a minimal briefing for session start.
 
     This endpoint assembles:
-    - Identity (canonical facts)
     - Temporal authority (current time/day)
-    - Session state (working memory state)
     - Working memory (recent messages)
-    - Episode bridge (narrative since last interaction)
-    - Semantic context (relevant facts from query)
-    - Active loops (pending commitments, habits, etc.)
-    - Instructions (contextual guidance for the AI)
+    - Rolling summary (if available)
+
+    Semantic memory is queried on-demand via /memory/query.
     """
     try:
         logger.info(f"Building briefing for {request.tenantId}:{request.userId}")
@@ -198,6 +197,57 @@ async def brief(request: BriefRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/memory/query", response_model=MemoryQueryResponse)
+async def memory_query(request: MemoryQueryRequest):
+    """
+    Query Graphiti for semantic memory snippets on-demand.
+    """
+    try:
+        reference_time = None
+        if request.referenceTime:
+            value = request.referenceTime
+            if value.endswith("Z"):
+                value = value.replace("Z", "+00:00")
+            reference_time = datetime.fromisoformat(value)
+
+        facts = await graphiti_client.search_facts(
+            tenant_id=request.tenantId,
+            user_id=request.userId,
+            query=request.query,
+            limit=request.limit or 10,
+            reference_time=reference_time
+        )
+        entities = await graphiti_client.search_nodes(
+            tenant_id=request.tenantId,
+            user_id=request.userId,
+            query=request.query,
+            limit=min(request.limit or 10, 10),
+            reference_time=reference_time
+        )
+
+        fact_models = [
+            Fact(text=f["text"], relevance=f.get("relevance"), source=f.get("source", "graphiti"))
+            for f in facts
+        ]
+        entity_models = [
+            Entity(summary=e["summary"], type=e.get("type"), uuid=e.get("uuid"))
+            for e in entities if e.get("summary")
+        ]
+
+        return MemoryQueryResponse(
+            facts=fact_models,
+            entities=entity_models,
+            metadata={
+                "query": request.query,
+                "facts": len(fact_models),
+                "entities": len(entity_models)
+            }
+        )
+    except Exception as e:
+        logger.error(f"Memory query failed: {e}")
+        raise HTTPException(status_code=500, detail="Memory query failed")
+
+
 @app.post("/internal/drain")
 async def drain(
     limit: int = 200,
@@ -217,42 +267,6 @@ async def drain(
         return counts
     except Exception as e:
         logger.error(f"Drain endpoint error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/internal/debug/loops")
-async def debug_loops(tenantId: str, userId: str, x_internal_token: str | None = Header(default=None)):
-    """Debug endpoint for active loops."""
-    _require_internal_token(x_internal_token)
-    try:
-        rows = await loops.get_active_loops_debug(tenantId, userId)
-        return {"loops": rows}
-    except Exception as e:
-        logger.error(f"Debug loops endpoint error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/internal/debug/nudges")
-async def debug_nudges(tenantId: str, userId: str, x_internal_token: str | None = Header(default=None)):
-    """Debug endpoint for pending nudge candidates."""
-    _require_internal_token(x_internal_token)
-    try:
-        rows = await db.fetch(
-            """
-            SELECT id, type, text, status, metadata
-            FROM loops
-            WHERE tenant_id = $1
-              AND user_id = $2
-              AND status = 'active'
-              AND metadata ? 'pending_nudge'
-            ORDER BY updated_at DESC
-            """,
-            tenantId,
-            userId
-        )
-        return {"nudges": rows}
-    except Exception as e:
-        logger.error(f"Debug nudges endpoint error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -285,16 +299,9 @@ async def debug_session(
             tenantId,
             sessionId
         )
-        active_loops = await loops.get_active_loops_debug(tenantId, userId)
-        session_state = session_row.get("session_state") if session_row else {}
         return {
             "session": session_row,
-            "transcript": transcript,
-            "activeLoops": active_loops,
-            "sessionEpisode": {
-                "name": session_state.get("session_episode_name") if session_state else None,
-                "text": session_state.get("session_episode_text") if session_state else None
-            }
+            "transcript": transcript
         }
     except Exception as e:
         logger.error(f"Debug session endpoint error: {e}")
@@ -324,14 +331,6 @@ async def debug_user(
         last_interaction = None
         if session_id:
             last_interaction = await session.get_last_interaction_time(tenantId, session_id)
-        episode_bridge = None
-        try:
-            episode_bridge = await graphiti_client.get_latest_session_summary(
-                tenant_id=tenantId,
-                user_id=userId
-            )
-        except Exception:
-            episode_bridge = None
         entities = []
         try:
             entities = await graphiti_client.search_nodes(
@@ -343,12 +342,9 @@ async def debug_user(
             )
         except Exception:
             entities = []
-        active_loops = await loops.get_active_loops_debug(tenantId, userId)
         return {
             "latestSessionId": session_id,
             "lastInteractionTime": last_interaction.isoformat() if last_interaction else None,
-            "episodeBridge": episode_bridge,
-            "activeLoops": active_loops,
             "topEntities": entities
         }
     except Exception as e:
@@ -457,6 +453,66 @@ async def debug_close_user_sessions(
         return {"closedCount": len(closed), "closedSessions": closed}
     except Exception as e:
         logger.error(f"Debug close_user_sessions error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/internal/debug/emit_raw_episode")
+async def debug_emit_raw_episode(
+    tenantId: str,
+    userId: str,
+    sessionId: str,
+    x_internal_token: str | None = Header(default=None)
+):
+    """Emit raw transcript episode to Graphiti for a session."""
+    _require_internal_token(x_internal_token)
+    try:
+        await session.send_raw_transcript_episode(
+            tenant_id=tenantId,
+            session_id=sessionId,
+            user_id=userId,
+            graphiti_client=graphiti_client
+        )
+        return {"emitted": True, "sessionId": sessionId}
+    except Exception as e:
+        logger.error(f"Debug emit_raw_episode error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/internal/debug/emit_raw_user_sessions")
+async def debug_emit_raw_user_sessions(
+    tenantId: str,
+    userId: str,
+    limit: int = 20,
+    x_internal_token: str | None = Header(default=None)
+):
+    """Emit raw transcript episodes for recent sessions for a user."""
+    _require_internal_token(x_internal_token)
+    try:
+        rows = await db.fetch(
+            """
+            SELECT session_id
+            FROM session_buffer
+            WHERE tenant_id = $1 AND user_id = $2
+            ORDER BY updated_at DESC
+            LIMIT $3
+            """,
+            tenantId,
+            userId,
+            limit
+        )
+        emitted = []
+        for row in rows:
+            session_id = row["session_id"]
+            await session.send_raw_transcript_episode(
+                tenant_id=tenantId,
+                session_id=session_id,
+                user_id=userId,
+                graphiti_client=graphiti_client
+            )
+            emitted.append(session_id)
+        return {"emittedCount": len(emitted), "sessions": emitted}
+    except Exception as e:
+        logger.error(f"Debug emit_raw_user_sessions error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

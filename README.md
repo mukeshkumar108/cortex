@@ -1,11 +1,12 @@
 # Cortex (Synapse Memory API)
 
-A FastAPI memory service with a sliding-window session buffer, LLM-first procedural memory (loops), and optional Graphiti semantic memory. Designed to be reliable, tenant‑isolated, and cheap to run.
+A FastAPI memory service with a sliding‑window session buffer and Graphiti‑native semantic memory. Designed to be reliable, tenant‑isolated, and cheap to run.
 
 ## What it does (short)
-- **/ingest**: writes turns to Postgres (rolling summary + last 6 turns). Never blocks on LLM/Graphiti.
-- **/brief**: returns memory context (identity, rolling summary, last turns, loops). Graphiti enrichment is optional.
-- **Outbox**: reliable delivery of evicted turns + session summaries to Graphiti.
+- **/ingest**: writes turns to Postgres (rolling summary + last 12 messages). Never blocks.
+- **/brief**: minimal session seed (time + working memory + rolling summary).
+- **/memory/query**: on‑demand Graphiti memory query (facts/entities).
+- **Outbox**: reliable delivery of evicted turns; raw transcript is sent to Graphiti on session close.
 
 ## Quickstart
 ```bash
@@ -22,7 +23,7 @@ curl -s http://localhost:8000/health
 
 ## API: minimal usage
 **Recommended loop**
-1) `/brief` before each assistant response
+1) `/brief` once at session start (optional)
 2) LLM responds
 3) `/ingest` user turn
 4) `/ingest` assistant turn
@@ -34,9 +35,8 @@ Docs:
 
 ## Key concepts
 - **Session buffer**: Postgres keeps rolling summary + last 12 messages (6 user+assistant turns).
-- **Outbox**: evicted turns are queued for Graphiti; retries are backoff‑controlled.
-- **Loops**: procedural memory extracted by LLM (commitments, habits, frictions).
-- **Graphiti**: derived semantic memory (episodes/facts/entities), best‑effort. Receives raw session transcripts on close.
+- **Outbox**: evicted turns are queued; retries are backoff‑controlled.
+- **Graphiti**: semantic memory (episodes/facts/entities). Receives raw session transcripts on close.
 
 ## Configuration (important)
 Environment flags (see `src/config.py`):
@@ -53,7 +53,7 @@ OUTBOX_DRAIN_ENABLED=true
 
 ## Gotchas / things to watch
 - **Identity defaults are null** until user states name/home/timezone. Don’t assume name exists.
-- **Graphiti recall is not automatic**: call `/brief` with `query` to retrieve facts/entities.
+- **Graphiti recall is not automatic**: call `/memory/query` to retrieve facts/entities.
 - **Outbox won’t drain** unless `/internal/drain` is called or `OUTBOX_DRAIN_ENABLED=true`.
 - **Session close** happens via idle close loop (config) or next ingest. Enable idle close for clean session summaries.
 - **Graphiti LLM** uses OpenAI by default (via `OPENAI_API_KEY`) unless overridden by `GRAPHITI_LLM_*` settings.
@@ -69,10 +69,12 @@ Require header `X-Internal-Token` = `INTERNAL_TOKEN`.
 - `/internal/debug/session?tenantId&userId&sessionId`
 - `/internal/debug/user?tenantId&userId`
 - `/internal/debug/outbox?tenantId&limit=50`
-- `/internal/debug/loops?tenantId&userId`
+- `/internal/debug/session?tenantId&userId&sessionId`
 - `/internal/debug/nudges?tenantId&userId`
 - `POST /internal/debug/close_session?tenantId&userId&sessionId`
 - `POST /internal/debug/close_user_sessions?tenantId&userId&limit=20`
+- `POST /internal/debug/emit_raw_episode?tenantId&userId&sessionId`
+- `POST /internal/debug/emit_raw_user_sessions?tenantId&userId&limit=20`
 
 ## License
 Private/internal.

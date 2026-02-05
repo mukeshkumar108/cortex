@@ -1,33 +1,32 @@
 # Synapse Architecture Decisions (Source of Truth)
 
-Last updated: 2026-02-04
+Last updated: 2026-02-05
 
 ## Core Principles
 
-### 1) Separation of Concerns
-- **Postgres**: canonical procedural state (session_buffer, user_identity, loops, outbox)
-- **Graphiti**: derived semantic memory (episodes, facts, entities)
-- **LLM-first loops**: procedural state is decided by LLM output, not regex rules
+### 1) Separation of Concerns (Graphiti‑native)
+- **Postgres**: operational state only (session_buffer, session_transcript, outbox, caches)
+- **Graphiti**: semantic memory (episodes, facts, entities, relationships, temporal reasoning)
+- **No local semantic extraction** in Synapse
 
 ### 2) Graceful Degradation
-- /ingest and /brief must succeed even if Graphiti/LLM fails
-- Tier 2 (Graphiti) is best-effort and optional
+- /ingest and /brief must succeed even if Graphiti fails
+- Graphiti queries are on-demand and best-effort
 
 ### 3) Tenant Isolation
 - All Postgres queries filter by `tenant_id`
 - Graphiti group_id = `f"{tenant_id}__{user_id}"`
 
 ### 4) Cost Discipline
-- Sliding window keeps hot context bounded (last 6 turns)
-- Rolling summary compresses older turns
-- Graphiti ingestion is per-session (default) to reduce cost
+- Sliding window keeps hot context bounded (last 12 messages)
+- Rolling summary compresses older turns (local only)
+- Graphiti ingestion is per-session (raw transcript on close)
 
 ## Memory Architecture Decisions
 
 ### Identity
-- Canonical identity is derived from Graphiti and cached in `identity_cache`
-- `user_identity` is legacy and no longer updated by ingestion
-- Identity cache is best-effort; if unknown, orchestrator should avoid using a name in replies
+- Identity is derived from Graphiti on-demand (no local extractor)
+- Optional caching can be added later if needed
 
 ### Session Buffer (Working Memory)
 ```
@@ -40,25 +39,20 @@ session_buffer (tenant_id, session_id)
 
 ### Session Close
 - Sessions close after inactivity (idle close loop, config gated)
-- Close creates a **local** session summary for episodeBridge (Postgres only)
 - Close sends **raw transcript** as a Graphiti episode (for extraction)
-- Close enqueues remaining turns to outbox
+- Close enqueues remaining turns to outbox (operational)
 
 ### Outbox
 - `graphiti_outbox` is the reliable delivery queue
 - Rows are folded once, then sent (or dead-lettered)
 - Error classification: permanent → failed; transient → retry with backoff
 
-### Loops (Procedural Memory)
-- LLM-first output controls create/reinforce/complete/drop
-- Evidence is stored in metadata
-- Implicit completion → nudge candidate, not auto-complete
-- Explicit completion (confidence ≥ 0.85) → auto-complete
+### Procedural Memory
+- Not implemented in Synapse v1; should be modeled in Graphiti (custom entities/edges) if needed
 
 ## /brief Contract
-- Tier 1: identity, temporalAuthority, workingMemory, rollingSummary, activeLoops
-- Tier 2: semanticContext/entities/episodeBridge only if `query` provided
-- No "magic" recall — orchestrator decides when to query Graphiti
+- Minimal: temporalAuthority, workingMemory, rollingSummary
+- No semantic context here; orchestrator queries Graphiti via /memory/query
 
 ## /ingest Contract
 - sessionId can be top-level or metadata; auto-generated if missing
@@ -66,8 +60,6 @@ session_buffer (tenant_id, session_id)
 
 ## Model Routing Policy v1
 - summary → `OPENROUTER_MODEL_SUMMARY` (default `amazon/nova-micro-v1`)
-- loops → `OPENROUTER_MODEL_LOOPS` (default `xiaomi/mimo-v2-flash`)
-- session_episode → `OPENROUTER_MODEL_SESSION_EPISODE` (default `xiaomi/mimo-v2-flash`)
 - fallback → `OPENROUTER_MODEL_FALLBACK` (default `mistral/ministral-3b`)
 - reasoning toggle: `OPENROUTER_REASONING_ENABLED` (default false)
 
@@ -79,6 +71,6 @@ session_buffer (tenant_id, session_id)
 - `GRAPHITI_PER_TURN`: false (session episodes only)
 
 ## Known Gaps (Intentional)
-- No deterministic identity extraction from regex beyond lightweight hints
-- No automatic recall; orchestrator must pass `query`
+- No local semantic extraction; Graphiti is required for semantic memory
+- No automatic recall; orchestrator must call /memory/query
 - No metrics/alerts (logging only)

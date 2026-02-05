@@ -31,20 +31,14 @@ This doc is a concise API contract for external clients (e.g., Sophie orchestrat
   "userId": "user_1",
   "personaId": "persona_1",
   "now": "2026-02-04T18:00:00Z",
-  "sessionId": "session-abc",
-  "query": "Ashley"
+  "sessionId": "session-abc"
 }
 ```
 
 **Response JSON (example)**
 ```json
 {
-  "identity": {
-    "name": null,
-    "timezone": "UTC",
-    "home": null,
-    "isDefault": true
-  },
+  "identity": {"name": null, "isDefault": true},
   "temporalAuthority": {
     "currentTime": "06:00 PM",
     "currentDay": "Tuesday",
@@ -56,27 +50,19 @@ This doc is a concise API contract for external clients (e.g., Sophie orchestrat
     {"role": "user", "text": "...", "timestamp": "..."}
   ],
   "rollingSummary": "...",
-  "activeLoops": [
-    {"id": "...", "type": "commitment", "status": "active", "text": "...", "salience": 3}
-  ],
-  "nudgeCandidates": [
-    {"loopId": "...", "type": "commitment", "text": "...", "question": "Is this done?", "confidence": 0.7, "evidenceText": "..."}
-  ],
-  "episodeBridge": "...",
-  "semanticContext": [
-    {"text": "...", "relevance": 0.72, "source": "graphiti"}
-  ],
-  "entities": [
-    {"summary": "Ashley", "type": "person", "uuid": "..."}
-  ],
-  "instructions": ["..."],
+  "activeLoops": [],
+  "nudgeCandidates": [],
+  "episodeBridge": null,
+  "semanticContext": [],
+  "entities": [],
+  "instructions": [],
   "metadata": {
     "queryTime": "2026-02-04T18:00:00Z",
     "bufferSize": 2,
     "hasRollingSummary": true,
-    "graphitiFacts": 1,
-    "graphitiEntities": 1,
-    "loopsCount": 1
+    "graphitiFacts": 0,
+    "graphitiEntities": 0,
+    "loopsCount": 0
   }
 }
 ```
@@ -117,7 +103,7 @@ Notes:
   "identityUpdates": null,
   "loopsDetected": null,
   "loopsCompleted": null,
-  "graphitiAdded": true
+  "graphitiAdded": false
 }
 ```
 
@@ -133,10 +119,10 @@ These require header `X-Internal-Token` and are intended for ops/debug only:
 - `GET /internal/debug/session`
 - `GET /internal/debug/user`
 - `GET /internal/debug/outbox`
-- `GET /internal/debug/loops`
-- `GET /internal/debug/nudges`
 - `POST /internal/debug/close_session`
 - `POST /internal/debug/close_user_sessions`
+- `POST /internal/debug/emit_raw_episode`
+- `POST /internal/debug/emit_raw_user_sessions`
 
 ## 3) Canonical Identifiers
 
@@ -144,18 +130,53 @@ These require header `X-Internal-Token` and are intended for ops/debug only:
 | --- | --- | --- |
 | `tenantId` | required | Always required in /brief and /ingest |
 | `userId` | required | Always required |
-| `personaId` | required | Used for loop scoping and future persona handling |
+| `personaId` | required | Reserved for future persona handling |
 | `sessionId` | optional | If omitted, Synapse auto-creates and returns it |
 
 ## 4) Memory Concepts + Shapes
 
 ### Rolling Summary
 - Location: `session_buffer.rolling_summary`
-- Shape: plain text summary of older turns
+- Shape: plain text summary of older turns (local only)
 
 ### Working Memory
 - Location: `session_buffer.messages`
-- Shape: JSON array of last 6 turns `{role,text,timestamp}`
+- Shape: JSON array of last 12 messages `{role,text,timestamp}`
+
+### Graphiti Memory (Semantic/Episodic)
+- Graphiti is the source of truth for facts/entities and episodic memory.
+- Synapse exposes **/memory/query** for on-demand semantic retrieval.
+
+---
+
+### POST /memory/query
+**Auth:** none (public endpoint)
+**Headers:**
+- `Content-Type: application/json`
+
+**Request JSON**
+```json
+{
+  "tenantId": "tenant_a",
+  "userId": "user_1",
+  "query": "What happened earlier today?",
+  "limit": 10,
+  "referenceTime": "2026-02-04T18:00:00Z"
+}
+```
+
+**Response JSON (example)**
+```json
+{
+  "facts": [
+    {"text": "User was frustrated with bugs in a cafe.", "relevance": 0.83, "source": "graphiti"}
+  ],
+  "entities": [
+    {"summary": "Ashley", "type": "person", "uuid": "..."}
+  ],
+  "metadata": {"query": "...", "facts": 1, "entities": 1}
+}
+```
 
 ### Loops (procedural memory)
 - Stored in Postgres `loops`

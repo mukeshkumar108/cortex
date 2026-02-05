@@ -19,7 +19,6 @@ import inspect
 import json
 import logging
 import asyncio
-from . import loops
 from .db import Database
 from .models import Message
 from .config import get_settings
@@ -898,6 +897,10 @@ Do not include filler or meta-commentary."""
 
             return None
 
+        except Exception as e:
+            logger.error(f"Failed to get last interaction time: {e}")
+            return None
+
     async def get_latest_session_episode_text(
         self,
         tenant_id: str,
@@ -923,10 +926,6 @@ Do not include filler or meta-commentary."""
             logger.error(f"Failed to get latest session episode text: {e}")
             return None
 
-        except Exception as e:
-            logger.error(f"Failed to get last interaction time: {e}")
-            return None
-
     async def close_session(
         self,
         tenant_id: str,
@@ -937,6 +936,7 @@ Do not include filler or meta-commentary."""
     ) -> bool:
         """
         Close session: enqueue remaining raw turns to outbox and mark closed.
+        Graphiti-native: send raw transcript as a single episode; no local semantic summary.
         """
         try:
             buffer = await self.get_or_create_buffer(tenant_id, session_id, user_id)
@@ -952,99 +952,23 @@ Do not include filler or meta-commentary."""
 
             logger.info(f"Enqueued {len(buffer['messages'])} remaining turns on session close")
 
-            # 2. Create local session summary for episode bridge (best-effort, local only)
-            session_episode_name = None
-            session_episode_text = None
-            try:
-                summary_input = self._build_session_summary_input(
-                    buffer.get("rolling_summary", ""),
-                    buffer["messages"]
-                )
-                summary_text = await self._summarize_session_close(summary_input)
-                active_loops = []
-                if persona_id:
-                    active_loops = await loops.get_active_loops(
-                        tenant_id, user_id, persona_id, limit=10
-                    )
-                else:
-                    active_loops = await loops.get_active_loops_any(
-                        tenant_id, user_id, limit=10
-                    )
-                session_text = self._build_session_episode_text(
-                    summary_text=summary_text,
-                    rolling_summary=buffer.get("rolling_summary", ""),
-                    recent_turns=buffer["messages"],
-                    active_loops=active_loops
-                )
-                session_episode_text = session_text
-                started_at = buffer.get("created_at")
-                ended_at = datetime.utcnow()
-                episode_name = self._build_session_summary_name(
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    session_id=session_id,
-                    ts=ended_at,
-                    summary=session_text
-                )
-                session_episode_name = episode_name
-            except Exception as e:
-                logger.error(f"Failed to create session summary episode: {e}")
+            # 2. Send raw transcript episode to Graphiti (best-effort)
+            started_at = buffer.get("created_at")
+            ended_at = datetime.utcnow()
+            await self._send_raw_transcript_episode(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                user_id=user_id,
+                graphiti_client=graphiti_client,
+                started_at=started_at,
+                ended_at=ended_at
+            )
 
-            # 3. Send raw transcript episode to Graphiti (best-effort)
-            try:
-                transcript = await self.db.fetchone(
-                    """
-                    SELECT messages
-                    FROM session_transcript
-                    WHERE tenant_id = $1 AND session_id = $2
-                    """,
-                    tenant_id,
-                    session_id
-                )
-                transcript_messages = transcript.get("messages") if transcript else []
-                if isinstance(transcript_messages, str):
-                    try:
-                        transcript_messages = json.loads(transcript_messages)
-                    except Exception:
-                        transcript_messages = []
-
-                full_messages = []
-                if isinstance(transcript_messages, list):
-                    full_messages.extend(transcript_messages)
-                if isinstance(buffer.get("messages"), list):
-                    full_messages.extend(buffer["messages"])
-
-                if full_messages:
-                    raw_text = "\n".join(
-                        [f"{m.get('role')}: {m.get('text')}" for m in full_messages]
-                    )
-                    raw_episode_name = f"session_raw_{session_id}_{int(ended_at.timestamp())}"
-                    await graphiti_client.add_episode(
-                        tenant_id=tenant_id,
-                        user_id=user_id,
-                        text=raw_text,
-                        timestamp=ended_at,
-                        role="system",
-                        episode_name=raw_episode_name,
-                        metadata={
-                            "session_id": session_id,
-                            "started_at": started_at.isoformat() if started_at else None,
-                            "ended_at": ended_at.isoformat(),
-                            "episode_type": "session_raw"
-                        }
-                    )
-            except Exception as e:
-                logger.error(f\"Failed to send raw transcript episode: {e}\")
-
-            # 4. Mark session closed and clear messages
+            # 3. Mark session closed and clear messages
             query = """
                 UPDATE session_buffer
                 SET closed_at = NOW(),
                     messages = $1,
-                    session_state = jsonb_set(
-                        jsonb_set(COALESCE(session_state, '{}'::jsonb), '{session_episode_name}', to_jsonb($4::text), true),
-                        '{session_episode_text}', to_jsonb($5::text), true
-                    ),
                     updated_at = NOW()
                 WHERE tenant_id = $2 AND session_id = $3
             """
@@ -1052,9 +976,7 @@ Do not include filler or meta-commentary."""
                 query,
                 [],
                 tenant_id,
-                session_id,
-                session_episode_name,
-                session_episode_text
+                session_id
             )
 
             logger.info(f"Closed session {session_id}")
@@ -1105,6 +1027,64 @@ Do not include filler or meta-commentary."""
                     limit
                 )
                 return [dict(r) for r in rows]
+
+    async def _send_raw_transcript_episode(
+        self,
+        tenant_id: str,
+        session_id: str,
+        user_id: str,
+        graphiti_client,
+        started_at: Optional[datetime] = None,
+        ended_at: Optional[datetime] = None
+    ) -> None:
+        try:
+            transcript = await self.db.fetchone(
+                """
+                SELECT messages
+                FROM session_transcript
+                WHERE tenant_id = $1 AND session_id = $2
+                """,
+                tenant_id,
+                session_id
+            )
+            transcript_messages = transcript.get("messages") if transcript else []
+            if isinstance(transcript_messages, str):
+                try:
+                    transcript_messages = json.loads(transcript_messages)
+                except Exception:
+                    transcript_messages = []
+
+            buffer = await self.get_or_create_buffer(tenant_id, session_id, user_id)
+            full_messages = []
+            if isinstance(transcript_messages, list):
+                full_messages.extend(transcript_messages)
+            if isinstance(buffer.get("messages"), list):
+                full_messages.extend(buffer["messages"])
+
+            if not full_messages:
+                return
+
+            ended_at = ended_at or datetime.utcnow()
+            raw_text = "\n".join(
+                [f"{m.get('role')}: {m.get('text')}" for m in full_messages]
+            )
+            raw_episode_name = f"session_raw_{session_id}_{int(ended_at.timestamp())}"
+            await graphiti_client.add_episode(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                text=raw_text,
+                timestamp=ended_at,
+                role=None,
+                episode_name=raw_episode_name,
+                metadata={
+                    "session_id": session_id,
+                    "started_at": started_at.isoformat() if started_at else None,
+                    "ended_at": ended_at.isoformat(),
+                    "episode_type": "session_raw"
+                }
+            )
+        except Exception as e:
+            logger.error(f"Failed to send raw transcript episode: {e}")
 
     async def close_idle_sessions_once(
         self,
@@ -1332,6 +1312,22 @@ async def get_latest_session_episode_text(tenant_id: str, user_id: str) -> Optio
     if _manager is None:
         raise RuntimeError("SessionManager not initialized")
     return await _manager.get_latest_session_episode_text(tenant_id, user_id)
+
+
+async def send_raw_transcript_episode(
+    tenant_id: str,
+    session_id: str,
+    user_id: str,
+    graphiti_client
+) -> None:
+    if _manager is None:
+        raise RuntimeError("SessionManager not initialized")
+    await _manager._send_raw_transcript_episode(
+        tenant_id=tenant_id,
+        session_id=session_id,
+        user_id=user_id,
+        graphiti_client=graphiti_client
+    )
 
 
 async def should_close_session(

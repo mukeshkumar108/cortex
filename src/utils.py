@@ -31,7 +31,7 @@ def format_time_gap(minutes: int) -> str:
 
 
 def extract_identity_updates(text: str) -> Dict[str, Any]:
-    """Extract identity updates from text with validation"""
+    """Legacy helper (deprecated): local identity extraction is not used in Graphiti‑native v1."""
     updates = {}
     text_lower = text.lower()
 
@@ -67,6 +67,7 @@ def extract_identity_updates(text: str) -> Dict[str, Any]:
             # Reject if it's a non-name
             if candidate_lower not in name_rejects and len(candidate_lower) >= 2:
                 updates['name'] = candidate.capitalize()
+                updates['name_explicit'] = True
                 break
 
     # Extract location/home
