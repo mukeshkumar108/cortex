@@ -7,6 +7,7 @@ A FastAPI memory service with a sliding‑window session buffer and Graphiti‑n
 - **/brief**: minimal session seed (time + working memory + rolling summary).
 - **/memory/query**: on‑demand Graphiti memory query (facts/entities).
 - **/session/close**: flushes raw transcript to Graphiti.
+- **/session/ingest**: send a full session transcript in one call.
 - **Outbox**: reliable delivery of evicted turns; raw transcript is sent to Graphiti on session close.
 
 ## Quickstart

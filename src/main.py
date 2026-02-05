@@ -15,6 +15,8 @@ from .models import (
     Fact,
     Entity,
     SessionCloseRequest,
+    SessionIngestRequest,
+    SessionIngestResponse,
 )
 from .config import get_settings
 from .db import Database
@@ -291,6 +293,66 @@ async def close_session(request: SessionCloseRequest):
     except Exception as e:
         logger.error(f"Session close failed: {e}")
         raise HTTPException(status_code=500, detail="Session close failed")
+
+
+@app.post("/session/ingest", response_model=SessionIngestResponse)
+async def ingest_session(request: SessionIngestRequest):
+    """
+    Session-only ingestion: send full transcript to Graphiti as one episode.
+    """
+    try:
+        # Build raw transcript text
+        lines = []
+        for m in request.messages:
+            lines.append(f"{m.role}: {m.text}")
+        raw_text = "\n".join(lines)
+
+        # Determine timestamps
+        started_at = request.startedAt
+        ended_at = request.endedAt
+        if not started_at and request.messages:
+            started_at = request.messages[0].timestamp
+        if not ended_at and request.messages:
+            ended_at = request.messages[-1].timestamp
+
+        episode_name = f"session_raw_{request.sessionId}"
+
+        await graphiti_client.add_episode(
+            tenant_id=request.tenantId,
+            user_id=request.userId,
+            text=raw_text,
+            timestamp=datetime.utcnow(),
+            role=None,
+            episode_name=episode_name,
+            metadata={
+                "session_id": request.sessionId,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "episode_type": "session_raw"
+            }
+        )
+
+        # Optional: store transcript for debug/audit
+        await db.execute(
+            """
+            INSERT INTO session_transcript (tenant_id, session_id, messages, updated_at)
+            VALUES ($1, $2, $3::jsonb, NOW())
+            ON CONFLICT (tenant_id, session_id)
+            DO UPDATE SET messages = $3::jsonb, updated_at = NOW()
+            """,
+            request.tenantId,
+            request.sessionId,
+            [m.model_dump() for m in request.messages]
+        )
+
+        return SessionIngestResponse(
+            status="ingested",
+            sessionId=request.sessionId,
+            graphitiAdded=True
+        )
+    except Exception as e:
+        logger.error(f"Session ingest failed: {e}")
+        raise HTTPException(status_code=500, detail="Session ingest failed")
 
 
 @app.post("/internal/drain")

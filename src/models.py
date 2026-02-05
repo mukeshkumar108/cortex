@@ -128,3 +128,19 @@ class SessionCloseRequest(BaseModel):
     userId: str
     sessionId: Optional[str] = None
     personaId: Optional[str] = None
+
+
+class SessionIngestRequest(BaseModel):
+    tenantId: str
+    userId: str
+    personaId: Optional[str] = None
+    sessionId: str
+    startedAt: Optional[str] = None
+    endedAt: Optional[str] = None
+    messages: List[Message]
+
+
+class SessionIngestResponse(BaseModel):
+    status: str
+    sessionId: str
+    graphitiAdded: bool = False

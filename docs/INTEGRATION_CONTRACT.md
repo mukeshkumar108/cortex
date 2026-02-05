@@ -165,6 +165,19 @@ These require header `X-Internal-Token` and are intended for ops/debug only:
 }
 ```
 
+**Response JSON (example)**
+```json
+{
+  "facts": [
+    {"text": "User was frustrated with bugs in a cafe.", "relevance": 0.83, "source": "graphiti"}
+  ],
+  "entities": [
+    {"summary": "Ashley", "type": "person", "uuid": "..."}
+  ],
+  "metadata": {"query": "...", "facts": 1, "entities": 1}
+}
+```
+
 ---
 
 ### POST /session/close
@@ -193,27 +206,43 @@ These require header `X-Internal-Token` and are intended for ops/debug only:
 Notes:
 - If `sessionId` is omitted, Synapse closes the most recent open session for the user.
 
-**Response JSON (example)**
+---
+
+### POST /session/ingest
+**Auth:** none (public endpoint)
+**Headers:**
+- `Content-Type: application/json`
+
+Use this if you keep working memory locally and only send full transcripts.
+
+**Request JSON**
 ```json
 {
-  "facts": [
-    {"text": "User was frustrated with bugs in a cafe.", "relevance": 0.83, "source": "graphiti"}
-  ],
-  "entities": [
-    {"summary": "Ashley", "type": "person", "uuid": "..."}
-  ],
-  "metadata": {"query": "...", "facts": 1, "entities": 1}
+  "tenantId": "tenant_a",
+  "userId": "user_1",
+  "personaId": "persona_1",
+  "sessionId": "session-abc",
+  "startedAt": "2026-02-04T18:00:00Z",
+  "endedAt": "2026-02-04T18:45:00Z",
+  "messages": [
+    {"role": "user", "text": "My name is Mukesh", "timestamp": "2026-02-04T18:00:01Z"},
+    {"role": "assistant", "text": "Nice to meet you", "timestamp": "2026-02-04T18:00:05Z"}
+  ]
 }
 ```
 
-### Loops (procedural memory)
-- Stored in Postgres `loops`
-- Types: commitment, decision, friction, habit, thread
-- Metadata contains evidence + nudge candidates
+**Response JSON (example)**
+```json
+{
+  "status": "ingested",
+  "sessionId": "session-abc",
+  "graphitiAdded": true
+}
+```
 
 ### Semantic Memory (Graphiti)
 - Facts/entities/episodes in Graphiti (best-effort)
-- Retrieved only when /brief includes a `query`
+- Retrieved via /memory/query (on-demand)
 
 ## 5) Constraints / Limits
 - No explicit payload size limit enforced in code.

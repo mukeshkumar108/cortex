@@ -52,6 +52,24 @@ Use after inactivity to flush raw transcript to Graphiti.
 }
 ```
 
+### POST /session/ingest
+Use if Sophie stores working memory locally and only sends full transcripts.
+
+**Request**
+```json
+{
+  "tenantId": "tenant_a",
+  "userId": "user_1",
+  "personaId": "persona_1",
+  "sessionId": "session-abc",
+  "startedAt": "2026-02-04T18:00:00Z",
+  "endedAt": "2026-02-04T18:45:00Z",
+  "messages": [
+    {"role": "user", "text": "My name is Mukesh", "timestamp": "2026-02-04T18:00:01Z"},
+    {"role": "assistant", "text": "Nice to meet you", "timestamp": "2026-02-04T18:00:05Z"}
+  ]
+}
+```
 ## Failure behavior
 - Graphiti down → /brief and /ingest still succeed.
 - Memory query fails → orchestrator proceeds without semantic memory.
@@ -61,3 +79,4 @@ Use after inactivity to flush raw transcript to Graphiti.
 - Cache memory query results per session to avoid repeated calls.
 - Ask Graphiti only when the user mentions a person, project, or asks for recall.
 - Close sessions after 15 minutes of user inactivity via `/session/close`.
+- Use `/session/ingest` if you want to avoid per‑turn Synapse calls.

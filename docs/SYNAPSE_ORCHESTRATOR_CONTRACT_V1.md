@@ -150,6 +150,36 @@ Notes:
 
 ---
 
+### POST /session/ingest
+Use this if you keep working memory locally and only send full transcripts.
+
+**Request**
+```json
+{
+  "tenantId": "tenant_a",
+  "userId": "user_1",
+  "personaId": "persona_1",
+  "sessionId": "session-abc",
+  "startedAt": "2026-02-04T18:00:00Z",
+  "endedAt": "2026-02-04T18:45:00Z",
+  "messages": [
+    {"role": "user", "text": "My name is Mukesh", "timestamp": "2026-02-04T18:00:01Z"},
+    {"role": "assistant", "text": "Nice to meet you", "timestamp": "2026-02-04T18:00:05Z"}
+  ]
+}
+```
+
+**Response**
+```json
+{
+  "status": "ingested",
+  "sessionId": "session-abc",
+  "graphitiAdded": true
+}
+```
+
+---
+
 ## Orchestration Loop (Recommended)
 
 1) **Session start** (optional): call `/brief` once to seed time + working memory.
@@ -158,7 +188,7 @@ Notes:
    - rolling summary (if present)
 3) **On demand memory**: call `/memory/query` with targeted questions.
 4) LLM responds to user.
-5) Call `/ingest` for the user turn and the assistant turn.
+5) Call `/ingest` for the user turn and the assistant turn **or** use `/session/ingest` at end of session.
 6) If user is inactive for 15 minutes, call `/session/close`.
 
 ---
