@@ -25,18 +25,6 @@ class BriefRequest(BaseModel):
     query: Optional[str] = None
 
 
-class MemoryQueryRequest(BaseModel):
-    tenantId: str
-    userId: str
-    query: str
-    limit: Optional[int] = 10
-    referenceTime: Optional[str] = None
-
-
-class MemoryQueryResponse(BaseModel):
-    facts: List[Fact] = []
-    entities: List[Entity] = []
-    metadata: Dict[str, Any] = {}
 
 
 # Response Models
@@ -118,4 +106,18 @@ class BriefResponse(BaseModel):
 
     # Meta
     instructions: List[str] = []
+    metadata: Dict[str, Any] = {}
+
+
+class MemoryQueryRequest(BaseModel):
+    tenantId: str
+    userId: str
+    query: str
+    limit: Optional[int] = 10
+    referenceTime: Optional[str] = None
+
+
+class MemoryQueryResponse(BaseModel):
+    facts: List[Fact] = []
+    entities: List[Entity] = []
     metadata: Dict[str, Any] = {}

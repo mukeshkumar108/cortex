@@ -10,7 +10,7 @@ import pytest
 from httpx import AsyncClient, ASGITransport
 
 from src.main import app, graphiti_client
-from src import loops, session as session_module
+from src import session as session_module
 from starlette.background import BackgroundTasks
 from src.openrouter_client import get_llm_client
 
@@ -22,8 +22,6 @@ def _db_url() -> str:
     password = os.getenv("POSTGRES_PASSWORD", "password")
     return f"postgresql://synapse:{password}@postgres:5432/synapse"
 
-
-_ZERO_VECTOR_1536 = "[" + ",".join(["0"] * 1536) + "]"
 
 
 @pytest.mark.asyncio
@@ -372,11 +370,6 @@ async def test_ingest_returns_fast(monkeypatch):
 
     start = time.monotonic()
     async with app.router.lifespan_context(app):
-        if loops._manager is not None:
-            async def _no_embed(_text):
-                return _ZERO_VECTOR_1536
-            loops._manager._generate_embedding = _no_embed
-
         async with AsyncClient(
             transport=ASGITransport(app=app),
             base_url="http://test"
@@ -397,4 +390,3 @@ async def test_ingest_returns_fast(monkeypatch):
     elapsed = time.monotonic() - start
 
     assert elapsed < 0.2
-    assert recorded

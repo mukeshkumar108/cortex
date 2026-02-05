@@ -97,12 +97,16 @@ async def lifespan(app: FastAPI):
         app.state.idle_close_task.cancel()
         try:
             await app.state.idle_close_task
+        except asyncio.CancelledError:
+            pass
         except Exception:
             pass
     if getattr(app.state, "outbox_drain_task", None):
         app.state.outbox_drain_task.cancel()
         try:
             await app.state.outbox_drain_task
+        except asyncio.CancelledError:
+            pass
         except Exception:
             pass
     await db.close()
