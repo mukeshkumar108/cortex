@@ -117,3 +117,54 @@ async def test_session_close_sends_raw_transcript_episode():
         assert row["closed_at"] is not None
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_session_brief_happy_path():
+    tenant = f"tenant-{uuid4().hex}"
+    user = f"user-{uuid4().hex}"
+
+    async def _stub_recent_summaries(**_kwargs):
+        return [
+            {"summary": "User talked about testing and bugs", "reference_time": "2026-02-05T01:00:00Z"},
+            {"summary": "User planned a demo", "reference_time": "2026-02-04T20:00:00Z"},
+            {"summary": "User mentioned Ashley", "reference_time": "2026-02-04T18:00:00Z"},
+        ]
+
+    async def _stub_search_nodes(**kwargs):
+        query = kwargs.get("query", "")
+        if "tension" in query:
+            return [{
+                "summary": "Flaky tests",
+                "type": "Tension",
+                "attributes": {"description": "Flaky tests", "status": "unresolved"},
+            }]
+        if "mood" in query:
+            return [{
+                "summary": "Frustrated",
+                "type": "MentalState",
+                "attributes": {"mood": "Frustrated", "energy_level": "Low"},
+            }]
+        if "environment" in query:
+            return [{
+                "summary": "Cafe",
+                "type": "Environment",
+                "attributes": {"location_type": "Cafe", "vibe": "Noisy"},
+            }]
+        return []
+
+    graphiti_client.get_recent_episode_summaries = _stub_recent_summaries
+    graphiti_client.search_nodes = _stub_search_nodes
+
+    from src.main import session_brief
+
+    resp = await session_brief(
+        tenantId=tenant,
+        userId=user,
+        now="2026-02-05T03:00:00Z",
+    )
+    assert resp.timeGapDescription
+    assert len(resp.narrativeSummary) == 3
+    assert resp.activeLoops[0]["status"] == "unresolved"
+    assert resp.currentVibe["mood"] == "Frustrated"
+    assert resp.currentVibe["locationType"] == "Cafe"

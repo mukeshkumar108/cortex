@@ -80,6 +80,41 @@ On‑demand semantic memory lookup via Graphiti.
 
 ---
 
+### GET /session/brief
+Narrative start‑brief derived from Graphiti custom entities.
+
+**Query params**
+```
+tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z
+```
+
+**Response (example)**
+```json
+{
+  "timeGapDescription": "5 hours since last spoke",
+  "narrativeSummary": [
+    {"summary": "User discussed testing and bugs", "reference_time": "2026-02-04T12:00:00Z"},
+    {"summary": "User planned a demo", "reference_time": "2026-02-04T09:00:00Z"},
+    {"summary": "User mentioned Ashley", "reference_time": "2026-02-03T20:00:00Z"}
+  ],
+  "activeLoops": [
+    {"description": "Flaky tests", "status": "unresolved"}
+  ],
+  "currentVibe": {
+    "mood": "Frustrated",
+    "energyLevel": "Low",
+    "locationType": "Cafe",
+    "vibe": "Noisy"
+  }
+}
+```
+
+Notes:
+- Built from Graphiti narrative entities: `MentalState`, `Tension`, `Environment`.
+- Intended for session start only.
+
+---
+
 ### POST /ingest
 Write both user and assistant turns. This stores the session transcript only.
 
@@ -183,6 +218,7 @@ Use this if you keep working memory locally and only send full transcripts.
 ## Orchestration Loop (Recommended)
 
 1) **Session start** (optional): call `/brief` once to seed time + working memory.
+2) **Optional**: call `/session/brief` to get a narrative start‑brief in one call.
 2) Build the LLM prompt with:
    - recent working memory (last 1–6 turns)
    - rolling summary (if present)

@@ -50,6 +50,11 @@ session_buffer (tenant_id, session_id)
 ### Procedural Memory
 - Not implemented in Synapse v1; should be modeled in Graphiti (custom entities/edges) if needed
 
+### Narrative Continuity (Graphiti custom types)
+- Synapse defines custom entities: MentalState, Tension, Environment
+- Custom edges: FEELS, STRUGGLING_WITH, LOCATED_IN
+- /session/brief provides a narrative start‑brief derived from these entities
+
 ## /brief Contract
 - Minimal: temporalAuthority, workingMemory, rollingSummary
 - No semantic context here; orchestrator queries Graphiti via /memory/query

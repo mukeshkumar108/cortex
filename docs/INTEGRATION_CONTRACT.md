@@ -180,6 +180,42 @@ These require header `X-Internal-Token` and are intended for ops/debug only:
 
 ---
 
+### GET /session/brief
+**Auth:** none (public endpoint)
+**Headers:** none
+
+**Query params**
+```
+tenantId=tenant_a&userId=user_1&now=2026-02-04T18:00:00Z
+```
+
+**Response JSON (example)**
+```json
+{
+  "timeGapDescription": "5 hours since last spoke",
+  "narrativeSummary": [
+    {"summary": "User discussed testing and bugs", "reference_time": "2026-02-04T12:00:00Z"},
+    {"summary": "User planned a demo", "reference_time": "2026-02-04T09:00:00Z"},
+    {"summary": "User mentioned Ashley", "reference_time": "2026-02-03T20:00:00Z"}
+  ],
+  "activeLoops": [
+    {"description": "Flaky tests", "status": "unresolved"}
+  ],
+  "currentVibe": {
+    "mood": "Frustrated",
+    "energyLevel": "Low",
+    "locationType": "Cafe",
+    "vibe": "Noisy"
+  }
+}
+```
+
+Notes:
+- Derived from Graphiti narrative entities: `MentalState`, `Tension`, `Environment`.
+- Use at session start if you want a short “start‑brief” without issuing multiple queries.
+
+---
+
 ### POST /session/close
 **Auth:** none (public endpoint)
 **Headers:**

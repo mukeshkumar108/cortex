@@ -123,6 +123,13 @@ class MemoryQueryResponse(BaseModel):
     metadata: Dict[str, Any] = {}
 
 
+class SessionBriefResponse(BaseModel):
+    timeGapDescription: Optional[str] = None
+    narrativeSummary: List[Dict[str, Any]] = []
+    activeLoops: List[Dict[str, Any]] = []
+    currentVibe: Dict[str, Any] = {}
+
+
 class SessionCloseRequest(BaseModel):
     tenantId: str
     userId: str

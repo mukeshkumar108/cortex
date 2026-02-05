@@ -25,6 +25,10 @@ Call `/memory/query` for targeted questions when needed:
 - “What is the user worried about?”
 - “Any pending tasks?”
 
+### 2b) Start‑brief (optional)
+Call `/session/brief` to get a short narrative start‑brief derived from Graphiti’s
+custom entities (MentalState, Tension, Environment).
+
 ### 3) Ingest turns
 Send both user and assistant turns to `/ingest`.
 
@@ -35,6 +39,13 @@ Returns temporal authority + working memory + rolling summary.
 
 ### POST /memory/query (Graphiti)
 Returns facts/entities for a natural‑language query.
+
+### GET /session/brief
+Returns a structured start‑brief:
+- time gap since last episode
+- last 3 episode summaries
+- unresolved tensions
+- most recent mood + environment
 
 ### POST /ingest
 Stores the turn in the session transcript and buffer.
@@ -76,6 +87,7 @@ Use if Sophie stores working memory locally and only sends full transcripts.
 
 ## Practical heuristics
 - Call `/brief` only at session start.
+- Use `/session/brief` when you want a narrative “start‑brief” in one call.
 - Cache memory query results per session to avoid repeated calls.
 - Ask Graphiti only when the user mentions a person, project, or asks for recall.
 - Close sessions after 15 minutes of user inactivity via `/session/close`.

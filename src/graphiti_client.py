@@ -4,12 +4,70 @@ from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.nodes import EpisodeType
 from graphiti_core.driver.falkordb_driver import FalkorDriver
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import logging
 from .config import get_settings
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+class MentalState(BaseModel):
+    """The user's emotional or cognitive disposition during the episode."""
+    mood: Optional[str] = Field(None, description="e.g., Frustrated, Peaceful, Happy")
+    energy_level: Optional[str] = Field(None, description="e.g., High, Burnt out, Wired")
+
+
+class Tension(BaseModel):
+    """An unresolved problem, task, or psychological friction."""
+    description: str = Field(..., description="What is the user struggling with?")
+    status: str = Field("unresolved", description="Current state of this loop")
+
+
+class Environment(BaseModel):
+    """The physical or situational context mentioned in the session."""
+    location_type: Optional[str] = Field(None, description="e.g., Cafe, Home, Gym, Outside")
+    vibe: Optional[str] = Field(None, description="e.g., Sunset, Noisy, Raining")
+
+
+class Feels(BaseModel):
+    """Edge: Person feels a MentalState."""
+    pass
+
+
+class StrugglingWith(BaseModel):
+    """Edge: Person is struggling with a Tension."""
+    pass
+
+
+class LocatedIn(BaseModel):
+    """Edge: Person is located in an Environment."""
+    pass
+
+
+NARRATIVE_ENTITY_TYPES: Dict[str, type[BaseModel]] = {
+    "MentalState": MentalState,
+    "Tension": Tension,
+    "Environment": Environment,
+}
+
+NARRATIVE_EDGE_TYPES: Dict[str, type[BaseModel]] = {
+    "FEELS": Feels,
+    "STRUGGLING_WITH": StrugglingWith,
+    "LOCATED_IN": LocatedIn,
+}
+
+NARRATIVE_EDGE_TYPE_MAP: Dict[Tuple[str, str], List[str]] = {
+    ("Person", "MentalState"): ["FEELS"],
+    ("Person", "Tension"): ["STRUGGLING_WITH"],
+    ("Person", "Environment"): ["LOCATED_IN"],
+}
+
+NARRATIVE_EXTRACTION_INSTRUCTIONS = (
+    "Pay close attention to changes in the user's mood and any mentions of unfinished tasks "
+    "or environment. Do not stop extracting generic entities like names and locations, but "
+    "prioritize these structured types."
+)
 
 
 def _is_edge_result(result: Any) -> bool:
@@ -154,6 +212,20 @@ class GraphitiClient:
         """Create composite user ID for Graphiti"""
         return f"{tenant_id}__{user_id}"
 
+    def _format_message_transcript(self, messages: List[Dict[str, Any]]) -> str:
+        lines: List[str] = []
+        for msg in messages:
+            role = (msg.get("role") or "").lower()
+            if role == "assistant":
+                role_label = "Assistant"
+            elif role == "system":
+                role_label = "System"
+            else:
+                role_label = "User"
+            text = msg.get("text") or ""
+            lines.append(f"{role_label}: {text}")
+        return "\n".join(lines)
+
     async def add_episode(
         self,
         tenant_id: str,
@@ -190,7 +262,11 @@ class GraphitiClient:
                 source=EpisodeType.message,
                 source_description="synapse_conversation",
                 reference_time=timestamp,
-                group_id=composite_user_id
+                group_id=composite_user_id,
+                entity_types=NARRATIVE_ENTITY_TYPES,
+                edge_types=NARRATIVE_EDGE_TYPES,
+                edge_type_map=NARRATIVE_EDGE_TYPE_MAP,
+                custom_extraction_instructions=NARRATIVE_EXTRACTION_INSTRUCTIONS
             )
 
             logger.info(f"Added episode for user {composite_user_id} (role={role})")
@@ -199,6 +275,26 @@ class GraphitiClient:
         except Exception as e:
             logger.error(f"Failed to add episode: {e}")
             return {"success": False}
+
+    async def add_session_episode(
+        self,
+        tenant_id: str,
+        user_id: str,
+        messages: List[Dict[str, Any]],
+        reference_time: datetime,
+        episode_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        transcript = self._format_message_transcript(messages)
+        return await self.add_episode(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            text=transcript,
+            timestamp=reference_time,
+            role=None,
+            metadata=metadata,
+            episode_name=episode_name
+        )
 
     async def search_facts(
         self,
@@ -364,6 +460,11 @@ class GraphitiClient:
                 elif hasattr(result, 'id'):
                     entity_data["uuid"] = str(result.id)
 
+                if hasattr(result, 'attributes'):
+                    entity_data["attributes"] = result.attributes
+                elif hasattr(result, 'metadata'):
+                    entity_data["attributes"] = result.metadata
+
                 entities.append(entity_data)
 
                 # Stop once we have enough valid entities
@@ -376,6 +477,30 @@ class GraphitiClient:
         except Exception as e:
             logger.error(f"search_nodes failed: {e}")
             return []
+
+    def _extract_episode_summary(self, episode: Any) -> Dict[str, Any]:
+        if isinstance(episode, dict):
+            summary = (
+                episode.get("summary")
+                or episode.get("episode_summary")
+                or episode.get("text")
+                or episode.get("episode_body")
+                or episode.get("content")
+            )
+            reference_time = episode.get("reference_time") or episode.get("created_at")
+        else:
+            summary = (
+                getattr(episode, "summary", None)
+                or getattr(episode, "episode_summary", None)
+                or getattr(episode, "episode_body", None)
+                or getattr(episode, "content", None)
+            )
+            reference_time = getattr(episode, "reference_time", None) or getattr(episode, "created_at", None)
+
+        return {
+            "summary": summary,
+            "reference_time": reference_time
+        }
 
     async def search(
         self,
@@ -457,6 +582,20 @@ class GraphitiClient:
                 return text
 
         return None
+
+    async def get_recent_episode_summaries(
+        self,
+        tenant_id: str,
+        user_id: str,
+        limit: int = 3
+    ) -> List[Dict[str, Any]]:
+        episodes = await self.get_recent_episodes(tenant_id, user_id, since=None, limit=limit)
+        results: List[Dict[str, Any]] = []
+        for episode in episodes:
+            extracted = self._extract_episode_summary(episode)
+            if extracted.get("summary"):
+                results.append(extracted)
+        return results
 
     async def smoke_test(
         self,

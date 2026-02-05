@@ -16,11 +16,11 @@ async def test_session_ingest_calls_graphiti_once():
 
     called = {}
 
-    async def _stub_add_episode(**kwargs):
+    async def _stub_add_session_episode(**kwargs):
         called.update(kwargs)
         return {"ok": True}
 
-    graphiti_client.add_episode = _stub_add_episode
+    graphiti_client.add_session_episode = _stub_add_session_episode
 
     async with app.router.lifespan_context(app):
         async with AsyncClient(
@@ -47,5 +47,7 @@ async def test_session_ingest_calls_graphiti_once():
             assert data["status"] == "ingested"
             assert data["sessionId"] == session_id
 
-    assert "text" in called
-    assert "My name is Mukesh" in called["text"]
+    assert "messages" in called
+    transcript = graphiti_client._format_message_transcript(called["messages"])
+    assert "User: My name is Mukesh" in transcript
+    assert "Assistant: Nice to meet you" in transcript

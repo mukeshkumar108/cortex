@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 import asyncio
 from datetime import datetime
 import logging
+from typing import Optional, Dict, Any
 
 from .models import (
     IngestRequest,
@@ -17,6 +18,7 @@ from .models import (
     SessionCloseRequest,
     SessionIngestRequest,
     SessionIngestResponse,
+    SessionBriefResponse,
 )
 from .config import get_settings
 from .db import Database
@@ -255,6 +257,107 @@ async def memory_query(request: MemoryQueryRequest):
         raise HTTPException(status_code=500, detail="Memory query failed")
 
 
+@app.get("/session/brief", response_model=SessionBriefResponse)
+async def session_brief(
+    tenantId: str,
+    userId: str,
+    now: Optional[str] = None
+):
+    """
+    Generate a session start-brief from Graphiti narrative entities.
+    """
+    try:
+        reference_now = datetime.utcnow()
+        if now:
+            reference_now = datetime.fromisoformat(now.replace("Z", "+00:00"))
+
+        episodes = await graphiti_client.get_recent_episode_summaries(
+            tenant_id=tenantId,
+            user_id=userId,
+            limit=3
+        )
+
+        time_gap_description = None
+        if episodes:
+            last_time = episodes[0].get("reference_time")
+            if isinstance(last_time, str):
+                try:
+                    last_time = datetime.fromisoformat(last_time.replace("Z", "+00:00"))
+                except Exception:
+                    last_time = None
+            if last_time:
+                delta = reference_now - last_time
+                hours = int(delta.total_seconds() // 3600)
+                minutes = int((delta.total_seconds() % 3600) // 60)
+                if hours > 0:
+                    time_gap_description = f"{hours} hours since last spoke"
+                else:
+                    time_gap_description = f"{minutes} minutes since last spoke"
+
+        tensions = await graphiti_client.search_nodes(
+            tenant_id=tenantId,
+            user_id=userId,
+            query="current problems tasks unresolved tensions",
+            limit=10,
+            reference_time=reference_now
+        )
+        active_loops = []
+        for t in tensions:
+            t_type = (t.get("type") or "").lower() if isinstance(t, dict) else ""
+            if t_type != "tension":
+                continue
+            attrs = t.get("attributes") if isinstance(t, dict) else None
+            status = None
+            description = None
+            if isinstance(attrs, dict):
+                status = attrs.get("status")
+                description = attrs.get("description")
+            active_loops.append({
+                "description": description or t.get("summary"),
+                "status": status or "unresolved"
+            })
+
+        mental_states = await graphiti_client.search_nodes(
+            tenant_id=tenantId,
+            user_id=userId,
+            query="user mood mental state energy level",
+            limit=5,
+            reference_time=reference_now
+        )
+        environments = await graphiti_client.search_nodes(
+            tenant_id=tenantId,
+            user_id=userId,
+            query="current environment location vibe",
+            limit=5,
+            reference_time=reference_now
+        )
+
+        current_vibe: Dict[str, Any] = {}
+        for ms in mental_states:
+            if (ms.get("type") or "").lower() == "mentalstate":
+                attrs = ms.get("attributes") or {}
+                current_vibe["mood"] = attrs.get("mood") or ms.get("summary")
+                current_vibe["energyLevel"] = attrs.get("energy_level")
+                break
+
+        for env in environments:
+            if (env.get("type") or "").lower() == "environment":
+                attrs = env.get("attributes") or {}
+                current_vibe["locationType"] = attrs.get("location_type") or env.get("summary")
+                current_vibe["vibe"] = attrs.get("vibe")
+                break
+
+        return SessionBriefResponse(
+            timeGapDescription=time_gap_description,
+            narrativeSummary=episodes,
+            activeLoops=active_loops,
+            currentVibe=current_vibe
+        )
+    except Exception as e:
+        logger.error(f"Session brief failed: {e}")
+        raise HTTPException(status_code=500, detail="Session brief failed")
+
+
 @app.post("/session/close")
 async def close_session(request: SessionCloseRequest):
     """
@@ -301,12 +404,6 @@ async def ingest_session(request: SessionIngestRequest):
     Session-only ingestion: send full transcript to Graphiti as one episode.
     """
     try:
-        # Build raw transcript text
-        lines = []
-        for m in request.messages:
-            lines.append(f"{m.role}: {m.text}")
-        raw_text = "\n".join(lines)
-
         # Determine timestamps
         started_at = request.startedAt
         ended_at = request.endedAt
@@ -316,13 +413,14 @@ async def ingest_session(request: SessionIngestRequest):
             ended_at = request.messages[-1].timestamp
 
         episode_name = f"session_raw_{request.sessionId}"
+        reference_time = datetime.fromisoformat(ended_at.replace("Z", "+00:00")) if ended_at else datetime.utcnow()
+        messages_payload = [m.model_dump() for m in request.messages]
 
-        await graphiti_client.add_episode(
+        await graphiti_client.add_session_episode(
             tenant_id=request.tenantId,
             user_id=request.userId,
-            text=raw_text,
-            timestamp=datetime.utcnow(),
-            role=None,
+            messages=messages_payload,
+            reference_time=reference_time,
             episode_name=episode_name,
             metadata={
                 "session_id": request.sessionId,
@@ -342,7 +440,7 @@ async def ingest_session(request: SessionIngestRequest):
             """,
             request.tenantId,
             request.sessionId,
-            [m.model_dump() for m in request.messages]
+            messages_payload
         )
 
         return SessionIngestResponse(
