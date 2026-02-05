@@ -63,7 +63,7 @@ Use this at the start of each turn to fetch memory context.
 
 Notes:
 - Tier 1 fields (identity, temporalAuthority, workingMemory, rollingSummary, activeLoops) are always returned.
-- Tier 2 fields (semanticContext, entities, episodeBridge) are best-effort and may be empty.
+- Tier 2 fields (semanticContext, entities) are best-effort and may be empty. episodeBridge is local.
 
 ### POST /ingest
 
@@ -125,7 +125,7 @@ Notes:
 
 **session_start**
 - Use when a new sessionId begins or when there is a gap > 30 minutes since last interaction.
-- The response may include `episodeBridge` to reconnect context.
+- The response may include `episodeBridge` (local session summary) to reconnect context.
 
 **in_session**
 - Use for continuous conversation within an active session.
@@ -160,7 +160,7 @@ All debug endpoints require header `X-Internal-Token` = `INTERNAL_TOKEN`.
   - Returns session_buffer row, transcript archive (if any), active loops, session episode blob/name, timestamps.
 
 - `GET /internal/debug/user?tenantId&userId`
-  - Returns latest session id, last interaction time, last session summary episode (episodeBridge),
+  - Returns latest session id, last interaction time, last session summary (episodeBridge),
     active loops, and top entities (if available).
 
 - `GET /internal/debug/outbox?tenantId&limit=50`

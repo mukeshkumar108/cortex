@@ -198,7 +198,7 @@ Caching note:
 - Graphiti recall is **not automatic**. Pass `query` when you need semantic memory.
 - Identity defaults to null until user states it. Don’t assume a name exists.
 - Outbox won’t drain unless `OUTBOX_DRAIN_ENABLED=true` or `/internal/drain` is called.
-- Session summaries depend on idle close; enable `IDLE_CLOSE_ENABLED` for reliable episodeBridge.
+- Episode bridge comes from local session summaries; enable `IDLE_CLOSE_ENABLED` for reliable episodeBridge.
 - Noise filter may return `status: skipped` for very short messages.
 - Nudge candidates repeat if `last_nudged_at` isn’t set after you send one.
 

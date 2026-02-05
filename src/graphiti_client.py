@@ -1,5 +1,7 @@
 import inspect
 from graphiti_core import Graphiti
+from graphiti_core.llm_client.client import LLMClient
+from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.nodes import EpisodeType
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from typing import List, Dict, Any, Optional
@@ -101,9 +103,27 @@ class GraphitiClient:
 
             falkor_driver = FalkorDriver(**driver_kwargs)
 
+            llm_client = None
+            api_key = self.settings.graphiti_llm_api_key or self.settings.openai_api_key
+            if (
+                self.settings.graphiti_llm_model
+                or self.settings.graphiti_llm_base_url
+                or self.settings.graphiti_llm_small_model
+                or self.settings.graphiti_llm_api_key
+            ):
+                llm_config = LLMConfig(
+                    api_key=api_key,
+                    model=self.settings.graphiti_llm_model,
+                    base_url=self.settings.graphiti_llm_base_url,
+                    temperature=self.settings.graphiti_llm_temperature,
+                    max_tokens=self.settings.graphiti_llm_max_tokens,
+                    small_model=self.settings.graphiti_llm_small_model
+                )
+                llm_client = LLMClient(config=llm_config)
+
             # Initialize Graphiti with LLM extraction enabled
-            # llm_client defaults to OpenAI if OPENAI_API_KEY is set in environment
-            self.client = Graphiti(graph_driver=falkor_driver)
+            # If llm_client is None, Graphiti uses its defaults (OpenAI if API key set)
+            self.client = Graphiti(graph_driver=falkor_driver, llm_client=llm_client)
 
             await self._maybe_build_indices()
 

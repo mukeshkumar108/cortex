@@ -11,6 +11,14 @@ class Settings(BaseSettings):
     falkordb_host: str = "falkordb"
     falkordb_port: int = 6379
 
+    # Graphiti LLM (optional override)
+    graphiti_llm_api_key: Optional[str] = None
+    graphiti_llm_model: Optional[str] = None
+    graphiti_llm_small_model: Optional[str] = None
+    graphiti_llm_base_url: Optional[str] = None
+    graphiti_llm_temperature: float = 1.0
+    graphiti_llm_max_tokens: int = 8192
+
     # OpenAI
     openai_api_key: str
 

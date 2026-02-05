@@ -13,7 +13,7 @@ Synapse is a memory backend. It stores short-term session state (rolling summary
 - `graphiti_outbox`: reliable queue for long-term memory delivery
 
 **Graphiti (derived, best‑effort)**
-- Episodes (session summary episodes by default)
+- Episodes (raw session transcript episodes by default)
 - Facts/entities (semantic recall)
 
 If Graphiti is down, Synapse still works using Postgres.
@@ -102,7 +102,7 @@ There is no magic push. The orchestrator must ask.
 
 ## Session boundaries
 - Synapse auto-closes sessions after inactivity (idle close loop, config).
-- New session summary episodes are generated at close, used as `episodeBridge`.
+- Local session summaries are generated at close, used as `episodeBridge`.
 - You can use your own sessionId policy; Synapse will follow it.
 
 ## Nudge candidates

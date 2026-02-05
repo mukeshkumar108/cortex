@@ -33,16 +33,17 @@ Docs:
 - `DECISIONS.md`
 
 ## Key concepts
-- **Session buffer**: Postgres keeps rolling summary + last 6 turns.
+- **Session buffer**: Postgres keeps rolling summary + last 12 messages (6 user+assistant turns).
 - **Outbox**: evicted turns are queued for Graphiti; retries are backoff‑controlled.
 - **Loops**: procedural memory extracted by LLM (commitments, habits, frictions).
-- **Graphiti**: derived semantic memory (episodes/facts/entities), best‑effort.
+- **Graphiti**: derived semantic memory (episodes/facts/entities), best‑effort. Receives raw session transcripts on close.
 
 ## Configuration (important)
 Environment flags (see `src/config.py`):
 - `IDLE_CLOSE_ENABLED` (default false): close idle sessions in background
 - `OUTBOX_DRAIN_ENABLED` (default false): drain outbox in background
 - `GRAPHITI_PER_TURN` (default false): per‑session episodes only
+- `GRAPHITI_LLM_MODEL` (optional): override Graphiti LLM model
 
 Recommended for staging:
 ```
@@ -55,6 +56,7 @@ OUTBOX_DRAIN_ENABLED=true
 - **Graphiti recall is not automatic**: call `/brief` with `query` to retrieve facts/entities.
 - **Outbox won’t drain** unless `/internal/drain` is called or `OUTBOX_DRAIN_ENABLED=true`.
 - **Session close** happens via idle close loop (config) or next ingest. Enable idle close for clean session summaries.
+- **Graphiti LLM** uses OpenAI by default (via `OPENAI_API_KEY`) unless overridden by `GRAPHITI_LLM_*` settings.
 - **Noise filter**: very short messages may be marked `skipped`.
 
 ## Dev / Test

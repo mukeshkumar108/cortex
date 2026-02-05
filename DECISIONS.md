@@ -40,7 +40,8 @@ session_buffer (tenant_id, session_id)
 
 ### Session Close
 - Sessions close after inactivity (idle close loop, config gated)
-- Close creates a session summary episode (Graphiti) best-effort
+- Close creates a **local** session summary for episodeBridge (Postgres only)
+- Close sends **raw transcript** as a Graphiti episode (for extraction)
 - Close enqueues remaining turns to outbox
 
 ### Outbox

@@ -72,15 +72,15 @@ async def build_briefing(
         entities: List[Entity] = []
         episode_bridge: Optional[str] = None
 
-        # If new session, try to fetch latest session summary as episode bridge
+        # If new session, try to fetch latest local session summary as episode bridge
         if session_id and not working_memory and not rolling_summary:
             try:
-                episode_bridge = await graphiti_client.get_latest_session_summary(
+                episode_bridge = await session.get_latest_session_episode_text(
                     tenant_id=tenant_id,
                     user_id=user_id
                 )
             except Exception as e:
-                logger.warning(f"Graphiti session summary fetch failed: {e}")
+                logger.warning(f"Local session summary fetch failed: {e}")
 
         if query:
             query_hint = _build_query_hint(working_memory) if len(query.split()) <= 3 else None

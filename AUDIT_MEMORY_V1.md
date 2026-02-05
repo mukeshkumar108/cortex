@@ -10,8 +10,8 @@ Last updated: 2026-02-05
 - Graphiti is best-effort; failures never block /ingest or /brief.
 - Loop extraction is LLM-first and best-effort; procedural state lives in Postgres.
 - Tenant isolation uses composite group_id `f"{tenant_id}__{user_id}"` in Graphiti.
-- /brief returns Postgres Tier 1 data; Graphiti enriches facts/entities/episodeBridge if available.
-- Idle session close runs in background (configurable) to generate session summary episodes.
+- /brief returns Postgres Tier 1 data; Graphiti enriches facts/entities if available; episodeBridge comes from local summaries.
+- Idle session close runs in background (configurable) to generate local session summaries and send raw transcript episodes to Graphiti.
 - Outbox ensures turns are not lost and retries are backoff-controlled.
 
 ## 1) Architecture truth table (canonical vs derived vs best-effort)
@@ -22,7 +22,7 @@ Last updated: 2026-02-05
 | `identity_cache` | Postgres | Derived cache | Graphiti-derived identity cache used by /brief. `src/identity_cache.py` |
 | `loops` | Postgres | Canonical | LLM-first procedural memory; evidence stored in metadata. `src/loops.py::LoopManager` |
 | `session_transcript` | Postgres | Derived | Archive of evicted turns (best-effort). `src/session.py::_append_transcript_turn` |
-| Graphiti episodes | FalkorDB | Derived (best-effort) | Session summary episodes (per-session by default). `src/graphiti_client.py` |
+| Graphiti episodes | FalkorDB | Derived (best-effort) | Raw session transcript episodes (per-session by default). `src/graphiti_client.py` |
 | Graphiti facts/entities | FalkorDB | Derived (best-effort) | Queried during /brief only if `query` provided. |
 | Rolling summary | Postgres | Derived | Lossy summary, not canonical. `src/session.py::_fold_into_summary` |
 
@@ -34,7 +34,6 @@ Last updated: 2026-02-05
 - `loops` (PK: id)
 - `identity_cache` (PK: tenant_id, user_id)
 - `schema_migrations`
-- `identity_cache` (legacy; present but unused)
 
 ### Key columns
 - `session_buffer`: messages (jsonb array), rolling_summary (text), closed_at (timestamptz)
@@ -82,7 +81,7 @@ Last updated: 2026-02-05
 - Tier 1: Postgres (identity from `identity_cache`, workingMemory, rollingSummary, activeLoops, nudgeCandidates)
 - Tier 2: Graphiti (facts/entities) only if `query` is provided
 - `reference_time=now` is passed to Graphiti search calls when supported
-- `episodeBridge` is fetched from latest session summary episode
+- `episodeBridge` is fetched from latest local session summary (Postgres)
 
 **Code pointers:**
 - `src/briefing.py::build_briefing`
@@ -92,7 +91,7 @@ Last updated: 2026-02-05
 - group_id: `f"{tenant_id}__{user_id}"`
 - rerank: enabled by default in search
 - reference_time: passed from /brief
-- episode naming: deterministic for session summary episodes
+- episode naming: deterministic for raw session transcript episodes
 - per-turn episodes: behind `GRAPHITI_PER_TURN` (default false)
 
 ## 6.5) Extraction responsibilities (who does what)
@@ -104,7 +103,7 @@ Last updated: 2026-02-05
 ## 7) Tests audit (what is covered)
 - Sliding window invariant (<=12) and outbox behaviors
 - Outbox error classification + backoff
-- Session close flush + session summary episode
+- Session close flush + local summary + raw transcript episode
 - Loop creation/reinforcement/completion/drop (LLM-first)
 - Nudge candidates behavior
 - Ingest session_id auto-create + metadata fallback
@@ -136,7 +135,7 @@ Last updated: 2026-02-05
 - `session_close_gap_minutes`: 15 by default
 - `idle_close_interval_seconds`: 300
 - `outbox_drain_enabled`: off by default
-- `GRAPHITI_PER_TURN`: false (session summary episodes only)
+- `GRAPHITI_PER_TURN`: false (raw transcript episodes only)
 
 ## 11) How memory retrieval actually works (no magic)
 - Synapse does **not** automatically push semantic memory into prompts.
