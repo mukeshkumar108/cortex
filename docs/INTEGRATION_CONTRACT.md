@@ -135,6 +135,8 @@ These require header `X-Internal-Token` and are intended for ops/debug only:
 - `GET /internal/debug/outbox`
 - `GET /internal/debug/loops`
 - `GET /internal/debug/nudges`
+- `POST /internal/debug/close_session`
+- `POST /internal/debug/close_user_sessions`
 
 ## 3) Canonical Identifiers
 

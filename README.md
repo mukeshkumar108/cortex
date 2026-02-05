@@ -69,6 +69,8 @@ Require header `X-Internal-Token` = `INTERNAL_TOKEN`.
 - `/internal/debug/outbox?tenantId&limit=50`
 - `/internal/debug/loops?tenantId&userId`
 - `/internal/debug/nudges?tenantId&userId`
+- `POST /internal/debug/close_session?tenantId&userId&sessionId`
+- `POST /internal/debug/close_user_sessions?tenantId&userId&limit=20`
 
 ## License
 Private/internal.

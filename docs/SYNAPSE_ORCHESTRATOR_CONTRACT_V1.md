@@ -166,6 +166,12 @@ All debug endpoints require header `X-Internal-Token` = `INTERNAL_TOKEN`.
 - `GET /internal/debug/outbox?tenantId&limit=50`
   - Returns pending/failed outbox rows with next_attempt_at and last_error.
 
+- `POST /internal/debug/close_session?tenantId&userId&sessionId`
+  - Force-closes a single session immediately.
+
+- `POST /internal/debug/close_user_sessions?tenantId&userId&limit=20`
+  - Force-closes all open sessions for a user (bounded).
+
 ## Orchestrator checklist
 
 - Always pass tenantId/userId/sessionId.

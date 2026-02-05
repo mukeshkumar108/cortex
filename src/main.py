@@ -395,6 +395,71 @@ async def debug_outbox(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/internal/debug/close_session")
+async def debug_close_session(
+    tenantId: str,
+    userId: str,
+    sessionId: str,
+    personaId: str | None = None,
+    x_internal_token: str | None = Header(default=None)
+):
+    """Force-close a single session immediately."""
+    _require_internal_token(x_internal_token)
+    try:
+        ok = await session.close_session(
+            tenant_id=tenantId,
+            session_id=sessionId,
+            user_id=userId,
+            graphiti_client=graphiti_client,
+            persona_id=personaId
+        )
+        return {"closed": bool(ok), "sessionId": sessionId}
+    except Exception as e:
+        logger.error(f"Debug close_session error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/internal/debug/close_user_sessions")
+async def debug_close_user_sessions(
+    tenantId: str,
+    userId: str,
+    limit: int = 20,
+    personaId: str | None = None,
+    x_internal_token: str | None = Header(default=None)
+):
+    """Force-close all open sessions for a user (bounded by limit)."""
+    _require_internal_token(x_internal_token)
+    try:
+        rows = await db.fetch(
+            """
+            SELECT session_id
+            FROM session_buffer
+            WHERE tenant_id = $1 AND user_id = $2 AND closed_at IS NULL
+            ORDER BY updated_at DESC
+            LIMIT $3
+            """,
+            tenantId,
+            userId,
+            limit
+        )
+        closed = []
+        for row in rows:
+            session_id = row["session_id"]
+            ok = await session.close_session(
+                tenant_id=tenantId,
+                session_id=session_id,
+                user_id=userId,
+                graphiti_client=graphiti_client,
+                persona_id=personaId
+            )
+            if ok:
+                closed.append(session_id)
+        return {"closedCount": len(closed), "closedSessions": closed}
+    except Exception as e:
+        logger.error(f"Debug close_user_sessions error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
