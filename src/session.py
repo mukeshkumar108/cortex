@@ -119,7 +119,7 @@ class SessionManager:
                 async with conn.transaction():
                     row = await conn.fetchrow(
                         """
-                        SELECT tenant_id, session_id, user_id, rolling_summary, messages
+                        SELECT tenant_id, session_id, user_id, rolling_summary, messages, session_state
                         FROM session_buffer
                         WHERE tenant_id = $1 AND session_id = $2
                         FOR UPDATE
@@ -145,7 +145,7 @@ class SessionManager:
                         )
                         row = await conn.fetchrow(
                             """
-                            SELECT tenant_id, session_id, user_id, rolling_summary, messages
+                            SELECT tenant_id, session_id, user_id, rolling_summary, messages, session_state
                             FROM session_buffer
                             WHERE tenant_id = $1 AND session_id = $2
                             FOR UPDATE
@@ -189,19 +189,30 @@ class SessionManager:
                             f"evicted oldest turn to outbox"
                         )
 
+                    last_user_ts = timestamp if role == "user" else None
                     await conn.execute(
                         """
                         UPDATE session_buffer
                         SET
                             rolling_summary = $1,
                             messages = $2,
+                            session_state = CASE
+                                WHEN $5::text IS NULL THEN session_state
+                                ELSE jsonb_set(
+                                    COALESCE(session_state, '{}'::jsonb),
+                                    '{last_user_message_ts}',
+                                    to_jsonb($5::text),
+                                    true
+                                )
+                            END,
                             updated_at = NOW()
                         WHERE tenant_id = $3 AND session_id = $4
                         """,
                         row["rolling_summary"] or "",
                         messages,
                         tenant_id,
-                        session_id
+                        session_id,
+                        last_user_ts
                     )
 
                     return oldest_turn
@@ -864,7 +875,7 @@ Do not include filler or meta-commentary."""
         tenant_id: str,
         session_id: str
     ) -> Optional[datetime]:
-        """Get timestamp of last message in buffer"""
+        """Get timestamp of last user message in buffer"""
         try:
             query = """
                 SELECT messages FROM session_buffer
@@ -879,11 +890,11 @@ Do not include filler or meta-commentary."""
             if not isinstance(messages, list) or not messages:
                 return None
 
-            last_message = messages[-1]
-            timestamp_str = last_message.get('timestamp')
-
-            if timestamp_str:
-                return datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+            for message in reversed(messages):
+                if message.get("role") == "user":
+                    timestamp_str = message.get('timestamp')
+                    if timestamp_str:
+                        return datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
 
             return None
 
@@ -1010,7 +1021,13 @@ Do not include filler or meta-commentary."""
                         FROM session_buffer
                         WHERE closed_at IS NULL
                           AND (session_state->>'closing') IS NULL
-                          AND updated_at < NOW() - ($1::int * INTERVAL '1 minute')
+                          AND (
+                            CASE
+                              WHEN session_state ? 'last_user_message_ts'
+                                THEN (session_state->>'last_user_message_ts')::timestamptz
+                              ELSE updated_at
+                            END
+                          ) < NOW() - ($1::int * INTERVAL '1 minute')
                         ORDER BY updated_at ASC
                         FOR UPDATE SKIP LOCKED
                         LIMIT $2
