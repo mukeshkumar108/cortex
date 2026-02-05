@@ -14,6 +14,7 @@ from .models import (
     MemoryQueryResponse,
     Fact,
     Entity,
+    SessionCloseRequest,
 )
 from .config import get_settings
 from .db import Database
@@ -250,6 +251,46 @@ async def memory_query(request: MemoryQueryRequest):
     except Exception as e:
         logger.error(f"Memory query failed: {e}")
         raise HTTPException(status_code=500, detail="Memory query failed")
+
+
+@app.post("/session/close")
+async def close_session(request: SessionCloseRequest):
+    """
+    Public session close endpoint.
+
+    Orchestrator should call this after inactivity to flush raw transcript to Graphiti.
+    """
+    try:
+        # Determine session to close
+        session_id = request.sessionId
+        if not session_id:
+            row = await db.fetchone(
+                """
+                SELECT session_id
+                FROM session_buffer
+                WHERE tenant_id = $1 AND user_id = $2 AND closed_at IS NULL
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                request.tenantId,
+                request.userId
+            )
+            session_id = row.get("session_id") if row else None
+
+        if not session_id:
+            return {"closed": False, "reason": "no_open_session"}
+
+        ok = await session.close_session(
+            tenant_id=request.tenantId,
+            session_id=session_id,
+            user_id=request.userId,
+            graphiti_client=graphiti_client,
+            persona_id=request.personaId
+        )
+        return {"closed": bool(ok), "sessionId": session_id}
+    except Exception as e:
+        logger.error(f"Session close failed: {e}")
+        raise HTTPException(status_code=500, detail="Session close failed")
 
 
 @app.post("/internal/drain")

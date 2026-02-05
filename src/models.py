@@ -121,3 +121,10 @@ class MemoryQueryResponse(BaseModel):
     facts: List[Fact] = []
     entities: List[Entity] = []
     metadata: Dict[str, Any] = {}
+
+
+class SessionCloseRequest(BaseModel):
+    tenantId: str
+    userId: str
+    sessionId: Optional[str] = None
+    personaId: Optional[str] = None

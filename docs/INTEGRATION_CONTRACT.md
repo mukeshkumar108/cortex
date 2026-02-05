@@ -165,6 +165,34 @@ These require header `X-Internal-Token` and are intended for ops/debug only:
 }
 ```
 
+---
+
+### POST /session/close
+**Auth:** none (public endpoint)
+**Headers:**
+- `Content-Type: application/json`
+
+**Request JSON**
+```json
+{
+  "tenantId": "tenant_a",
+  "userId": "user_1",
+  "sessionId": "session-abc",
+  "personaId": "persona_1"
+}
+```
+
+**Response JSON (example)**
+```json
+{
+  "closed": true,
+  "sessionId": "session-abc"
+}
+```
+
+Notes:
+- If `sessionId` is omitted, Synapse closes the most recent open session for the user.
+
 **Response JSON (example)**
 ```json
 {

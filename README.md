@@ -6,6 +6,7 @@ A FastAPI memory service with a sliding‑window session buffer and Graphiti‑n
 - **/ingest**: writes turns to Postgres (rolling summary + last 12 messages). Never blocks.
 - **/brief**: minimal session seed (time + working memory + rolling summary).
 - **/memory/query**: on‑demand Graphiti memory query (facts/entities).
+- **/session/close**: flushes raw transcript to Graphiti.
 - **Outbox**: reliable delivery of evicted turns; raw transcript is sent to Graphiti on session close.
 
 ## Quickstart

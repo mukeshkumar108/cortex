@@ -39,6 +39,19 @@ Returns facts/entities for a natural‑language query.
 ### POST /ingest
 Stores the turn in the session transcript and buffer.
 
+### POST /session/close
+Use after inactivity to flush raw transcript to Graphiti.
+
+**Request**
+```json
+{
+  "tenantId": "tenant_a",
+  "userId": "user_1",
+  "sessionId": "session-abc",
+  "personaId": "persona_1"
+}
+```
+
 ## Failure behavior
 - Graphiti down → /brief and /ingest still succeed.
 - Memory query fails → orchestrator proceeds without semantic memory.
@@ -47,3 +60,4 @@ Stores the turn in the session transcript and buffer.
 - Call `/brief` only at session start.
 - Cache memory query results per session to avoid repeated calls.
 - Ask Graphiti only when the user mentions a person, project, or asks for recall.
+- Close sessions after 15 minutes of user inactivity via `/session/close`.

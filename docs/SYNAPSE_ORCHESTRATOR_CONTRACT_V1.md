@@ -124,6 +124,32 @@ Notes:
 
 ---
 
+### POST /session/close
+Public close endpoint to flush raw transcript to Graphiti.
+
+**Request**
+```json
+{
+  "tenantId": "tenant_a",
+  "userId": "user_1",
+  "sessionId": "session-abc",
+  "personaId": "persona_1"
+}
+```
+
+**Response**
+```json
+{
+  "closed": true,
+  "sessionId": "session-abc"
+}
+```
+
+Notes:
+- If `sessionId` is omitted, Synapse closes the most recent open session for the user.
+
+---
+
 ## Orchestration Loop (Recommended)
 
 1) **Session start** (optional): call `/brief` once to seed time + working memory.
@@ -133,6 +159,7 @@ Notes:
 3) **On demand memory**: call `/memory/query` with targeted questions.
 4) LLM responds to user.
 5) Call `/ingest` for the user turn and the assistant turn.
+6) If user is inactive for 15 minutes, call `/session/close`.
 
 ---
 
