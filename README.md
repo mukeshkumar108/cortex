@@ -5,6 +5,7 @@ A FastAPI memory service with a sliding‑window session buffer and Graphiti‑n
 ## What it does (short)
 - **/ingest**: writes turns to Postgres (rolling summary + last 12 messages). Never blocks.
 - **/brief**: minimal session seed (time + working memory + rolling summary).
+- **/session/brief**: Graphiti‑native start brief (narrativeSummary + currentVibe + activeLoops).
 - **/memory/query**: on‑demand Graphiti memory query (facts/entities).
 - **/session/close**: flushes raw transcript to Graphiti.
 - **/session/ingest**: send a full session transcript in one call.
@@ -26,9 +27,10 @@ curl -s http://localhost:8000/health
 ## API: minimal usage
 **Recommended loop**
 1) `/brief` once at session start (optional)
-2) LLM responds
-3) `/ingest` user turn
-4) `/ingest` assistant turn
+2) `/session/brief` if you want a narrative start‑brief (Graphiti)
+3) LLM responds
+4) `/ingest` user turn
+5) `/ingest` assistant turn
 
 Docs:
 - `docs/SOPHIE_ORCHESTRATOR_INTEGRATION_V1.md`
@@ -56,6 +58,7 @@ OUTBOX_DRAIN_ENABLED=true
 ## Gotchas / things to watch
 - **Identity defaults are null** until user states name/home/timezone. Don’t assume name exists.
 - **Graphiti recall is not automatic**: call `/memory/query` to retrieve facts/entities.
+- **/session/brief is Graphiti‑native**: narrativeSummary is derived from Graphiti facts, not transcripts.
 - **Outbox won’t drain** unless `/internal/drain` is called or `OUTBOX_DRAIN_ENABLED=true`.
 - **Session close** happens via idle close loop (config) or next ingest. Enable idle close for clean session summaries.
 - **Graphiti LLM** uses OpenAI by default (via `OPENAI_API_KEY`) unless overridden by `GRAPHITI_LLM_*` settings.
@@ -73,6 +76,8 @@ Require header `X-Internal-Token` = `INTERNAL_TOKEN`.
 - `/internal/debug/outbox?tenantId&limit=50`
 - `/internal/debug/session?tenantId&userId&sessionId`
 - `/internal/debug/nudges?tenantId&userId`
+- `/internal/debug/graphiti/episodes?tenantId&userId&limit=5`
+- `POST /internal/debug/graphiti/query`
 - `POST /internal/debug/close_session?tenantId&userId&sessionId`
 - `POST /internal/debug/close_user_sessions?tenantId&userId&limit=20`
 - `POST /internal/debug/emit_raw_episode?tenantId&userId&sessionId`

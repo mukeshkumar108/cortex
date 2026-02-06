@@ -75,6 +75,7 @@ Last updated: 2026-02-05
 ## 5) /brief read-path contract + Graphiti query strategy
 - /brief returns only temporal authority + workingMemory + rollingSummary
 - Semantic memory is fetched via /memory/query (Graphiti)
+- /session/brief returns narrative start‑brief from Graphiti nodes + edge facts
 - `episodeBridge` is fetched from latest local session summary (Postgres)
 
 **Code pointers:**

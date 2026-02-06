@@ -28,6 +28,7 @@ Call `/memory/query` for targeted questions when needed:
 ### 2b) Start‑brief (optional)
 Call `/session/brief` to get a short narrative start‑brief derived from Graphiti’s
 custom entities (MentalState, Tension, Environment).
+`narrativeSummary` is synthesized from Graphiti facts (not raw transcripts).
 
 ### 3) Ingest turns
 Send both user and assistant turns to `/ingest`.

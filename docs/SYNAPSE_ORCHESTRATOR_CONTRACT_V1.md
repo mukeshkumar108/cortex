@@ -111,6 +111,7 @@ tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z
 
 Notes:
 - Built from Graphiti narrative entities: `MentalState`, `Tension`, `Environment`.
+- `narrativeSummary` is synthesized from Graphiti facts (not raw transcripts).
 - Intended for session start only.
 
 ---
