@@ -32,6 +32,47 @@ curl -s http://localhost:8000/health
 4) `/ingest` user turn
 5) `/ingest` assistant turn
 
+## Quick API examples
+**POST /brief**
+```bash
+curl -s http://localhost:8000/brief -H 'Content-Type: application/json' -d '{
+  "tenantId": "tenant_a",
+  "userId": "user_1",
+  "personaId": "persona_1",
+  "sessionId": "session-demo-001",
+  "now": "2026-02-06T10:15:00Z"
+}'
+```
+
+**GET /session/brief**
+```bash
+curl -s "http://localhost:8000/session/brief?tenantId=tenant_a&userId=user_1&now=2026-02-06T10:15:00Z"
+```
+
+**POST /memory/query**
+```bash
+curl -s http://localhost:8000/memory/query -H 'Content-Type: application/json' -d '{
+  "tenantId": "tenant_a",
+  "userId": "user_1",
+  "query": "What is the user stressed about?",
+  "limit": 10,
+  "referenceTime": "2026-02-06T10:15:00Z"
+}'
+```
+
+**POST /ingest**
+```bash
+curl -s http://localhost:8000/ingest -H 'Content-Type: application/json' -d '{
+  "tenantId": "tenant_a",
+  "userId": "user_1",
+  "personaId": "persona_1",
+  "sessionId": "session-demo-001",
+  "role": "user",
+  "text": "I am stressed at the gym. The blue-widget-glitch is still unresolved.",
+  "timestamp": "2026-02-06T10:15:05Z"
+}'
+```
+
 Docs:
 - `docs/SOPHIE_ORCHESTRATOR_INTEGRATION_V1.md`
 - `AUDIT_MEMORY_V1.md`

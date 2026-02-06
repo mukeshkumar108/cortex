@@ -40,6 +40,22 @@ Returns temporal authority + working memory + rolling summary.
 
 ### POST /memory/query (Graphiti)
 Returns facts/entities for a natural‑language query.
+Example response:
+```json
+{
+  "facts": [
+    {"text": "User is stressed at the gym.", "relevance": null, "source": "graphiti"},
+    {"text": "User is struggling with the blue-widget-glitch in Sophie and it is unresolved.", "relevance": null, "source": "graphiti"},
+    {"text": "User feels burnt out from testing.", "relevance": null, "source": "graphiti"}
+  ],
+  "entities": [
+    {"summary": "stressed", "type": "MentalState", "uuid": "..."},
+    {"summary": "gym", "type": "Environment", "uuid": "..."},
+    {"summary": "blue-widget-glitch", "type": "Tension", "uuid": "..."}
+  ],
+  "metadata": {"query": "What is the user stressed about?", "facts": 3, "entities": 3}
+}
+```
 
 ### GET /session/brief
 Returns a structured start‑brief:
@@ -47,6 +63,25 @@ Returns a structured start‑brief:
 - last 3 episode summaries
 - unresolved tensions
 - most recent mood + environment
+Example response:
+```json
+{
+  "timeGapDescription": "15 minutes since last spoke",
+  "narrativeSummary": [
+    {"summary": "User is at the gym.; User feels stressed.; User is struggling with the blue-widget-glitch in Sophie.", "reference_time": "2026-02-06T10:14:30Z"},
+    {"summary": "User is testing Sophie and feeling burnt out.", "reference_time": "2026-02-06T09:58:12Z"}
+  ],
+  "activeLoops": [
+    {"description": "Blue-widget-glitch in Sophie", "status": "unresolved"}
+  ],
+  "currentVibe": {
+    "mood": "Stressed",
+    "energyLevel": "Low",
+    "locationType": "Gym",
+    "vibe": "Noisy"
+  }
+}
+```
 
 ### POST /ingest
 Stores the turn in the session transcript and buffer.

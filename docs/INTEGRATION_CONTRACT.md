@@ -169,12 +169,16 @@ These require header `X-Internal-Token` and are intended for ops/debug only:
 ```json
 {
   "facts": [
-    {"text": "User was frustrated with bugs in a cafe.", "relevance": 0.83, "source": "graphiti"}
+    {"text": "User is stressed at the gym.", "relevance": null, "source": "graphiti"},
+    {"text": "User is struggling with the blue-widget-glitch in Sophie and it is unresolved.", "relevance": null, "source": "graphiti"},
+    {"text": "User feels burnt out from testing.", "relevance": null, "source": "graphiti"}
   ],
   "entities": [
-    {"summary": "Ashley", "type": "person", "uuid": "..."}
+    {"summary": "stressed", "type": "MentalState", "uuid": "..."},
+    {"summary": "gym", "type": "Environment", "uuid": "..."},
+    {"summary": "blue-widget-glitch", "type": "Tension", "uuid": "..."}
   ],
-  "metadata": {"query": "...", "facts": 1, "entities": 1}
+  "metadata": {"query": "What is the user stressed about?", "facts": 3, "entities": 3}
 }
 ```
 
@@ -192,19 +196,18 @@ tenantId=tenant_a&userId=user_1&now=2026-02-04T18:00:00Z
 **Response JSON (example)**
 ```json
 {
-  "timeGapDescription": "5 hours since last spoke",
+  "timeGapDescription": "15 minutes since last spoke",
   "narrativeSummary": [
-    {"summary": "User discussed testing and bugs", "reference_time": "2026-02-04T12:00:00Z"},
-    {"summary": "User planned a demo", "reference_time": "2026-02-04T09:00:00Z"},
-    {"summary": "User mentioned Ashley", "reference_time": "2026-02-03T20:00:00Z"}
+    {"summary": "User is at the gym.; User feels stressed.; User is struggling with the blue-widget-glitch in Sophie.", "reference_time": "2026-02-06T10:14:30Z"},
+    {"summary": "User is testing Sophie and feeling burnt out.", "reference_time": "2026-02-06T09:58:12Z"}
   ],
   "activeLoops": [
-    {"description": "Flaky tests", "status": "unresolved"}
+    {"description": "Blue-widget-glitch in Sophie", "status": "unresolved"}
   ],
   "currentVibe": {
-    "mood": "Frustrated",
+    "mood": "Stressed",
     "energyLevel": "Low",
-    "locationType": "Cafe",
+    "locationType": "Gym",
     "vibe": "Noisy"
   }
 }

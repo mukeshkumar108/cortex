@@ -95,6 +95,21 @@ Last updated: 2026-02-05
 - Postgres stores **operational memory only** (sessions, transcripts, outbox).
 - **We do not mirror entities/edges in Postgres**; they remain in Graphiti and are queried on demand.
 
+## 6.6) Graphiti narrative entities (what /session/brief uses)
+**Custom entity types**
+- `MentalState`: mood, energy_level
+- `Tension`: description, status (unresolved by default)
+- `Environment`: location_type, vibe
+
+**Custom edge types**
+- `Person` → `MentalState`: FEELS
+- `Person` → `Tension`: STRUGGLING_WITH
+- `Person` → `Environment`: LOCATED_IN
+
+**Notes**
+- Attributes are stored in `node.attributes` and must be read from there.
+- `/session/brief` uses Graphiti node-centric search to surface these nodes.
+
 ## 7) Tests audit (what is covered)
 - Sliding window invariant (<=12) and outbox behaviors
 - Outbox error classification + backoff
