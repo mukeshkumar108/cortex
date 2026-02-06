@@ -689,3 +689,52 @@ class GraphitiClient:
         results["recentCount"] = len(recent_results)
 
         return results
+
+    async def purge_user_graph(self, tenant_id: str, user_id: str) -> Dict[str, Any]:
+        """Delete Graphiti nodes/edges for a given tenant/user group_id."""
+        if not self._initialized:
+            await self.initialize()
+        if not self._initialized or self.client is None:
+            logger.warning("Graphiti client unavailable; skipping purge")
+            return {"success": False, "reason": "client_unavailable"}
+
+        composite_user_id = self._make_composite_user_id(tenant_id, user_id)
+        driver = getattr(self.client, "driver", None)
+        if not driver:
+            logger.warning("Graphiti driver unavailable; skipping purge")
+            return {"success": False, "reason": "driver_unavailable"}
+
+        try:
+            count_nodes = 0
+            count_edges = 0
+            # Count nodes
+            count_res = await driver.execute_query(
+                "MATCH (n {group_id: $group_id}) RETURN count(n) AS c",
+                group_id=composite_user_id
+            )
+            if count_res and isinstance(count_res, list) and count_res[0]:
+                count_nodes = int(count_res[0].get("c", 0))
+
+            # Count edges
+            edge_res = await driver.execute_query(
+                "MATCH ()-[r {group_id: $group_id}]-() RETURN count(r) AS c",
+                group_id=composite_user_id
+            )
+            if edge_res and isinstance(edge_res, list) and edge_res[0]:
+                count_edges = int(edge_res[0].get("c", 0))
+
+            # Delete edges then nodes
+            await driver.execute_query(
+                "MATCH ()-[r {group_id: $group_id}]-() DELETE r",
+                group_id=composite_user_id
+            )
+            await driver.execute_query(
+                "MATCH (n {group_id: $group_id}) DETACH DELETE n",
+                group_id=composite_user_id
+            )
+
+            logger.info(f"Purged Graphiti group_id {composite_user_id} (nodes={count_nodes}, edges={count_edges})")
+            return {"success": True, "nodes": count_nodes, "edges": count_edges}
+        except Exception as e:
+            logger.error(f"Graphiti purge failed: {e}")
+            return {"success": False, "reason": str(e)}

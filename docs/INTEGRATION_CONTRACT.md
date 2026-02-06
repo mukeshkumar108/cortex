@@ -124,6 +124,9 @@ These require header `X-Internal-Token` and are intended for ops/debug only:
 - `POST /internal/debug/emit_raw_episode`
 - `POST /internal/debug/emit_raw_user_sessions`
 
+Admin-only (requires `X-Admin-Key`):
+- `POST /admin/purgeUser` (purge Postgres + Graphiti for a tenant/user)
+
 ## 3) Canonical Identifiers
 
 | Identifier | Required? | Notes |

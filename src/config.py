@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
     internal_token: Optional[str] = None
+    admin_api_key: Optional[str] = None
 
     class Config:
         env_file = ".env"

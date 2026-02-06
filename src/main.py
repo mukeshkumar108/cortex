@@ -19,6 +19,7 @@ from .models import (
     SessionIngestRequest,
     SessionIngestResponse,
     SessionBriefResponse,
+    PurgeUserRequest,
 )
 from .config import get_settings
 from .db import Database
@@ -469,6 +470,51 @@ async def session_brief(
     except Exception as e:
         logger.error(f"Session brief failed: {e}")
         raise HTTPException(status_code=500, detail="Session brief failed")
+
+
+@app.post("/admin/purgeUser")
+async def purge_user(
+    request: PurgeUserRequest,
+    x_admin_key: Optional[str] = Header(None)
+):
+    """
+    Admin-only: purge all memory for a tenant/user from Postgres + Graphiti.
+    """
+    settings = get_settings()
+    if not settings.admin_api_key or x_admin_key != settings.admin_api_key:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    tenant_id = request.tenantId
+    user_id = request.userId
+
+    tables = [
+        "session_buffer",
+        "session_transcript",
+        "graphiti_outbox",
+        "loops",
+        "identity_cache",
+        "user_identity"
+    ]
+    deleted: Dict[str, int] = {}
+    for table in tables:
+        try:
+            count = await db.fetchval(
+                f"WITH deleted AS (DELETE FROM {table} WHERE tenant_id = $1 AND user_id = $2 RETURNING 1) SELECT count(*) FROM deleted",
+                tenant_id,
+                user_id
+            )
+            deleted[table] = int(count or 0)
+        except Exception:
+            deleted[table] = 0
+
+    graphiti_result = await graphiti_client.purge_user_graph(tenant_id, user_id)
+
+    return {
+        "tenantId": tenant_id,
+        "userId": user_id,
+        "postgres": deleted,
+        "graphiti": graphiti_result
+    }
 
 
 @app.post("/session/close")

@@ -153,3 +153,8 @@ class SessionIngestResponse(BaseModel):
     status: str
     sessionId: str
     graphitiAdded: bool = False
+
+
+class PurgeUserRequest(BaseModel):
+    tenantId: str
+    userId: str

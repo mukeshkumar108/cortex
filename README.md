@@ -123,6 +123,7 @@ Require header `X-Internal-Token` = `INTERNAL_TOKEN`.
 - `POST /internal/debug/close_user_sessions?tenantId&userId&limit=20`
 - `POST /internal/debug/emit_raw_episode?tenantId&userId&sessionId`
 - `POST /internal/debug/emit_raw_user_sessions?tenantId&userId&limit=20`
+- `POST /admin/purgeUser` (requires `X-Admin-Key`)
 
 ## License
 Private/internal.
