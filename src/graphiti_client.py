@@ -2,7 +2,8 @@ import inspect
 from graphiti_core import Graphiti
 from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig
-from graphiti_core.nodes import EpisodeType
+from graphiti_core.nodes import EpisodeType, EpisodicNode
+from graphiti_core.edges import EntityEdge
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
@@ -381,7 +382,8 @@ class GraphitiClient:
         query: str,
         limit: int = 5,
         reference_time: Optional[datetime] = None,
-        query_hint: Optional[str] = None
+        query_hint: Optional[str] = None,
+        search_filter: Optional[Any] = None
     ) -> List[Dict[str, Any]]:
         """
         Search for relevant entities (nodes) in Graphiti using semantic query.
@@ -400,26 +402,46 @@ class GraphitiClient:
         try:
             composite_user_id = self._make_composite_user_id(tenant_id, user_id)
 
-            # Check if Graphiti has a dedicated node search method
-            node_search = getattr(self.client, "search_nodes", None)
-            search_fn = node_search if callable(node_search) else self.client.search
-            params = inspect.signature(search_fn).parameters
-            kwargs: Dict[str, Any] = {
-                "query": query,
-                "group_ids": [composite_user_id],
-                "num_results": limit * 2
-            }
-            if "rerank" in params:
-                kwargs["rerank"] = True
-            if reference_time and "reference_time" in params:
-                kwargs["reference_time"] = reference_time
-            if query_hint:
-                if "query_hint" in params:
-                    kwargs["query_hint"] = query_hint
-                elif "context" in params:
-                    kwargs["context"] = query_hint
+            # Prefer node-only search when available
+            search_method = getattr(self.client, "_search", None)
+            if callable(search_method):
+                try:
+                    from graphiti_core.search.search_config_recipes import NODE_HYBRID_SEARCH_RRF
+                    config = NODE_HYBRID_SEARCH_RRF.model_copy(deep=True)
+                    config.limit = limit * 2
+                    results = await search_method(
+                        query=query,
+                        config=config,
+                        group_ids=[composite_user_id],
+                        search_filter=search_filter
+                    )
+                    results = getattr(results, "nodes", [])
+                except Exception:
+                    results = await self.client.search(
+                        query=query,
+                        group_ids=[composite_user_id],
+                        num_results=limit * 2
+                    )
+            else:
+                # Fallback to generic search
+                search_fn = self.client.search
+                params = inspect.signature(search_fn).parameters
+                kwargs: Dict[str, Any] = {
+                    "query": query,
+                    "group_ids": [composite_user_id],
+                    "num_results": limit * 2
+                }
+                if "rerank" in params:
+                    kwargs["rerank"] = True
+                if reference_time and "reference_time" in params:
+                    kwargs["reference_time"] = reference_time
+                if query_hint:
+                    if "query_hint" in params:
+                        kwargs["query_hint"] = query_hint
+                    elif "context" in params:
+                        kwargs["context"] = query_hint
 
-            results = await search_fn(**kwargs)
+                results = await search_fn(**kwargs)
 
             entities = []
             for result in results:
@@ -454,6 +476,10 @@ class GraphitiClient:
                     entity_data["type"] = result.entity_type
                 elif hasattr(result, 'type'):
                     entity_data["type"] = result.type
+                elif hasattr(result, 'labels'):
+                    labels = [l for l in getattr(result, 'labels', []) if l not in ("Entity", "Episodic", "Community")]
+                    if labels:
+                        entity_data["type"] = labels[0]
 
                 if hasattr(result, 'uuid'):
                     entity_data["uuid"] = str(result.uuid)
@@ -483,23 +509,21 @@ class GraphitiClient:
             summary = (
                 episode.get("summary")
                 or episode.get("episode_summary")
-                or episode.get("text")
-                or episode.get("episode_body")
-                or episode.get("content")
             )
             reference_time = episode.get("reference_time") or episode.get("created_at")
+            edge_ids = episode.get("entity_edges") or []
         else:
             summary = (
                 getattr(episode, "summary", None)
                 or getattr(episode, "episode_summary", None)
-                or getattr(episode, "episode_body", None)
-                or getattr(episode, "content", None)
             )
             reference_time = getattr(episode, "reference_time", None) or getattr(episode, "created_at", None)
+            edge_ids = getattr(episode, "entity_edges", None) or []
 
         return {
             "summary": summary,
-            "reference_time": reference_time
+            "reference_time": reference_time,
+            "edge_ids": edge_ids
         }
 
     async def search(
@@ -551,6 +575,17 @@ class GraphitiClient:
                 logger.info(f"Retrieved {len(episodes)} recent episodes for {composite_user_id}")
                 return episodes
 
+            driver = getattr(self.client, "driver", None)
+            if driver:
+                episodes = await EpisodicNode.get_by_group_ids(
+                    driver=driver,
+                    group_ids=[composite_user_id],
+                    limit=limit
+                )
+                episodes = episodes or []
+                episodes.sort(key=lambda e: getattr(e, "created_at", None) or datetime.min, reverse=True)
+                return episodes[:limit]
+
             logger.info(f"Graphiti client has no get_recent_episodes; returning [] for {composite_user_id}")
             return []
 
@@ -591,10 +626,21 @@ class GraphitiClient:
     ) -> List[Dict[str, Any]]:
         episodes = await self.get_recent_episodes(tenant_id, user_id, since=None, limit=limit)
         results: List[Dict[str, Any]] = []
+        driver = getattr(self.client, "driver", None) if self.client else None
         for episode in episodes:
             extracted = self._extract_episode_summary(episode)
+            if driver:
+                edge_ids = extracted.get("edge_ids") or []
+                if edge_ids:
+                    edges = await EntityEdge.get_by_uuids(driver=driver, uuids=edge_ids)
+                    facts = [e.fact for e in edges if getattr(e, "fact", None)]
+                    if facts:
+                        extracted["summary"] = "; ".join(facts[:3])
             if extracted.get("summary"):
-                results.append(extracted)
+                results.append({
+                    "summary": extracted.get("summary"),
+                    "reference_time": extracted.get("reference_time")
+                })
         return results
 
     async def smoke_test(

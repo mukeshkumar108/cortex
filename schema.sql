@@ -101,6 +101,7 @@ ON session_buffer(tenant_id, user_id);
 CREATE TABLE IF NOT EXISTS session_transcript (
     tenant_id TEXT NOT NULL,
     session_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
     messages JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
@@ -109,6 +110,9 @@ CREATE TABLE IF NOT EXISTS session_transcript (
 
 CREATE INDEX IF NOT EXISTS idx_session_transcript_tenant_session
 ON session_transcript(tenant_id, session_id);
+
+CREATE INDEX IF NOT EXISTS idx_session_transcript_tenant_user
+ON session_transcript(tenant_id, user_id);
 
 -- Graphiti outbox (reliable delivery for evicted turns)
 CREATE TABLE IF NOT EXISTS graphiti_outbox (

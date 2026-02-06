@@ -384,7 +384,7 @@ class SessionManager:
                 if row.get("folded_at") is None:
                     new_summary = await self._fold_into_summary(current_summary, turn)
                     await self._update_rolling_summary(tenant_id, session_id, new_summary)
-                    await self._append_transcript_turn(tenant_id, session_id, turn)
+                    await self._append_transcript_turn(tenant_id, session_id, user_id, turn)
                     await self._mark_outbox_folded(row["id"])
                     current_summary = new_summary
 
@@ -521,17 +521,18 @@ class SessionManager:
         self,
         tenant_id: str,
         session_id: str,
+        user_id: str,
         turn: Dict[str, Any]
     ) -> None:
         query = """
-            INSERT INTO session_transcript (tenant_id, session_id, messages)
-            VALUES ($1, $2, $3::jsonb)
+            INSERT INTO session_transcript (tenant_id, session_id, user_id, messages)
+            VALUES ($1, $2, $3, $4::jsonb)
             ON CONFLICT (tenant_id, session_id)
             DO UPDATE SET
                 messages = session_transcript.messages || EXCLUDED.messages,
                 updated_at = NOW()
         """
-        await self.db.execute(query, tenant_id, session_id, [turn])
+        await self.db.execute(query, tenant_id, session_id, user_id, [turn])
 
     async def _mark_outbox_sent(self, outbox_id: int) -> None:
         query = """
@@ -631,6 +632,7 @@ class SessionManager:
                     await self._append_transcript_turn(
                         row["tenant_id"],
                         row["session_id"],
+                        row["user_id"],
                         turn
                     )
                     await self._mark_outbox_folded(row["id"])

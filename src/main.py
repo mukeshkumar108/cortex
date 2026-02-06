@@ -277,6 +277,8 @@ async def session_brief(
             limit=3
         )
 
+        # No transcript fallback; narrative summary must come from Graphiti
+
         time_gap_description = None
         if episodes:
             last_time = episodes[0].get("reference_time")
@@ -294,19 +296,29 @@ async def session_brief(
                 else:
                     time_gap_description = f"{minutes} minutes since last spoke"
 
+        from graphiti_core.search.search_filters import SearchFilters, DateFilter, ComparisonOperator
+        current_filter = SearchFilters(
+            valid_at=[[DateFilter(date=reference_now, comparison_operator=ComparisonOperator.less_than_equal)]],
+            invalid_at=[[DateFilter(date=None, comparison_operator=ComparisonOperator.is_null)]]
+        )
+
         tensions = await graphiti_client.search_nodes(
             tenant_id=tenantId,
             user_id=userId,
             query="current problems tasks unresolved tensions",
             limit=10,
-            reference_time=reference_now
+            reference_time=reference_now,
+            search_filter=current_filter
         )
         active_loops = []
         for t in tensions:
-            t_type = (t.get("type") or "").lower() if isinstance(t, dict) else ""
-            if t_type != "tension":
-                continue
             attrs = t.get("attributes") if isinstance(t, dict) else None
+            t_type = (t.get("type") or "").lower() if isinstance(t, dict) else ""
+            is_tension = t_type == "tension"
+            if isinstance(attrs, dict) and ("description" in attrs or "status" in attrs):
+                is_tension = True
+            if not is_tension:
+                continue
             status = None
             description = None
             if isinstance(attrs, dict):
@@ -322,27 +334,33 @@ async def session_brief(
             user_id=userId,
             query="user mood mental state energy level",
             limit=5,
-            reference_time=reference_now
+            reference_time=reference_now,
+            search_filter=current_filter
         )
         environments = await graphiti_client.search_nodes(
             tenant_id=tenantId,
             user_id=userId,
             query="current environment location vibe",
             limit=5,
-            reference_time=reference_now
+            reference_time=reference_now,
+            search_filter=current_filter
         )
 
         current_vibe: Dict[str, Any] = {}
         for ms in mental_states:
-            if (ms.get("type") or "").lower() == "mentalstate":
-                attrs = ms.get("attributes") or {}
+            attrs = ms.get("attributes") or {}
+            ms_type = (ms.get("type") or "").lower()
+            is_mental = ms_type == "mentalstate" or "mood" in attrs or "energy_level" in attrs
+            if is_mental:
                 current_vibe["mood"] = attrs.get("mood") or ms.get("summary")
                 current_vibe["energyLevel"] = attrs.get("energy_level")
                 break
 
         for env in environments:
-            if (env.get("type") or "").lower() == "environment":
-                attrs = env.get("attributes") or {}
+            attrs = env.get("attributes") or {}
+            env_type = (env.get("type") or "").lower()
+            is_env = env_type == "environment" or "location_type" in attrs or "vibe" in attrs
+            if is_env:
                 current_vibe["locationType"] = attrs.get("location_type") or env.get("summary")
                 current_vibe["vibe"] = attrs.get("vibe")
                 break
@@ -433,13 +451,14 @@ async def ingest_session(request: SessionIngestRequest):
         # Optional: store transcript for debug/audit
         await db.execute(
             """
-            INSERT INTO session_transcript (tenant_id, session_id, messages, updated_at)
-            VALUES ($1, $2, $3::jsonb, NOW())
+            INSERT INTO session_transcript (tenant_id, session_id, user_id, messages, updated_at)
+            VALUES ($1, $2, $3, $4::jsonb, NOW())
             ON CONFLICT (tenant_id, session_id)
-            DO UPDATE SET messages = $3::jsonb, updated_at = NOW()
+            DO UPDATE SET messages = $4::jsonb, updated_at = NOW(), user_id = EXCLUDED.user_id
             """,
             request.tenantId,
             request.sessionId,
+            request.userId,
             messages_payload
         )
 
@@ -719,6 +738,79 @@ async def debug_emit_raw_user_sessions(
     except Exception as e:
         logger.error(f"Debug emit_raw_user_sessions error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/internal/debug/graphiti/episodes")
+async def debug_graphiti_episodes(
+    tenantId: str,
+    userId: str,
+    limit: int = 5,
+    x_internal_token: str | None = Header(default=None)
+):
+    _require_internal_token(x_internal_token)
+    try:
+        episodes = await graphiti_client.get_recent_episodes(
+            tenant_id=tenantId,
+            user_id=userId,
+            since=None,
+            limit=limit
+        )
+        results = []
+        for episode in episodes or []:
+            if isinstance(episode, dict):
+                results.append({
+                    "name": episode.get("name") or episode.get("episode_name"),
+                    "summary": episode.get("summary") or episode.get("episode_summary"),
+                    "reference_time": episode.get("reference_time") or episode.get("created_at"),
+                    "content": episode.get("episode_body") or episode.get("content") or episode.get("text"),
+                    "uuid": episode.get("uuid")
+                })
+            else:
+                results.append({
+                    "name": getattr(episode, "name", None),
+                    "summary": getattr(episode, "summary", None) or getattr(episode, "episode_summary", None),
+                    "reference_time": getattr(episode, "reference_time", None) or getattr(episode, "created_at", None),
+                    "content": getattr(episode, "episode_body", None) or getattr(episode, "content", None),
+                    "uuid": str(getattr(episode, "uuid", None)) if getattr(episode, "uuid", None) else None
+                })
+        return {"count": len(results), "episodes": results}
+    except Exception as e:
+        logger.error(f"Debug graphiti episodes failed: {e}")
+        raise HTTPException(status_code=500, detail="Debug graphiti episodes failed")
+
+
+@app.post("/internal/debug/graphiti/query")
+async def debug_graphiti_query(
+    request: MemoryQueryRequest,
+    x_internal_token: str | None = Header(default=None)
+):
+    _require_internal_token(x_internal_token)
+    try:
+        reference_time = None
+        if request.referenceTime:
+            value = request.referenceTime
+            if value.endswith("Z"):
+                value = value.replace("Z", "+00:00")
+            reference_time = datetime.fromisoformat(value)
+
+        facts = await graphiti_client.search_facts(
+            tenant_id=request.tenantId,
+            user_id=request.userId,
+            query=request.query,
+            limit=request.limit or 10,
+            reference_time=reference_time
+        )
+        entities = await graphiti_client.search_nodes(
+            tenant_id=request.tenantId,
+            user_id=request.userId,
+            query=request.query,
+            limit=min(request.limit or 10, 10),
+            reference_time=reference_time
+        )
+        return {"facts": facts, "entities": entities}
+    except Exception as e:
+        logger.error(f"Debug graphiti query failed: {e}")
+        raise HTTPException(status_code=500, detail="Debug graphiti query failed")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import datetime
 from uuid import uuid4
 
@@ -8,6 +9,7 @@ import pytest
 from src.main import app, graphiti_client
 from src.briefing import build_briefing
 from src import session as session_module
+from src.config import get_settings
 
 
 def _db_url() -> str:
@@ -168,3 +170,87 @@ async def test_session_brief_happy_path():
     assert resp.activeLoops[0]["status"] == "unresolved"
     assert resp.currentVibe["mood"] == "Frustrated"
     assert resp.currentVibe["locationType"] == "Cafe"
+
+
+@pytest.mark.asyncio
+async def test_internal_graphiti_debug_endpoints():
+    os.environ["INTERNAL_TOKEN"] = "test_token"
+    get_settings.cache_clear()
+
+    async def _stub_recent_episodes(**_kwargs):
+        return [
+            {"name": "session_raw_x", "summary": "User talked about bugs", "reference_time": "2026-02-05T01:00:00Z"}
+        ]
+
+    async def _stub_search_facts(**_kwargs):
+        return [{"text": "User is frustrated about bugs", "relevance": 0.8, "source": "graphiti"}]
+
+    async def _stub_search_nodes(**_kwargs):
+        return [{"summary": "Ashley", "type": "person", "uuid": "u1", "attributes": {"role": "girlfriend"}}]
+
+    graphiti_client.get_recent_episodes = _stub_recent_episodes
+    graphiti_client.search_facts = _stub_search_facts
+    graphiti_client.search_nodes = _stub_search_nodes
+
+    from src.main import debug_graphiti_episodes, debug_graphiti_query
+    from src.models import MemoryQueryRequest
+
+    episodes = await debug_graphiti_episodes(
+        tenantId="t",
+        userId="u",
+        limit=2,
+        x_internal_token="test_token"
+    )
+    assert episodes["count"] == 1
+
+    query_resp = await debug_graphiti_query(
+        request=MemoryQueryRequest(tenantId="t", userId="u", query="Ashley"),
+        x_internal_token="test_token"
+    )
+    assert len(query_resp["facts"]) == 1
+    assert len(query_resp["entities"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_narrative_continuity_integrity():
+    tenant = f"tenant-{uuid4().hex}"
+    user = f"user-{uuid4().hex}"
+
+    async def _stub_recent_summaries(**_kwargs):
+        return [{"summary": "User mentioned the blue-widget-glitch", "reference_time": "2026-02-05T01:00:00Z"}]
+
+    async def _stub_search_nodes(**kwargs):
+        query = kwargs.get("query", "")
+        if "tension" in query:
+            return [{
+                "summary": "blue-widget-glitch",
+                "type": "Tension",
+                "attributes": {"description": "blue-widget-glitch", "status": "unresolved"},
+            }]
+        if "environment" in query:
+            return [{
+                "summary": "Gym",
+                "type": "Environment",
+                "attributes": {"location_type": "Gym", "vibe": "Noisy"},
+            }]
+        if "mood" in query:
+            return [{
+                "summary": "Stressed",
+                "type": "MentalState",
+                "attributes": {"mood": "Stressed", "energy_level": "Low"},
+            }]
+        return []
+
+    graphiti_client.get_recent_episode_summaries = _stub_recent_summaries
+    graphiti_client.search_nodes = _stub_search_nodes
+
+    from src.main import session_brief
+
+    resp = await session_brief(
+        tenantId=tenant,
+        userId=user,
+        now="2026-02-05T02:00:00Z",
+    )
+
+    assert any(loop["description"] == "blue-widget-glitch" for loop in resp.activeLoops)
+    assert resp.currentVibe["locationType"] == "Gym"
