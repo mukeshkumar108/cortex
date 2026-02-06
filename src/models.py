@@ -125,6 +125,8 @@ class MemoryQueryResponse(BaseModel):
 
 class SessionBriefResponse(BaseModel):
     timeGapDescription: Optional[str] = None
+    temporalVibe: Optional[str] = None
+    briefContext: Optional[str] = None
     narrativeSummary: List[Dict[str, Any]] = []
     activeLoops: List[Dict[str, Any]] = []
     currentVibe: Dict[str, Any] = {}

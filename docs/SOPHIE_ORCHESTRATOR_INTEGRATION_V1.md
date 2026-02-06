@@ -67,6 +67,8 @@ Example response:
 ```json
 {
   "timeGapDescription": "15 minutes since last spoke",
+  "temporalVibe": "Active Day / Co-pilot mode",
+  "briefContext": "Temporal vibe: Active Day / Co-pilot mode. Immediate bridge: User is at the gym.; User feels stressed.; User is struggling with the blue-widget-glitch in Sophie. Anchor: drinking a cold matcha.",
   "narrativeSummary": [
     {"summary": "User is at the gym.; User feels stressed.; User is struggling with the blue-widget-glitch in Sophie.", "reference_time": "2026-02-06T10:14:30Z"},
     {"summary": "User is testing Sophie and feeling burnt out.", "reference_time": "2026-02-06T09:58:12Z"}

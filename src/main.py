@@ -274,12 +274,13 @@ async def session_brief(
         episodes = await graphiti_client.get_recent_episode_summaries(
             tenant_id=tenantId,
             user_id=userId,
-            limit=3
+            limit=10
         )
 
         # No transcript fallback; narrative summary must come from Graphiti
 
         time_gap_description = None
+        delta_hours = None
         if episodes:
             last_time = episodes[0].get("reference_time")
             if isinstance(last_time, str):
@@ -291,6 +292,7 @@ async def session_brief(
                 delta = reference_now - last_time
                 hours = int(delta.total_seconds() // 3600)
                 minutes = int((delta.total_seconds() % 3600) // 60)
+                delta_hours = delta.total_seconds() / 3600
                 if hours > 0:
                     time_gap_description = f"{hours} hours since last spoke"
                 else:
@@ -324,6 +326,8 @@ async def session_brief(
             if isinstance(attrs, dict):
                 status = attrs.get("status")
                 description = attrs.get("description")
+            if status and isinstance(status, str) and status.lower() != "unresolved":
+                continue
             active_loops.append({
                 "description": description or t.get("summary"),
                 "status": status or "unresolved"
@@ -365,9 +369,100 @@ async def session_brief(
                 current_vibe["vibe"] = attrs.get("vibe")
                 break
 
+        # Incidental anchor (Observation entity)
+        incidental_anchor = None
+        observations = await graphiti_client.search_nodes(
+            tenant_id=tenantId,
+            user_id=userId,
+            query="incidental anchor sensory detail observation",
+            limit=3,
+            reference_time=reference_now,
+            search_filter=current_filter
+        )
+        for obs in observations:
+            attrs = obs.get("attributes") or {}
+            obs_type = (obs.get("type") or "").lower()
+            is_obs = obs_type == "observation" or "detail" in attrs
+            if not is_obs:
+                continue
+            incidental_anchor = attrs.get("detail") or obs.get("summary")
+            if incidental_anchor:
+                break
+
+        # Temporal vibe based on current hour
+        hour = reference_now.hour
+        if 0 <= hour < 5:
+            temporal_vibe = "Deep Night / Low Energy"
+        elif 5 <= hour < 9:
+            temporal_vibe = "Morning Start / Fresh / Light re-entry"
+        elif 9 <= hour < 18:
+            temporal_vibe = "Active Day / Co-pilot mode"
+        else:
+            temporal_vibe = "Evening Wind-down / Reflection"
+
+        # Handshake retrieval based on time delta
+        handshake = None
+        if delta_hours is None:
+            delta_hours = 0
+        if delta_hours < 2:
+            # SHORT: immediate bridge from most recent episode facts
+            if episodes:
+                bridge = episodes[0].get("summary")
+                if bridge:
+                    handshake = f"Immediate bridge: {bridge}"
+        elif delta_hours < 12:
+            # MEDIUM: daily arc (all sessions today)
+            today = reference_now.date()
+            daily_eps = []
+            for ep in episodes:
+                rt = ep.get("reference_time")
+                if isinstance(rt, str):
+                    try:
+                        rt = datetime.fromisoformat(rt.replace("Z", "+00:00"))
+                    except Exception:
+                        rt = None
+                if rt and rt.date() == today:
+                    daily_eps.append({"summary": ep.get("summary"), "reference_time": rt})
+            if not daily_eps:
+                daily_eps = [{"summary": ep.get("summary"), "reference_time": None} for ep in episodes[:3]]
+            daily_eps = [e for e in daily_eps if e.get("summary")]
+            if daily_eps:
+                daily_text = " → ".join([e["summary"] for e in reversed(daily_eps)])
+                handshake = f"Today so far: {daily_text}"
+        else:
+            # LONG: unresolved tensions + long-term gravity
+            gravity_facts = await graphiti_client.search_facts(
+                tenant_id=tenantId,
+                user_id=userId,
+                query="long term goals identity values projects",
+                limit=5,
+                reference_time=reference_now
+            )
+            gravity_text = "; ".join([f.get("text") for f in gravity_facts if f.get("text")][:3])
+            loop_text = ", ".join([l.get("description") for l in active_loops if l.get("description")])
+            parts = []
+            if gravity_text:
+                parts.append(f"Long-term gravity: {gravity_text}.")
+            if loop_text:
+                parts.append(f"Unresolved tensions: {loop_text}.")
+            if parts:
+                handshake = " ".join(parts)
+
+        # Compose brief context
+        context_parts = []
+        if temporal_vibe:
+            context_parts.append(f"Temporal vibe: {temporal_vibe}.")
+        if handshake:
+            context_parts.append(handshake)
+        if incidental_anchor:
+            context_parts.append(f"Anchor: {incidental_anchor}.")
+        brief_context = " ".join(context_parts).strip() if context_parts else None
+
         return SessionBriefResponse(
             timeGapDescription=time_gap_description,
-            narrativeSummary=episodes,
+            temporalVibe=temporal_vibe,
+            briefContext=brief_context,
+            narrativeSummary=episodes[:3],
             activeLoops=active_loops,
             currentVibe=current_vibe
         )

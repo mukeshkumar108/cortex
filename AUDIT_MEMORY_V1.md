@@ -100,11 +100,13 @@ Last updated: 2026-02-05
 - `MentalState`: mood, energy_level
 - `Tension`: description, status (unresolved by default)
 - `Environment`: location_type, vibe
+- `Observation`: detail (incidental anchor)
 
 **Custom edge types**
 - `Person` → `MentalState`: FEELS
 - `Person` → `Tension`: STRUGGLING_WITH
 - `Person` → `Environment`: LOCATED_IN
+- `Person` → `Observation`: OBSERVED
 
 **Notes**
 - Attributes are stored in `node.attributes` and must be read from there.

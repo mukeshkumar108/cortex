@@ -60,11 +60,13 @@ session_buffer (tenant_id, session_id)
 - `MentalState`: mood, energy_level (user’s emotional/cognitive disposition)
 - `Tension`: description, status (unresolved problem/task/friction)
 - `Environment`: location_type, vibe (physical/situational context)
+- `Observation`: detail (incidental anchor like “raining” or “cold matcha”)
 
 **Edges**
 - `Person` → `MentalState`: FEELS
 - `Person` → `Tension`: STRUGGLING_WITH
 - `Person` → `Environment`: LOCATED_IN
+- `Person` → `Observation`: OBSERVED
 
 **Retrieval**
 - `/session/brief` uses node-centric search to surface these types.

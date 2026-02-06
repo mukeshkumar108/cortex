@@ -30,6 +30,10 @@ class Environment(BaseModel):
     location_type: Optional[str] = Field(None, description="e.g., Cafe, Home, Gym, Outside")
     vibe: Optional[str] = Field(None, description="e.g., Sunset, Noisy, Raining")
 
+class Observation(BaseModel):
+    """A small incidental human detail (sensory or phrasing)."""
+    detail: Optional[str] = Field(None, description="e.g., 'raining outside', 'drinking matcha'")
+
 
 class Feels(BaseModel):
     """Edge: Person feels a MentalState."""
@@ -45,29 +49,38 @@ class LocatedIn(BaseModel):
     """Edge: Person is located in an Environment."""
     pass
 
+class Observed(BaseModel):
+    """Edge: Person observed a small incidental detail."""
+    pass
+
 
 NARRATIVE_ENTITY_TYPES: Dict[str, type[BaseModel]] = {
     "MentalState": MentalState,
     "Tension": Tension,
     "Environment": Environment,
+    "Observation": Observation,
 }
 
 NARRATIVE_EDGE_TYPES: Dict[str, type[BaseModel]] = {
     "FEELS": Feels,
     "STRUGGLING_WITH": StrugglingWith,
     "LOCATED_IN": LocatedIn,
+    "OBSERVED": Observed,
 }
 
 NARRATIVE_EDGE_TYPE_MAP: Dict[Tuple[str, str], List[str]] = {
     ("Person", "MentalState"): ["FEELS"],
     ("Person", "Tension"): ["STRUGGLING_WITH"],
     ("Person", "Environment"): ["LOCATED_IN"],
+    ("Person", "Observation"): ["OBSERVED"],
 }
 
 NARRATIVE_EXTRACTION_INSTRUCTIONS = (
     "Pay close attention to changes in the user's mood and any mentions of unfinished tasks "
     "or environment. Do not stop extracting generic entities like names and locations, but "
-    "prioritize these structured types."
+    "prioritize these structured types. While extracting, also identify one Incidental Anchor "
+    "(a specific sensory detail, unique phrasing, or minor human observation) and store it as "
+    "an Observation entity with a short 'detail' attribute."
 )
 
 
