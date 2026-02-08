@@ -118,13 +118,29 @@ class MemoryQueryRequest(BaseModel):
 
 
 class MemoryQueryResponse(BaseModel):
-    facts: List[Fact] = []
+    facts: List[str] = []
+    openLoops: List[str] = []
+    commitments: List[str] = []
+    contextAnchors: Dict[str, Any] = {}
+    userStatedState: Optional[str] = None
+    currentFocus: Optional[str] = None
+    factItems: List[Fact] = []  # Backward compatibility
     entities: List[Entity] = []
+    recallSheet: Optional[str] = None
+    supplementalContext: Optional[str] = None
     metadata: Dict[str, Any] = {}
 
 
 class SessionBriefResponse(BaseModel):
     timeGapDescription: Optional[str] = None
+    timeOfDayLabel: Optional[str] = None
+    energyHint: Optional[str] = None
+    facts: List[str] = []
+    openLoops: List[str] = []
+    commitments: List[str] = []
+    contextAnchors: Dict[str, Any] = {}
+    userStatedState: Optional[str] = None
+    currentFocus: Optional[str] = None
     temporalVibe: Optional[str] = None
     briefContext: Optional[str] = None
     narrativeSummary: List[Dict[str, Any]] = []

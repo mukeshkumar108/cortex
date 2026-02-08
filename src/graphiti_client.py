@@ -14,34 +14,38 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 class MentalState(BaseModel):
-    """The user's emotional or cognitive disposition during the episode."""
-    mood: Optional[str] = Field(None, description="e.g., Frustrated, Peaceful, Happy")
-    energy_level: Optional[str] = Field(None, description="e.g., High, Burnt out, Wired")
+    """User-stated state captured only when explicitly stated."""
+    mood: Optional[str] = Field(None, description="Explicit user phrase only, e.g., 'I feel anxious'")
+    energy_level: Optional[str] = Field(None, description="Explicit user phrase only, e.g., 'I am tired'")
 
 
 class Tension(BaseModel):
-    """An unresolved problem, task, or psychological friction."""
-    description: str = Field(..., description="What is the user struggling with?")
+    """An unresolved problem, task, or blocker explicitly mentioned by the user."""
+    description: str = Field(..., description="Short factual description of the unresolved item")
     status: str = Field("unresolved", description="Current state of this loop")
 
 
 class Environment(BaseModel):
     """The physical or situational context mentioned in the session."""
     location_type: Optional[str] = Field(None, description="e.g., Cafe, Home, Gym, Outside")
-    vibe: Optional[str] = Field(None, description="e.g., Sunset, Noisy, Raining")
+    vibe: Optional[str] = Field(None, description="Concrete context detail only (e.g., 'Noisy', 'Raining')")
 
 class Observation(BaseModel):
     """A small incidental human detail (sensory or phrasing)."""
     detail: Optional[str] = Field(None, description="e.g., 'raining outside', 'drinking matcha'")
 
+class UserFocus(BaseModel):
+    """User-stated focus captured only when explicitly stated."""
+    focus: Optional[str] = Field(None, description="Explicit user phrase only, keep concise and neutral")
+
 
 class Feels(BaseModel):
-    """Edge: Person feels a MentalState."""
+    """Edge: User explicitly stated a mental state."""
     pass
 
 
 class StrugglingWith(BaseModel):
-    """Edge: Person is struggling with a Tension."""
+    """Edge: User has an unresolved item."""
     pass
 
 
@@ -53,12 +57,17 @@ class Observed(BaseModel):
     """Edge: Person observed a small incidental detail."""
     pass
 
+class FocusedOn(BaseModel):
+    """Edge: User explicitly stated current focus."""
+    pass
+
 
 NARRATIVE_ENTITY_TYPES: Dict[str, type[BaseModel]] = {
     "MentalState": MentalState,
     "Tension": Tension,
     "Environment": Environment,
     "Observation": Observation,
+    "UserFocus": UserFocus,
 }
 
 NARRATIVE_EDGE_TYPES: Dict[str, type[BaseModel]] = {
@@ -66,6 +75,7 @@ NARRATIVE_EDGE_TYPES: Dict[str, type[BaseModel]] = {
     "STRUGGLING_WITH": StrugglingWith,
     "LOCATED_IN": LocatedIn,
     "OBSERVED": Observed,
+    "FOCUSED_ON": FocusedOn,
 }
 
 NARRATIVE_EDGE_TYPE_MAP: Dict[Tuple[str, str], List[str]] = {
@@ -73,14 +83,19 @@ NARRATIVE_EDGE_TYPE_MAP: Dict[Tuple[str, str], List[str]] = {
     ("Person", "Tension"): ["STRUGGLING_WITH"],
     ("Person", "Environment"): ["LOCATED_IN"],
     ("Person", "Observation"): ["OBSERVED"],
+    ("Person", "UserFocus"): ["FOCUSED_ON"],
 }
 
 NARRATIVE_EXTRACTION_INSTRUCTIONS = (
-    "Pay close attention to changes in the user's mood and any mentions of unfinished tasks "
-    "or environment. Do not stop extracting generic entities like names and locations, but "
-    "prioritize these structured types. While extracting, also identify one Incidental Anchor "
-    "(a specific sensory detail, unique phrasing, or minor human observation) and store it as "
-    "an Observation entity with a short 'detail' attribute."
+    "Extract factual, user-stated memory only. Do not infer emotions, intent, or therapy-style framing. "
+    "Capture MentalState only when the user explicitly states it in first person (for example: 'I feel anxious', "
+    "'I am tired'). Capture unresolved tasks/blockers as Tension only when explicitly mentioned. "
+    "Capture UserFocus only when explicitly stated (for example: 'I'm focused on X', "
+    "'My priority this week is X', 'Today I need to X', 'Right now I'm trying to X'). "
+    "Do not infer focus from complaints, lists of tasks, or implied goals. Do not treat emotions as focus. "
+    "Keep focus concise (<= 80 chars), neutral, and user-phrased. "
+    "Capture environment as concrete context details (location/noise/weather) and keep phrasing neutral. "
+    "Continue extracting generic entities (names, places, projects). Optionally store one concrete Observation detail."
 )
 
 

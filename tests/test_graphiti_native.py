@@ -7,9 +7,27 @@ import asyncpg
 import pytest
 
 from src.main import app, graphiti_client
+from src.graphiti_client import NARRATIVE_EXTRACTION_INSTRUCTIONS
 from src.briefing import build_briefing
 from src import session as session_module
 from src.config import get_settings
+
+
+def _contains_banned_interpretive_phrases(text: str) -> bool:
+    banned = ("feels", "feeling", "struggling", "isolating", "grounding", "vibe", "tension", "emotional")
+    lower = (text or "").lower()
+    return any(term in lower for term in banned)
+
+
+def _contains_required_sections(text: str) -> bool:
+    required = ("FACTS:", "OPEN_LOOPS:", "COMMITMENTS:", "CONTEXT_ANCHORS:")
+    value = text or ""
+    return all(section in value for section in required)
+
+
+@pytest.mark.asyncio
+async def test_focus_extraction_instruction_present():
+    assert "Capture UserFocus only when explicitly stated" in NARRATIVE_EXTRACTION_INSTRUCTIONS
 
 
 def _db_url() -> str:
@@ -63,7 +81,12 @@ async def test_memory_query_uses_graphiti():
     )
     resp = await memory_query(req)
     assert len(resp.facts) == 1
+    assert len(resp.factItems) == 1
     assert len(resp.entities) == 1
+    assert resp.recallSheet is not None
+    assert _contains_required_sections(resp.recallSheet)
+    assert resp.supplementalContext == resp.recallSheet
+    assert len(resp.recallSheet) <= 720
 
 
 @pytest.mark.asyncio
@@ -135,23 +158,28 @@ async def test_session_brief_happy_path():
 
     async def _stub_search_nodes(**kwargs):
         query = kwargs.get("query", "")
-        if "tension" in query:
+        if "unresolved" in query or "open loops" in query:
             return [{
                 "summary": "Flaky tests",
                 "type": "Tension",
                 "attributes": {"description": "Flaky tests", "status": "unresolved"},
             }]
-        if "mood" in query:
-            return [{
-                "summary": "Frustrated",
-                "type": "MentalState",
-                "attributes": {"mood": "Frustrated", "energy_level": "Low"},
-            }]
-        if "environment" in query:
+        if "named people" in query:
             return [{
                 "summary": "Cafe",
                 "type": "Environment",
-                "attributes": {"location_type": "Cafe", "vibe": "Noisy"},
+                "attributes": {"location_type": "Cafe"},
+            }]
+        if "commitment" in query:
+            return [{
+                "summary": "I will send the demo notes tomorrow",
+                "type": "Task",
+            }]
+        if "current focus" in query:
+            return [{
+                "summary": "I'm focused on stabilizing the release pipeline",
+                "type": "UserFocus",
+                "attributes": {"focus": "I'm focused on stabilizing the release pipeline"},
             }]
         return []
 
@@ -166,10 +194,15 @@ async def test_session_brief_happy_path():
         now="2026-02-05T03:00:00Z",
     )
     assert resp.timeGapDescription
-    assert len(resp.narrativeSummary) == 3
+    assert len(resp.narrativeSummary) >= 1
     assert resp.activeLoops[0]["status"] == "unresolved"
-    assert resp.currentVibe["mood"] == "Frustrated"
-    assert resp.currentVibe["locationType"] == "Cafe"
+    assert resp.openLoops == ["Flaky tests"]
+    assert resp.timeOfDayLabel == "NIGHT"
+    assert _contains_required_sections(resp.briefContext or "")
+    assert len(resp.briefContext or "") <= 720
+    assert not _contains_banned_interpretive_phrases(resp.briefContext or "")
+    assert resp.currentFocus is not None
+    assert "CURRENT_FOCUS:" in (resp.briefContext or "")
 
 
 @pytest.mark.asyncio
@@ -221,23 +254,17 @@ async def test_narrative_continuity_integrity():
 
     async def _stub_search_nodes(**kwargs):
         query = kwargs.get("query", "")
-        if "tension" in query:
+        if "unresolved" in query or "open loops" in query:
             return [{
                 "summary": "blue-widget-glitch",
                 "type": "Tension",
                 "attributes": {"description": "blue-widget-glitch", "status": "unresolved"},
             }]
-        if "environment" in query:
+        if "named people" in query:
             return [{
                 "summary": "Gym",
                 "type": "Environment",
-                "attributes": {"location_type": "Gym", "vibe": "Noisy"},
-            }]
-        if "mood" in query:
-            return [{
-                "summary": "Stressed",
-                "type": "MentalState",
-                "attributes": {"mood": "Stressed", "energy_level": "Low"},
+                "attributes": {"location_type": "Gym"},
             }]
         return []
 
@@ -253,4 +280,93 @@ async def test_narrative_continuity_integrity():
     )
 
     assert any(loop["description"] == "blue-widget-glitch" for loop in resp.activeLoops)
-    assert resp.currentVibe["locationType"] == "Gym"
+    assert "blue-widget-glitch" in resp.openLoops
+    assert "blue-widget-glitch" in " ".join(resp.facts)
+    assert not _contains_banned_interpretive_phrases(resp.briefContext or "")
+    assert len(resp.briefContext or "") <= 720
+    assert "CURRENT_FOCUS:" not in (resp.briefContext or "")
+
+
+@pytest.mark.asyncio
+async def test_explicit_user_state_allowed_and_isolated():
+    async def _stub_recent_summaries(**_kwargs):
+        return [
+            {"summary": "I feel anxious about tomorrow's launch", "reference_time": "2026-02-05T01:00:00Z"},
+            {"summary": "User is struggling with launch pressure", "reference_time": "2026-02-04T20:00:00Z"},
+        ]
+
+    async def _stub_search_nodes(**kwargs):
+        query = kwargs.get("query", "")
+        if "unresolved" in query or "open loops" in query:
+            return []
+        if "named people" in query:
+            return [{"summary": "Launch prep", "type": "Project"}]
+        if "commitment" in query:
+            return []
+        return []
+
+    graphiti_client.get_recent_episode_summaries = _stub_recent_summaries
+    graphiti_client.search_nodes = _stub_search_nodes
+
+    from src.main import session_brief
+
+    resp = await session_brief(
+        tenantId="tenant",
+        userId="user",
+        now="2026-02-05T02:00:00Z",
+    )
+
+    assert resp.userStatedState is not None
+    assert "i feel anxious" in resp.userStatedState.lower()
+    assert "i feel anxious" not in " ".join(resp.facts).lower()
+    assert "i feel anxious" not in " ".join(resp.openLoops).lower()
+    assert "i feel anxious" not in " ".join(resp.commitments).lower()
+    assert "USER_STATED_STATE:" in (resp.briefContext or "")
+    assert "struggling" not in (resp.briefContext or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_memory_query_recall_sheet_filters_interpretive_language():
+    class _FakeGraph:
+        async def search_facts(self, **_kwargs):
+            return [
+                {"text": "User is struggling with launch pressure", "source": "graphiti"},
+                {"text": "I feel anxious about tomorrow's launch", "source": "graphiti"},
+                {"text": "Launch is scheduled for Friday 9 AM", "source": "graphiti"},
+            ]
+
+        async def search_nodes(self, **_kwargs):
+            query = _kwargs.get("query", "")
+            if "current focus" in query:
+                return [{
+                    "summary": "Right now I'm trying to finish the launch checklist",
+                    "type": "UserFocus",
+                    "attributes": {"focus": "Right now I'm trying to finish the launch checklist"},
+                }]
+            return [
+                {
+                    "summary": "launch-checklist",
+                    "type": "Tension",
+                    "attributes": {"description": "launch-checklist", "status": "unresolved"},
+                },
+                {"summary": "Sophie", "type": "Person", "uuid": "u1"},
+            ]
+
+    fake = _FakeGraph()
+    graphiti_client.search_facts = fake.search_facts
+    graphiti_client.search_nodes = fake.search_nodes
+
+    from src.main import memory_query
+    from src.models import MemoryQueryRequest
+
+    resp = await memory_query(MemoryQueryRequest(tenantId="t", userId="u", query="launch"))
+    assert resp.recallSheet is not None
+    assert _contains_required_sections(resp.recallSheet)
+    assert len(resp.recallSheet) <= 720
+    assert "struggling" not in resp.recallSheet.lower()
+    assert "i feel anxious" in resp.recallSheet.lower()
+    assert "i feel anxious" not in " ".join(resp.facts).lower()
+    assert "i feel anxious" not in " ".join(resp.openLoops).lower()
+    assert "i feel anxious" not in " ".join(resp.commitments).lower()
+    assert "CURRENT_FOCUS:" in resp.recallSheet
+    assert resp.currentFocus is not None

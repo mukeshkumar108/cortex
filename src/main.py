@@ -4,7 +4,8 @@ from contextlib import asynccontextmanager
 import asyncio
 from datetime import datetime
 import logging
-from typing import Optional, Dict, Any
+import re
+from typing import Optional, Dict, Any, List
 
 from .models import (
     IngestRequest,
@@ -39,6 +40,256 @@ logger = logging.getLogger(__name__)
 # Global instances
 db = Database()
 graphiti_client = GraphitiClient()
+
+
+INTERPRETIVE_TERMS = (
+    "feels",
+    "feeling",
+    "struggling",
+    "isolating",
+    "grounding",
+    "tension",
+    "vibe",
+    "emotional",
+)
+ENERGY_HINT_TERMS = (
+    "tired",
+    "exhausted",
+    "drained",
+    "sleepy",
+    "energized",
+    "wired",
+    "low energy",
+    "high energy",
+)
+
+
+def _normalize_text(value: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", (value or "")).strip()
+
+
+def _split_claims(text: Optional[str]) -> List[str]:
+    clean = _normalize_text(text)
+    if not clean:
+        return []
+    parts = re.split(r"[;\n]+|(?<=[.!?])\s+", clean)
+    return [_normalize_text(p).strip(" .") for p in parts if _normalize_text(p)]
+
+
+def _extract_explicit_user_state(text: Optional[str]) -> Optional[str]:
+    clean = _normalize_text(text)
+    if not clean:
+        return None
+    match = re.search(
+        r"\b(i feel|i'm feeling|i am feeling|i felt|i am|i'm)\s+([a-z][^.;,!?\n]{0,60})",
+        clean,
+        flags=re.IGNORECASE
+    )
+    if not match:
+        return None
+    candidate = _normalize_text(match.group(0))
+    if _is_focus_phrase(candidate):
+        return None
+    return candidate
+
+
+def _contains_interpretive_language(text: Optional[str]) -> bool:
+    lower = _normalize_text(text).lower()
+    if not lower:
+        return False
+    return any(term in lower for term in INTERPRETIVE_TERMS)
+
+
+def _is_explicit_user_state_claim(text: Optional[str]) -> bool:
+    return _extract_explicit_user_state(text) is not None
+
+
+def _is_focus_phrase(text: Optional[str]) -> bool:
+    lower = _normalize_text(text).lower()
+    if not lower:
+        return False
+    focus_terms = (
+        "focus",
+        "focused",
+        "priority",
+        "priorities",
+        "trying to",
+        "need to",
+        "working on",
+        "right now",
+        "today i need",
+    )
+    return any(term in lower for term in focus_terms)
+
+
+def _allow_claim(text: Optional[str]) -> bool:
+    clean = _normalize_text(text)
+    if not clean:
+        return False
+    if _contains_interpretive_language(clean) and not _extract_explicit_user_state(clean):
+        return False
+    return True
+
+
+def _dedupe_keep_order(items: List[str], limit: int) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for raw in items:
+        item = _normalize_text(raw)
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _time_of_day_label(dt: datetime) -> str:
+    hour = dt.hour
+    if 0 <= hour < 5:
+        return "NIGHT"
+    if 5 <= hour < 12:
+        return "MORNING"
+    if 12 <= hour < 17:
+        return "AFTERNOON"
+    return "EVENING"
+
+
+def _extract_energy_hint_from_texts(texts: List[str]) -> Optional[str]:
+    for text in texts:
+        state = _extract_explicit_user_state(text)
+        if not state:
+            continue
+        lower = state.lower()
+        for term in ENERGY_HINT_TERMS:
+            if term in lower:
+                return term.upper().replace(" ", "_")
+    return None
+
+
+def _extract_commitments(texts: List[str], limit: int = 3) -> List[str]:
+    commitment_patterns = (
+        r"\bi will\b",
+        r"\bi'll\b",
+        r"\bi plan to\b",
+        r"\bi am going to\b",
+        r"\bscheduled\b",
+        r"\bdeadline\b",
+    )
+    candidates: List[str] = []
+    for text in texts:
+        for claim in _split_claims(text):
+            lower = claim.lower()
+            if any(re.search(pattern, lower) for pattern in commitment_patterns):
+                if _allow_claim(claim) and not _is_explicit_user_state_claim(claim):
+                    candidates.append(claim)
+    return _dedupe_keep_order(candidates, limit=limit)
+
+def _select_current_focus(nodes: List[Dict[str, Any]]) -> Optional[str]:
+    for node in nodes:
+        attrs = node.get("attributes") if isinstance(node, dict) else None
+        node_type = (node.get("type") or "").lower() if isinstance(node, dict) else ""
+        if node_type != "userfocus" and not (isinstance(attrs, dict) and "focus" in attrs):
+            continue
+        focus_text = None
+        if isinstance(attrs, dict):
+            focus_text = attrs.get("focus")
+        if not focus_text:
+            focus_text = node.get("summary")
+        focus_text = _normalize_text(focus_text)
+        if not focus_text:
+            continue
+        if not _allow_claim(focus_text) or _is_explicit_user_state_claim(focus_text):
+            continue
+        return focus_text[:80]
+    return None
+
+
+def _build_structured_sheet(
+    facts: List[str],
+    open_loops: List[str],
+    commitments: List[str],
+    anchors: Dict[str, Any],
+    user_stated_state: Optional[str],
+    current_focus: Optional[str],
+    max_chars: int = 720
+) -> str:
+    def _short(value: str, limit: int) -> str:
+        clean = _normalize_text(value)
+        if len(clean) <= limit:
+            return clean
+        return clean[: max(0, limit - 3)].rstrip() + "..."
+
+    fact_items = [_short(v, 72) for v in facts[:4]]
+    loop_items = [_short(v, 72) for v in open_loops[:3]]
+    commitment_items = [_short(v, 72) for v in commitments[:3]]
+    state_item = _short(user_stated_state, 90) if user_stated_state else None
+    focus_item = _short(current_focus, 80) if current_focus else None
+
+    def _render() -> str:
+        lines: List[str] = []
+        lines.append("FACTS:")
+        for fact in fact_items:
+            lines.append(f"- {fact}")
+        lines.append("OPEN_LOOPS:")
+        for loop in loop_items:
+            lines.append(f"- {loop}")
+        lines.append("COMMITMENTS:")
+        for item in commitment_items:
+            lines.append(f"- {item}")
+        lines.append("CONTEXT_ANCHORS:")
+        for key in ("timeOfDayLabel", "timeGapDescription", "lastInteraction", "sessionId"):
+            value = anchors.get(key)
+            if value is not None and value != "":
+                lines.append(f"- {key}: {_short(str(value), 80)}")
+        if state_item:
+            lines.append("USER_STATED_STATE:")
+            lines.append(f"- {state_item}")
+        if focus_item:
+            lines.append("CURRENT_FOCUS:")
+            lines.append(f"- {focus_item}")
+        return "\n".join(lines).strip()
+
+    output = _render()
+    while len(output) > max_chars:
+        if commitment_items:
+            commitment_items.pop()
+        elif loop_items:
+            loop_items.pop()
+        elif fact_items:
+            fact_items.pop()
+        elif state_item:
+            state_item = None
+        elif focus_item:
+            focus_item = None
+        else:
+            break
+        output = _render()
+    return output
+
+
+async def _get_latest_session_id(tenant_id: str, user_id: str) -> Optional[str]:
+    try:
+        row = await db.fetchone(
+            """
+            SELECT session_id
+            FROM session_buffer
+            WHERE tenant_id = $1 AND user_id = $2
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            tenant_id,
+            user_id
+        )
+        if not row:
+            return None
+        return row.get("session_id")
+    except Exception:
+        return None
 
 
 @asynccontextmanager
@@ -234,23 +485,106 @@ async def memory_query(request: MemoryQueryRequest):
             limit=min(request.limit or 10, 10),
             reference_time=reference_time
         )
+        focus_nodes = await graphiti_client.search_nodes(
+            tenant_id=request.tenantId,
+            user_id=request.userId,
+            query="current focus priority",
+            limit=3,
+            reference_time=reference_time
+        )
 
+        fact_texts_raw = [_normalize_text(f.get("text")) for f in facts if f.get("text")]
+        user_stated_state = None
+        for text in fact_texts_raw:
+            state = _extract_explicit_user_state(text)
+            if state:
+                user_stated_state = state
+                break
+
+        fact_texts = _dedupe_keep_order(
+            [
+                t for t in fact_texts_raw
+                if _allow_claim(t) and not _is_explicit_user_state_claim(t)
+            ],
+            limit=4
+        )
         fact_models = [
-            Fact(text=f["text"], relevance=f.get("relevance"), source=f.get("source", "graphiti"))
+            Fact(text=text, relevance=f.get("relevance"), source=f.get("source", "graphiti"))
+            for text in fact_texts
             for f in facts
-        ]
-        entity_models = [
-            Entity(summary=e["summary"], type=e.get("type"), uuid=e.get("uuid"))
-            for e in entities if e.get("summary")
-        ]
+            if _normalize_text(f.get("text")) == text
+        ][:4]
+
+        entity_models = []
+        for e in entities:
+            summary = _normalize_text(e.get("summary"))
+            if not summary:
+                continue
+            entity_models.append(Entity(summary=summary, type=e.get("type"), uuid=e.get("uuid")))
+
+        open_loop_items: List[str] = []
+        for entity in entities:
+            attrs = entity.get("attributes") if isinstance(entity, dict) else None
+            entity_type = (entity.get("type") or "").lower() if isinstance(entity, dict) else ""
+            if entity_type == "tension" or (isinstance(attrs, dict) and "status" in attrs):
+                status = (attrs.get("status") if isinstance(attrs, dict) else None) or "unresolved"
+                if isinstance(status, str) and status.lower() != "unresolved":
+                    continue
+                description = (attrs.get("description") if isinstance(attrs, dict) else None) or entity.get("summary")
+                if _allow_claim(description) and not _is_explicit_user_state_claim(description):
+                    open_loop_items.append(_normalize_text(description))
+        open_loop_items = _dedupe_keep_order(open_loop_items, limit=3)
+
+        commitment_items = _extract_commitments(
+            texts=fact_texts + [e.summary for e in entity_models],
+            limit=3
+        )
+        latest_session_id = await _get_latest_session_id(request.tenantId, request.userId)
+        last_interaction = None
+        try:
+            eps = await graphiti_client.get_recent_episode_summaries(
+                tenant_id=request.tenantId,
+                user_id=request.userId,
+                limit=1
+            )
+            if eps:
+                last_interaction = eps[0].get("reference_time")
+        except Exception:
+            last_interaction = None
+
+        anchors = {
+            "timeOfDayLabel": _time_of_day_label(reference_time or datetime.utcnow()),
+            "timeGapDescription": None,
+            "lastInteraction": last_interaction,
+            "sessionId": latest_session_id
+        }
+        current_focus = _select_current_focus(focus_nodes or [])
+        recall_sheet = _build_structured_sheet(
+            facts=fact_texts,
+            open_loops=open_loop_items,
+            commitments=commitment_items,
+            anchors=anchors,
+            user_stated_state=user_stated_state,
+            current_focus=current_focus,
+            max_chars=720
+        )
 
         return MemoryQueryResponse(
-            facts=fact_models,
+            facts=fact_texts,
+            openLoops=open_loop_items,
+            commitments=commitment_items,
+            contextAnchors=anchors,
+            userStatedState=user_stated_state,
+            currentFocus=current_focus,
+            factItems=fact_models,
             entities=entity_models,
+            recallSheet=recall_sheet,
+            supplementalContext=recall_sheet,
             metadata={
                 "query": request.query,
                 "facts": len(fact_models),
-                "entities": len(entity_models)
+                "entities": len(entity_models),
+                "openLoops": len(open_loop_items)
             }
         )
     except Exception as e:
@@ -281,7 +615,6 @@ async def session_brief(
         # No transcript fallback; narrative summary must come from Graphiti
 
         time_gap_description = None
-        delta_hours = None
         if episodes:
             last_time = episodes[0].get("reference_time")
             if isinstance(last_time, str):
@@ -293,7 +626,6 @@ async def session_brief(
                 delta = reference_now - last_time
                 hours = int(delta.total_seconds() // 3600)
                 minutes = int((delta.total_seconds() % 3600) // 60)
-                delta_hours = delta.total_seconds() / 3600
                 if hours > 0:
                     time_gap_description = f"{hours} hours since last spoke"
                 else:
@@ -308,7 +640,7 @@ async def session_brief(
         tensions = await graphiti_client.search_nodes(
             tenant_id=tenantId,
             user_id=userId,
-            query="current problems tasks unresolved tensions",
+            query="current problems tasks unresolved blockers open loops",
             limit=10,
             reference_time=reference_now,
             search_filter=current_filter
@@ -330,140 +662,124 @@ async def session_brief(
             if status and isinstance(status, str) and status.lower() != "unresolved":
                 continue
             active_loops.append({
-                "description": description or t.get("summary"),
+                "description": _normalize_text(description or t.get("summary")),
                 "status": status or "unresolved"
             })
 
-        mental_states = await graphiti_client.search_nodes(
+        key_entities = await graphiti_client.search_nodes(
             tenant_id=tenantId,
             user_id=userId,
-            query="user mood mental state energy level",
-            limit=5,
+            query="named people places projects tools organizations priorities",
+            limit=6,
             reference_time=reference_now,
             search_filter=current_filter
         )
-        environments = await graphiti_client.search_nodes(
+        commitment_entities = await graphiti_client.search_nodes(
             tenant_id=tenantId,
             user_id=userId,
-            query="current environment location vibe",
-            limit=5,
+            query="commitment schedule deadline todo follow up plan",
+            limit=6,
             reference_time=reference_now,
             search_filter=current_filter
         )
-
-        current_vibe: Dict[str, Any] = {}
-        for ms in mental_states:
-            attrs = ms.get("attributes") or {}
-            ms_type = (ms.get("type") or "").lower()
-            is_mental = ms_type == "mentalstate" or "mood" in attrs or "energy_level" in attrs
-            if is_mental:
-                current_vibe["mood"] = attrs.get("mood") or ms.get("summary")
-                current_vibe["energyLevel"] = attrs.get("energy_level")
-                break
-
-        for env in environments:
-            attrs = env.get("attributes") or {}
-            env_type = (env.get("type") or "").lower()
-            is_env = env_type == "environment" or "location_type" in attrs or "vibe" in attrs
-            if is_env:
-                current_vibe["locationType"] = attrs.get("location_type") or env.get("summary")
-                current_vibe["vibe"] = attrs.get("vibe")
-                break
-
-        # Incidental anchor (Observation entity)
-        incidental_anchor = None
-        observations = await graphiti_client.search_nodes(
+        focus_nodes = await graphiti_client.search_nodes(
             tenant_id=tenantId,
             user_id=userId,
-            query="incidental anchor sensory detail observation",
+            query="current focus priority",
             limit=3,
             reference_time=reference_now,
             search_filter=current_filter
         )
-        for obs in observations:
-            attrs = obs.get("attributes") or {}
-            obs_type = (obs.get("type") or "").lower()
-            is_obs = obs_type == "observation" or "detail" in attrs
-            if not is_obs:
+
+        facts_from_episodes = []
+        for ep in episodes[:4]:
+            for claim in _split_claims(ep.get("summary")):
+                if _allow_claim(claim) and not _is_explicit_user_state_claim(claim):
+                    facts_from_episodes.append(claim)
+
+        facts_from_entities = []
+        for entity in key_entities:
+            summary = _normalize_text(entity.get("summary"))
+            entity_type = (entity.get("type") or "").lower()
+            if not summary:
                 continue
-            incidental_anchor = attrs.get("detail") or obs.get("summary")
-            if incidental_anchor:
+            if entity_type in {"mentalstate"}:
+                continue
+            if _allow_claim(summary) and not _is_explicit_user_state_claim(summary):
+                facts_from_entities.append(summary)
+
+        facts = _dedupe_keep_order(facts_from_episodes + facts_from_entities, limit=4)
+        open_loop_descriptions = _dedupe_keep_order(
+            [
+                l.get("description")
+                for l in active_loops
+                if l.get("description")
+                and _allow_claim(l.get("description"))
+                and not _is_explicit_user_state_claim(l.get("description"))
+            ],
+            limit=3
+        )
+        commitment_candidates = [
+            _normalize_text(e.get("summary"))
+            for e in commitment_entities
+            if _normalize_text(e.get("summary"))
+        ] + facts_from_episodes
+        commitments = _extract_commitments(commitment_candidates, limit=3)
+
+        user_stated_state = None
+        for ep in episodes[:4]:
+            state = _extract_explicit_user_state(ep.get("summary"))
+            if state:
+                user_stated_state = state
                 break
 
-        # Temporal vibe based on current hour
-        hour = reference_now.hour
-        if 0 <= hour < 5:
-            temporal_vibe = "Deep Night / Low Energy"
-        elif 5 <= hour < 9:
-            temporal_vibe = "Morning Start / Fresh / Light re-entry"
-        elif 9 <= hour < 18:
-            temporal_vibe = "Active Day / Co-pilot mode"
-        else:
-            temporal_vibe = "Evening Wind-down / Reflection"
+        time_of_day_label = _time_of_day_label(reference_now)
+        energy_hint = _extract_energy_hint_from_texts([ep.get("summary") for ep in episodes[:4]])
+        last_interaction = episodes[0].get("reference_time") if episodes else None
+        latest_session_id = await _get_latest_session_id(tenantId, userId)
 
-        # Handshake retrieval based on time delta
-        handshake = None
-        if delta_hours is None:
-            delta_hours = 0
-        if delta_hours < 2:
-            # SHORT: immediate bridge from most recent episode facts
-            if episodes:
-                bridge = episodes[0].get("summary")
-                if bridge:
-                    handshake = f"Immediate bridge: {bridge}"
-        elif delta_hours < 12:
-            # MEDIUM: daily arc (all sessions today)
-            today = reference_now.date()
-            daily_eps = []
-            for ep in episodes:
-                rt = ep.get("reference_time")
-                if isinstance(rt, str):
-                    try:
-                        rt = datetime.fromisoformat(rt.replace("Z", "+00:00"))
-                    except Exception:
-                        rt = None
-                if rt and rt.date() == today:
-                    daily_eps.append({"summary": ep.get("summary"), "reference_time": rt})
-            if not daily_eps:
-                daily_eps = [{"summary": ep.get("summary"), "reference_time": None} for ep in episodes[:3]]
-            daily_eps = [e for e in daily_eps if e.get("summary")]
-            if daily_eps:
-                daily_text = " → ".join([e["summary"] for e in reversed(daily_eps)])
-                handshake = f"Today so far: {daily_text}"
-        else:
-            # LONG: unresolved tensions + long-term gravity
-            gravity_facts = await graphiti_client.search_facts(
-                tenant_id=tenantId,
-                user_id=userId,
-                query="long term goals identity values projects",
-                limit=5,
-                reference_time=reference_now
-            )
-            gravity_text = "; ".join([f.get("text") for f in gravity_facts if f.get("text")][:3])
-            loop_text = ", ".join([l.get("description") for l in active_loops if l.get("description")])
-            parts = []
-            if gravity_text:
-                parts.append(f"Long-term gravity: {gravity_text}.")
-            if loop_text:
-                parts.append(f"Unresolved tensions: {loop_text}.")
-            if parts:
-                handshake = " ".join(parts)
+        context_anchors: Dict[str, Any] = {
+            "timeOfDayLabel": time_of_day_label,
+            "timeGapDescription": time_gap_description,
+            "sessionId": latest_session_id,
+            "lastInteraction": last_interaction
+        }
+        current_focus = _select_current_focus(focus_nodes or [])
 
-        # Compose brief context
-        context_parts = []
-        if temporal_vibe:
-            context_parts.append(f"Temporal vibe: {temporal_vibe}.")
-        if handshake:
-            context_parts.append(handshake)
-        if incidental_anchor:
-            context_parts.append(f"Anchor: {incidental_anchor}.")
-        brief_context = " ".join(context_parts).strip() if context_parts else None
+        brief_context = _build_structured_sheet(
+            facts=facts,
+            open_loops=open_loop_descriptions,
+            commitments=commitments,
+            anchors=context_anchors,
+            user_stated_state=user_stated_state,
+            current_focus=current_focus,
+            max_chars=720
+        )
+
+        narrative_summary = [
+            {"summary": fact, "reference_time": last_interaction}
+            for fact in facts
+        ]
+
+        current_vibe: Dict[str, Any] = {
+            "timeOfDayLabel": time_of_day_label
+        }
+        if energy_hint:
+            current_vibe["energyHint"] = energy_hint
 
         return SessionBriefResponse(
             timeGapDescription=time_gap_description,
-            temporalVibe=temporal_vibe,
+            timeOfDayLabel=time_of_day_label,
+            energyHint=energy_hint,
+            facts=facts,
+            openLoops=open_loop_descriptions,
+            commitments=commitments,
+            contextAnchors=context_anchors,
+            userStatedState=user_stated_state,
+            currentFocus=current_focus,
+            temporalVibe=time_of_day_label,
             briefContext=brief_context,
-            narrativeSummary=episodes[:3],
+            narrativeSummary=narrative_summary,
             activeLoops=active_loops,
             currentVibe=current_vibe
         )
