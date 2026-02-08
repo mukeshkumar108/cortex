@@ -342,6 +342,7 @@ async def test_memory_query_recall_sheet_filters_interpretive_language():
                     "summary": "Right now I'm trying to finish the launch checklist",
                     "type": "UserFocus",
                     "attributes": {"focus": "Right now I'm trying to finish the launch checklist"},
+                    "created_at": "2026-02-04T18:00:00Z",
                 }]
             return [
                 {
@@ -370,3 +371,33 @@ async def test_memory_query_recall_sheet_filters_interpretive_language():
     assert "i feel anxious" not in " ".join(resp.commitments).lower()
     assert "CURRENT_FOCUS:" in resp.recallSheet
     assert resp.currentFocus is not None
+
+
+@pytest.mark.asyncio
+async def test_current_focus_omitted_when_stale():
+    class _FakeGraph:
+        async def search_facts(self, **_kwargs):
+            return []
+
+        async def search_nodes(self, **_kwargs):
+            query = _kwargs.get("query", "")
+            if "current focus" in query:
+                return [{
+                    "summary": "I'm focused on refactoring the build",
+                    "type": "UserFocus",
+                    "attributes": {"focus": "I'm focused on refactoring the build"},
+                    "created_at": "2026-01-01T00:00:00Z",
+                }]
+            return []
+
+    fake = _FakeGraph()
+    graphiti_client.search_facts = fake.search_facts
+    graphiti_client.search_nodes = fake.search_nodes
+
+    from src.main import memory_query
+    from src.models import MemoryQueryRequest
+
+    resp = await memory_query(MemoryQueryRequest(tenantId="t", userId="u", query="focus"))
+    assert resp.recallSheet is not None
+    assert "CURRENT_FOCUS:" not in resp.recallSheet
+    assert resp.currentFocus is None

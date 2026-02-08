@@ -172,14 +172,29 @@ Admin-only (requires `X-Admin-Key`):
 ```json
 {
   "facts": [
-    {"text": "User is stressed at the gym.", "relevance": null, "source": "graphiti"},
-    {"text": "User is struggling with the blue-widget-glitch in Sophie and it is unresolved.", "relevance": null, "source": "graphiti"},
-    {"text": "User feels burnt out from testing.", "relevance": null, "source": "graphiti"}
+    "User is at the gym",
+    "Launch is scheduled for Friday 9 AM"
+  ],
+  "openLoops": ["blue-widget-glitch"],
+  "commitments": ["I will send the demo notes tomorrow"],
+  "contextAnchors": {
+    "timeOfDayLabel": "AFTERNOON",
+    "timeGapDescription": null,
+    "lastInteraction": "2026-02-06T10:14:30Z",
+    "sessionId": "session-abc"
+  },
+  "userStatedState": "I feel anxious about the demo",
+  "currentFocus": "I'm focused on stabilizing the release pipeline",
+  "recallSheet": "FACTS:\n- User is at the gym\n- Launch is scheduled for Friday 9 AM\nOPEN_LOOPS:\n- blue-widget-glitch\nCOMMITMENTS:\n- I will send the demo notes tomorrow\nCONTEXT_ANCHORS:\n- timeOfDayLabel: AFTERNOON\n- lastInteraction: 2026-02-06T10:14:30Z\n- sessionId: session-abc\nUSER_STATED_STATE:\n- I feel anxious about the demo\nCURRENT_FOCUS:\n- I'm focused on stabilizing the release pipeline",
+  "supplementalContext": "FACTS:\n- User is at the gym\n- Launch is scheduled for Friday 9 AM\nOPEN_LOOPS:\n- blue-widget-glitch\nCOMMITMENTS:\n- I will send the demo notes tomorrow\nCONTEXT_ANCHORS:\n- timeOfDayLabel: AFTERNOON\n- lastInteraction: 2026-02-06T10:14:30Z\n- sessionId: session-abc\nUSER_STATED_STATE:\n- I feel anxious about the demo\nCURRENT_FOCUS:\n- I'm focused on stabilizing the release pipeline",
+  "factItems": [
+    {"text": "User is at the gym", "relevance": null, "source": "graphiti"},
+    {"text": "Launch is scheduled for Friday 9 AM", "relevance": null, "source": "graphiti"}
   ],
   "entities": [
-    {"summary": "stressed", "type": "MentalState", "uuid": "..."},
     {"summary": "gym", "type": "Environment", "uuid": "..."},
-    {"summary": "blue-widget-glitch", "type": "Tension", "uuid": "..."}
+    {"summary": "blue-widget-glitch", "type": "Tension", "uuid": "..."},
+    {"summary": "I'm focused on stabilizing the release pipeline", "type": "UserFocus", "uuid": "..."}
   ],
   "metadata": {"query": "What is the user stressed about?", "facts": 3, "entities": 3}
 }
@@ -200,28 +215,31 @@ tenantId=tenant_a&userId=user_1&now=2026-02-04T18:00:00Z
 ```json
 {
   "timeGapDescription": "15 minutes since last spoke",
-  "temporalVibe": "Active Day / Co-pilot mode",
-  "briefContext": "Temporal vibe: Active Day / Co-pilot mode. Immediate bridge: User is at the gym.; User feels stressed.; User is struggling with the blue-widget-glitch in Sophie. Anchor: drinking a cold matcha.",
+  "timeOfDayLabel": "AFTERNOON",
+  "facts": ["User is at the gym"],
+  "openLoops": ["blue-widget-glitch"],
+  "commitments": ["I will send the demo notes tomorrow"],
+  "contextAnchors": {
+    "timeOfDayLabel": "AFTERNOON",
+    "timeGapDescription": "15 minutes since last spoke",
+    "lastInteraction": "2026-02-06T10:14:30Z",
+    "sessionId": "session-abc"
+  },
+  "userStatedState": "I feel anxious about the demo",
+  "currentFocus": "I'm focused on stabilizing the release pipeline",
+  "briefContext": "FACTS:\n- User is at the gym\nOPEN_LOOPS:\n- blue-widget-glitch\nCOMMITMENTS:\n- I will send the demo notes tomorrow\nCONTEXT_ANCHORS:\n- timeOfDayLabel: AFTERNOON\n- timeGapDescription: 15 minutes since last spoke\n- lastInteraction: 2026-02-06T10:14:30Z\n- sessionId: session-abc\nUSER_STATED_STATE:\n- I feel anxious about the demo\nCURRENT_FOCUS:\n- I'm focused on stabilizing the release pipeline",
   "narrativeSummary": [
-    {"summary": "User is at the gym.; User feels stressed.; User is struggling with the blue-widget-glitch in Sophie.", "reference_time": "2026-02-06T10:14:30Z"},
-    {"summary": "User is testing Sophie and feeling burnt out.", "reference_time": "2026-02-06T09:58:12Z"}
+    {"summary": "User is at the gym", "reference_time": "2026-02-06T10:14:30Z"}
   ],
-  "activeLoops": [
-    {"description": "Blue-widget-glitch in Sophie", "status": "unresolved"}
-  ],
-  "currentVibe": {
-    "mood": "Stressed",
-    "energyLevel": "Low",
-    "locationType": "Gym",
-    "vibe": "Noisy"
-  }
+  "activeLoops": [{"description": "Blue-widget-glitch", "status": "unresolved"}],
+  "currentVibe": {"timeOfDayLabel": "AFTERNOON"}
 }
 ```
 
 Notes:
-- Derived from Graphiti narrative entities: `MentalState`, `Tension`, `Environment`.
-- `narrativeSummary` is synthesized from Graphiti edge facts (not raw transcripts).
-- `briefContext` combines time‑aware handshake + temporal vibe + incidental anchor.
+- Derived from Graphiti narrative entities: `MentalState`, `Tension`, `Environment`, `UserFocus`.
+- `narrativeSummary` is synthesized from Graphiti facts (not raw transcripts).
+- `briefContext` is a compact, structured sheet (no narrative prose).
 - Use at session start if you want a short “start‑brief” without issuing multiple queries.
 
 ---

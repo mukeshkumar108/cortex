@@ -189,7 +189,11 @@ def _extract_commitments(texts: List[str], limit: int = 3) -> List[str]:
                     candidates.append(claim)
     return _dedupe_keep_order(candidates, limit=limit)
 
-def _select_current_focus(nodes: List[Dict[str, Any]]) -> Optional[str]:
+def _select_current_focus(nodes: List[Dict[str, Any]], now: Optional[datetime] = None) -> Optional[str]:
+    now = now or datetime.utcnow()
+    if now.tzinfo is not None:
+        now = now.replace(tzinfo=None)
+    candidates: List[Tuple[datetime, str]] = []
     for node in nodes:
         attrs = node.get("attributes") if isinstance(node, dict) else None
         node_type = (node.get("type") or "").lower() if isinstance(node, dict) else ""
@@ -205,8 +209,26 @@ def _select_current_focus(nodes: List[Dict[str, Any]]) -> Optional[str]:
             continue
         if not _allow_claim(focus_text) or _is_explicit_user_state_claim(focus_text):
             continue
-        return focus_text[:80]
-    return None
+        ts = node.get("updated_at") or node.get("reference_time") or node.get("created_at")
+        if isinstance(ts, str):
+            try:
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except Exception:
+                ts = None
+        if isinstance(ts, datetime) and ts.tzinfo is not None:
+            ts = ts.replace(tzinfo=None)
+        if not isinstance(ts, datetime):
+            ts = now
+        candidates.append((ts, focus_text[:80]))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    selected_ts, selected_focus = candidates[0]
+    if (now - selected_ts).days > 7:
+        return None
+    return selected_focus
 
 
 def _build_structured_sheet(
@@ -488,7 +510,7 @@ async def memory_query(request: MemoryQueryRequest):
         focus_nodes = await graphiti_client.search_nodes(
             tenant_id=request.tenantId,
             user_id=request.userId,
-            query="current focus priority",
+            query="current focus priority focused on right now today i need",
             limit=3,
             reference_time=reference_time
         )
@@ -558,7 +580,7 @@ async def memory_query(request: MemoryQueryRequest):
             "lastInteraction": last_interaction,
             "sessionId": latest_session_id
         }
-        current_focus = _select_current_focus(focus_nodes or [])
+        current_focus = _select_current_focus(focus_nodes or [], now=reference_time)
         recall_sheet = _build_structured_sheet(
             facts=fact_texts,
             open_loops=open_loop_items,
@@ -685,7 +707,7 @@ async def session_brief(
         focus_nodes = await graphiti_client.search_nodes(
             tenant_id=tenantId,
             user_id=userId,
-            query="current focus priority",
+            query="current focus priority focused on right now today i need",
             limit=3,
             reference_time=reference_now,
             search_filter=current_filter
@@ -744,7 +766,7 @@ async def session_brief(
             "sessionId": latest_session_id,
             "lastInteraction": last_interaction
         }
-        current_focus = _select_current_focus(focus_nodes or [])
+        current_focus = _select_current_focus(focus_nodes or [], now=reference_now)
 
         brief_context = _build_structured_sheet(
             facts=facts,

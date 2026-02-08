@@ -5,8 +5,8 @@ A FastAPI memory service with a sliding‑window session buffer and Graphiti‑n
 ## What it does (short)
 - **/ingest**: writes turns to Postgres (rolling summary + last 12 messages). Never blocks.
 - **/brief**: minimal session seed (time + working memory + rolling summary).
-- **/session/brief**: Graphiti‑native start brief (briefContext + temporalVibe + currentVibe + activeLoops).
-- **/memory/query**: on‑demand Graphiti memory query (facts/entities).
+- **/session/brief**: Graphiti‑native start brief (structured briefContext + facts/openLoops/commitments + currentFocus).
+- **/memory/query**: on‑demand Graphiti memory query (facts/openLoops/commitments + recallSheet).
 - **/session/close**: flushes raw transcript to Graphiti.
 - **/session/ingest**: send a full session transcript in one call.
 - **Outbox**: reliable delivery of evicted turns; raw transcript is sent to Graphiti on session close.
@@ -27,7 +27,7 @@ curl -s http://localhost:8000/health
 ## API: minimal usage
 **Recommended loop**
 1) `/brief` once at session start (optional)
-2) `/session/brief` if you want a narrative start‑brief (Graphiti)
+2) `/session/brief` if you want a structured start‑brief (Graphiti)
 3) LLM responds
 4) `/ingest` user turn
 5) `/ingest` assistant turn

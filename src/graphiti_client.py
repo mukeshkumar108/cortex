@@ -519,6 +519,14 @@ class GraphitiClient:
                 elif hasattr(result, 'metadata'):
                     entity_data["attributes"] = result.metadata
 
+                # Best-effort timestamps for recency selection
+                if hasattr(result, 'created_at'):
+                    entity_data["created_at"] = result.created_at
+                if hasattr(result, 'updated_at'):
+                    entity_data["updated_at"] = result.updated_at
+                if hasattr(result, 'reference_time'):
+                    entity_data["reference_time"] = result.reference_time
+
                 entities.append(entity_data)
 
                 # Stop once we have enough valid entities

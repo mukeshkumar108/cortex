@@ -96,29 +96,32 @@ tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z
 ```json
 {
   "timeGapDescription": "15 minutes since last spoke",
-  "temporalVibe": "Active Day / Co-pilot mode",
-  "briefContext": "Temporal vibe: Active Day / Co-pilot mode. Immediate bridge: User is at the gym.; User feels stressed.; User is struggling with the blue-widget-glitch in Sophie. Anchor: drinking a cold matcha.",
+  "timeOfDayLabel": "AFTERNOON",
+  "facts": ["User is at the gym"],
+  "openLoops": ["blue-widget-glitch"],
+  "commitments": ["I will send the demo notes tomorrow"],
+  "contextAnchors": {
+    "timeOfDayLabel": "AFTERNOON",
+    "timeGapDescription": "15 minutes since last spoke",
+    "lastInteraction": "2026-02-06T10:14:30Z",
+    "sessionId": "session-abc"
+  },
+  "userStatedState": "I feel anxious about the demo",
+  "currentFocus": "I'm focused on stabilizing the release pipeline",
+  "briefContext": "FACTS:\n- User is at the gym\nOPEN_LOOPS:\n- blue-widget-glitch\nCOMMITMENTS:\n- I will send the demo notes tomorrow\nCONTEXT_ANCHORS:\n- timeOfDayLabel: AFTERNOON\n- timeGapDescription: 15 minutes since last spoke\n- lastInteraction: 2026-02-06T10:14:30Z\n- sessionId: session-abc\nUSER_STATED_STATE:\n- I feel anxious about the demo\nCURRENT_FOCUS:\n- I'm focused on stabilizing the release pipeline",
   "narrativeSummary": [
-    {"summary": "User is at the gym.; User feels stressed.; User is struggling with the blue-widget-glitch in Sophie.", "reference_time": "2026-02-06T10:14:30Z"},
-    {"summary": "User is testing Sophie and feeling burnt out.", "reference_time": "2026-02-06T09:58:12Z"}
+    {"summary": "User is at the gym", "reference_time": "2026-02-06T10:14:30Z"}
   ],
-  "activeLoops": [
-    {"description": "Blue-widget-glitch in Sophie", "status": "unresolved"}
-  ],
-  "currentVibe": {
-    "mood": "Stressed",
-    "energyLevel": "Low",
-    "locationType": "Gym",
-    "vibe": "Noisy"
-  }
+  "activeLoops": [{"description": "Blue-widget-glitch", "status": "unresolved"}],
+  "currentVibe": {"timeOfDayLabel": "AFTERNOON"}
 }
 ```
 
 Notes:
-- Built from Graphiti narrative entities: `MentalState`, `Tension`, `Environment`.
+- Built from Graphiti narrative entities: `MentalState`, `Tension`, `Environment`, `UserFocus`.
 - `narrativeSummary` is synthesized from Graphiti facts (not raw transcripts).
 - Intended for session start only.
-- `briefContext` is a time‑aware handshake + temporal vibe + incidental anchor.
+- `briefContext` is a compact, structured sheet (no narrative prose).
 
 ---
 
