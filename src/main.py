@@ -5,7 +5,7 @@ import asyncio
 from datetime import datetime
 import logging
 import re
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 from .models import (
     IngestRequest,
@@ -68,12 +68,133 @@ def _normalize_text(value: Optional[str]) -> str:
     return re.sub(r"\s+", " ", (value or "")).strip()
 
 
-def _split_claims(text: Optional[str]) -> List[str]:
-    clean = _normalize_text(text)
+def _strip_list_prefix(value: str) -> str:
+    # Remove common bullet/numbering prefixes so claim splitting doesn't emit "-" or "1."
+    return re.sub(r"^\s*(?:[-*•]+|\d+[.)])\s+", "", value).strip()
+
+
+_KNOWN_SHEET_HEADINGS = {
+    "FACTS:",
+    "OPEN_LOOPS:",
+    "COMMITMENTS:",
+    "CONTEXT_ANCHORS:",
+    "USER_STATED_STATE:",
+    "CURRENT_FOCUS:",
+}
+_HEADING_LIKE_RE = re.compile(r"^[A-Z][A-Z0-9_ ]{2,40}:$")
+
+
+def _is_heading_like(value: str) -> bool:
+    clean = _normalize_text(value)
     if not clean:
+        return False
+    if clean in _KNOWN_SHEET_HEADINGS:
+        return True
+    # Generic ALL_CAPS heading lines like "FACTS:" or "ACTION ITEMS:"
+    return bool(_HEADING_LIKE_RE.match(clean))
+
+
+_WORD_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:['’][A-Za-z]+)?")
+_GENERIC_LEADING_TOKENS = {"a", "an", "the", "my", "our", "your", "this", "that", "these", "those"}
+_VAGUE_NOUN_TOKENS = {
+    # Keep this list short and stable; we only want to suppress obvious low-signal fragments.
+    "user",
+    "presentation",
+    "project",
+    "projects",
+    "thing",
+    "stuff",
+}
+_COPULA_TOKENS = {"is", "am", "are", "was", "were", "be", "been", "being"}
+
+
+def _word_tokens(value: str) -> List[str]:
+    return _WORD_TOKEN_RE.findall(value or "")
+
+
+def _has_proper_possessive(value: str) -> bool:
+    # "Ashley's presentation" / "Ashley’s presentation"
+    clean = _normalize_text(value)
+    return bool(re.search(r"\b[A-Z][a-z]+['’]s\b", clean))
+
+
+def _allow_fact_text(value: Optional[str]) -> bool:
+    """
+    Minimal fact-quality filter:
+    - Require >= 2 word tokens, OR allow "ProperNoun's <descriptor>".
+    - Suppress obvious single-token/vague fragments.
+    """
+    clean = _strip_list_prefix(_normalize_text(value))
+    if not clean:
+        return False
+    if _is_heading_like(clean):
+        return False
+
+    tokens = _word_tokens(clean)
+    if len(tokens) < 2:
+        # Single tokens like "User" or "presentation" are too low-signal.
+        return False
+
+    if len(tokens) == 2:
+        # Accept proper-noun possessive constructions even if the descriptor is generic.
+        if _has_proper_possessive(clean):
+            return True
+
+        lowered = [t.lower() for t in tokens if t]
+        if any(t in _COPULA_TOKENS for t in lowered):
+            # "User is" / "I am" style fragments are not useful standalone.
+            return False
+
+        meaningful = [t for t in lowered if t not in _GENERIC_LEADING_TOKENS]
+        if len(meaningful) == 1 and meaningful[0] in _VAGUE_NOUN_TOKENS:
+            # "the presentation", "my project"
+            return False
+        if meaningful and all(t in _VAGUE_NOUN_TOKENS for t in meaningful):
+            # "user presentation"
+            return False
+
+    # Multi-token facts generally have enough surface area to be useful.
+    return True
+
+
+def _shorten_line(value: str, limit: int) -> str:
+    clean = _normalize_text(value)
+    if len(clean) <= limit:
+        return clean
+    return clean[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _select_facts(candidates: List[str], limit: int) -> List[str]:
+    filtered: List[str] = []
+    for raw in candidates:
+        claim = _strip_list_prefix(_normalize_text(raw)).strip(" .")
+        if not claim:
+            continue
+        if _is_heading_like(claim):
+            continue
+        if not _allow_claim(claim) or _is_explicit_user_state_claim(claim):
+            continue
+        if not _allow_fact_text(claim):
+            continue
+        filtered.append(_shorten_line(claim, 160))
+    return _dedupe_keep_order(filtered, limit=limit)
+
+
+def _split_claims(text: Optional[str]) -> List[str]:
+    raw = (text or "").strip()
+    if not raw:
         return []
-    parts = re.split(r"[;\n]+|(?<=[.!?])\s+", clean)
-    return [_normalize_text(p).strip(" .") for p in parts if _normalize_text(p)]
+    # Important: split before collapsing whitespace so we don't merge "\nFACTS:\n- X" into a single claim.
+    parts = re.split(r"[;\n]+|(?<=[.!?])\s+", raw)
+    out: List[str] = []
+    for part in parts:
+        value = _strip_list_prefix(_normalize_text(part)).strip(" .")
+        if not value:
+            continue
+        if _is_heading_like(value):
+            continue
+        out.append(value)
+    return out
 
 
 def _extract_explicit_user_state(text: Optional[str]) -> Optional[str]:
@@ -125,6 +246,8 @@ def _is_focus_phrase(text: Optional[str]) -> bool:
 def _allow_claim(text: Optional[str]) -> bool:
     clean = _normalize_text(text)
     if not clean:
+        return False
+    if _is_heading_like(clean):
         return False
     if _contains_interpretive_language(clean) and not _extract_explicit_user_state(clean):
         return False
@@ -526,7 +649,7 @@ async def memory_query(request: MemoryQueryRequest):
         fact_texts = _dedupe_keep_order(
             [
                 t for t in fact_texts_raw
-                if _allow_claim(t) and not _is_explicit_user_state_claim(t)
+                if _allow_claim(t) and _allow_fact_text(t) and not _is_explicit_user_state_claim(t)
             ],
             limit=4
         )
@@ -730,7 +853,7 @@ async def session_brief(
             if _allow_claim(summary) and not _is_explicit_user_state_claim(summary):
                 facts_from_entities.append(summary)
 
-        facts = _dedupe_keep_order(facts_from_episodes + facts_from_entities, limit=4)
+        facts = _select_facts(facts_from_episodes + facts_from_entities, limit=4)
         open_loop_descriptions = _dedupe_keep_order(
             [
                 l.get("description")
@@ -778,10 +901,33 @@ async def session_brief(
             max_chars=720
         )
 
-        narrative_summary = [
-            {"summary": fact, "reference_time": last_interaction}
-            for fact in facts
-        ]
+        fact_keys = {f.lower() for f in facts}
+        narrative_candidates: List[str] = []
+        for ep in episodes[:6]:
+            narrative_candidates.extend(_split_claims(ep.get("summary")))
+
+        narrative_lines = _dedupe_keep_order(
+            [
+                _shorten_line(line, 180)
+                for line in narrative_candidates
+                if _allow_claim(line) and _allow_fact_text(line) and not _is_explicit_user_state_claim(line)
+            ],
+            limit=5
+        )
+        narrative_lines = [line for line in narrative_lines if line.lower() not in fact_keys][:3]
+        if not narrative_lines and episodes:
+            # Fallback: keep a single narrative anchor without duplicating a fact line verbatim.
+            for claim in _split_claims(episodes[0].get("summary")):
+                if not _allow_claim(claim) or _is_explicit_user_state_claim(claim):
+                    continue
+                if not _allow_fact_text(claim):
+                    continue
+                candidate = claim if claim.lower() not in fact_keys else f"Previously: {claim}"
+                if _allow_claim(candidate) and _allow_fact_text(candidate):
+                    narrative_lines = [_shorten_line(candidate, 180)]
+                    break
+
+        narrative_summary = [{"summary": line, "reference_time": last_interaction} for line in narrative_lines]
 
         current_vibe: Dict[str, Any] = {
             "timeOfDayLabel": time_of_day_label

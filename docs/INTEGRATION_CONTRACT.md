@@ -238,7 +238,8 @@ tenantId=tenant_a&userId=user_1&now=2026-02-04T18:00:00Z
 
 Notes:
 - Derived from Graphiti narrative entities: `MentalState`, `Tension`, `Environment`, `UserFocus`.
-- `narrativeSummary` is synthesized from Graphiti facts (not raw transcripts).
+- Facts are filtered for quality (no single‑token/vague fragments).
+- `narrativeSummary` is derived from Graphiti episode summaries and de‑duplicated from facts.
 - `briefContext` is a compact, structured sheet (no narrative prose).
 - Use at session start if you want a short “start‑brief” without issuing multiple queries.
 

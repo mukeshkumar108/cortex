@@ -99,7 +99,7 @@ OUTBOX_DRAIN_ENABLED=true
 ## Gotchas / things to watch
 - **Identity defaults are null** until user states name/home/timezone. Don’t assume name exists.
 - **Graphiti recall is not automatic**: call `/memory/query` to retrieve facts/entities.
-- **/session/brief is Graphiti‑native**: narrativeSummary is derived from Graphiti facts, not transcripts.
+- **/session/brief is Graphiti‑native**: facts are filtered for quality (no single-token/vague fragments), and narrativeSummary is derived from Graphiti episode summaries (de‑duplicated from facts).
 - **Outbox won’t drain** unless `/internal/drain` is called or `OUTBOX_DRAIN_ENABLED=true`.
 - **Session close** happens via idle close loop (config) or next ingest. Enable idle close for clean session summaries.
 - **Graphiti LLM** uses OpenAI by default (via `OPENAI_API_KEY`) unless overridden by `GRAPHITI_LLM_*` settings.

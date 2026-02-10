@@ -206,6 +206,82 @@ async def test_session_brief_happy_path():
 
 
 @pytest.mark.asyncio
+async def test_session_brief_filters_low_signal_facts_and_sheet_headings():
+    async def _stub_recent_summaries(**_kwargs):
+        return [
+            {
+                "summary": "FACTS:\n- User\n- presentation\n- User stayed up all night finishing the UI overhaul.\nOPEN_LOOPS:\n- TODO",
+                "reference_time": "2026-02-05T01:00:00Z",
+            }
+        ]
+
+    async def _stub_search_nodes(**kwargs):
+        query = kwargs.get("query", "")
+        if "unresolved" in query or "open loops" in query:
+            return []
+        if "named people" in query:
+            return [
+                {"summary": "presentation", "type": "Project"},
+                {"summary": "Ashley's presentation", "type": "Project"},
+            ]
+        if "commitment" in query:
+            return []
+        if "current focus" in query:
+            return []
+        return []
+
+    graphiti_client.get_recent_episode_summaries = _stub_recent_summaries
+    graphiti_client.search_nodes = _stub_search_nodes
+
+    from src.main import session_brief
+
+    resp = await session_brief(tenantId="t", userId="u", now="2026-02-05T03:00:00Z")
+
+    # Facts should be concrete and avoid low-signal singleton tokens/headings.
+    lower_facts = [f.lower() for f in resp.facts]
+    assert "user" not in lower_facts
+    assert "presentation" not in lower_facts
+    assert "facts:" not in lower_facts
+    assert "open_loops:" not in lower_facts
+    assert any("ui overhaul" in f.lower() for f in resp.facts)
+
+    # briefContext should not echo sheet headings as fact lines.
+    assert "- FACTS:" not in (resp.briefContext or "")
+    assert "- OPEN_LOOPS:" not in (resp.briefContext or "")
+
+
+@pytest.mark.asyncio
+async def test_session_brief_narrative_summary_does_not_duplicate_facts():
+    async def _stub_recent_summaries(**_kwargs):
+        return [
+            {"summary": "User planned a demo. User stayed up all night finishing the UI overhaul.", "reference_time": "2026-02-05T01:00:00Z"},
+            {"summary": "User mentioned Ashley's presentation.", "reference_time": "2026-02-04T20:00:00Z"},
+        ]
+
+    async def _stub_search_nodes(**kwargs):
+        query = kwargs.get("query", "")
+        if "unresolved" in query or "open loops" in query:
+            return []
+        if "named people" in query:
+            return [{"summary": "Ashley's presentation", "type": "Project"}]
+        if "commitment" in query:
+            return []
+        if "current focus" in query:
+            return []
+        return []
+
+    graphiti_client.get_recent_episode_summaries = _stub_recent_summaries
+    graphiti_client.search_nodes = _stub_search_nodes
+
+    from src.main import session_brief
+
+    resp = await session_brief(tenantId="t", userId="u", now="2026-02-05T03:00:00Z")
+    fact_keys = {f.lower() for f in resp.facts}
+    narrative_keys = {item.get("summary", "").lower() for item in (resp.narrativeSummary or [])}
+    assert fact_keys.isdisjoint(narrative_keys)
+
+
+@pytest.mark.asyncio
 async def test_internal_graphiti_debug_endpoints():
     os.environ["INTERNAL_TOKEN"] = "test_token"
     get_settings.cache_clear()
