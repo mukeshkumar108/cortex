@@ -752,6 +752,71 @@ class GraphitiClient:
                 })
         return results
 
+    async def get_latest_session_summary_node(
+        self,
+        tenant_id: str,
+        user_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return latest SessionSummary node for a user group."""
+        if not self._initialized:
+            await self.initialize()
+        if not self._initialized or self.client is None:
+            logger.warning("Graphiti client unavailable; skipping get_latest_session_summary_node")
+            return None
+
+        driver = getattr(self.client, "driver", None)
+        if not driver:
+            logger.warning("Graphiti driver unavailable; skipping get_latest_session_summary_node")
+            return None
+
+        composite_user_id = self._make_composite_user_id(tenant_id, user_id)
+        try:
+            rows = await driver.execute_query(
+                """
+                MATCH (n:SessionSummary {group_id: $group_id})
+                RETURN n.name AS name,
+                       n.summary AS summary,
+                       n.created_at AS created_at,
+                       n.uuid AS uuid,
+                       n.group_id AS group_id,
+                       n.attributes AS attributes
+                ORDER BY n.created_at DESC
+                LIMIT 1
+                """,
+                group_id=composite_user_id
+            )
+            if not rows:
+                return None
+            row = rows[0]
+            if isinstance(row, dict):
+                # Some drivers return nested dicts; pick the first dict with name/summary.
+                if any(isinstance(v, dict) for v in row.values()):
+                    for v in row.values():
+                        if isinstance(v, dict) and v.get("name") and v.get("summary"):
+                            row = v
+                            break
+                return {
+                    "name": row.get("name"),
+                    "summary": row.get("summary"),
+                    "created_at": row.get("created_at"),
+                    "uuid": row.get("uuid"),
+                    "group_id": row.get("group_id"),
+                    "attributes": row.get("attributes") or {}
+                }
+            if isinstance(row, (list, tuple)):
+                return {
+                    "name": row[0] if len(row) > 0 else None,
+                    "summary": row[1] if len(row) > 1 else None,
+                    "created_at": row[2] if len(row) > 2 else None,
+                    "uuid": row[3] if len(row) > 3 else None,
+                    "group_id": row[4] if len(row) > 4 else None,
+                    "attributes": row[5] if len(row) > 5 else {}
+                }
+            return None
+        except Exception as e:
+            logger.error(f"get_latest_session_summary_node failed: {e}")
+            return None
+
     async def smoke_test(
         self,
         tenant_id: str,

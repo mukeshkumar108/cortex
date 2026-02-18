@@ -15,11 +15,11 @@ async def test_session_startbrief_uses_loops_and_filters_summary(monkeypatch):
     now = now_dt.isoformat().replace("+00:00", "Z")
     session_id = "session-test"
 
-    async def _stub_recent_summaries(*_args, **_kwargs):
-        return [{
+    async def _stub_latest_summary_node(*_args, **_kwargs):
+        return {
             "summary": "I feel anxious about the demo. At the gym. Finish portfolio site this week.",
-            "reference_time": now
-        }]
+            "created_at": now
+        }
 
     async def _stub_search_nodes(*_args, **_kwargs):
         return [{
@@ -52,7 +52,7 @@ async def test_session_startbrief_uses_loops_and_filters_summary(monkeypatch):
     async def _stub_last_interaction_time(_tenant_id, _session_id):
         return now_dt - timedelta(hours=8)
 
-    graphiti_client.get_recent_episode_summaries = _stub_recent_summaries
+    graphiti_client.get_latest_session_summary_node = _stub_latest_summary_node
     graphiti_client.search_nodes = _stub_search_nodes
     monkeypatch.setattr(
         session_module,

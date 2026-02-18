@@ -1059,16 +1059,15 @@ async def session_startbrief(
                 last_user_text = None
 
         try:
-            logger.info("startbrief graphiti: get_recent_episode_summaries")
-            episodes = await graphiti_client.get_recent_episode_summaries(
+            logger.info("startbrief graphiti: get_latest_session_summary_node")
+            summary_node = await graphiti_client.get_latest_session_summary_node(
                 tenant_id=tenantId,
-                user_id=userId,
-                limit=1
+                user_id=userId
             )
-            if episodes:
-                last_session_summary = episodes[0].get("summary")
+            if summary_node:
+                last_session_summary = summary_node.get("summary")
                 if not last_activity_time:
-                    last_time = episodes[0].get("reference_time")
+                    last_time = summary_node.get("created_at")
                     if isinstance(last_time, str):
                         try:
                             last_time = datetime.fromisoformat(last_time.replace("Z", "+00:00"))
@@ -1078,6 +1077,29 @@ async def session_startbrief(
                         last_activity_time = last_time
         except Exception:
             last_session_summary = None
+
+        # Fallback to legacy episode summaries if no SessionSummary node is found
+        if not last_session_summary:
+            try:
+                logger.info("startbrief graphiti: get_recent_episode_summaries (fallback)")
+                episodes = await graphiti_client.get_recent_episode_summaries(
+                    tenant_id=tenantId,
+                    user_id=userId,
+                    limit=1
+                )
+                if episodes:
+                    last_session_summary = episodes[0].get("summary")
+                    if not last_activity_time:
+                        last_time = episodes[0].get("reference_time")
+                        if isinstance(last_time, str):
+                            try:
+                                last_time = datetime.fromisoformat(last_time.replace("Z", "+00:00"))
+                            except Exception:
+                                last_time = None
+                        if isinstance(last_time, datetime):
+                            last_activity_time = last_time
+            except Exception:
+                last_session_summary = None
 
         # Diagnostics: environment nodes (not used in output)
         try:
