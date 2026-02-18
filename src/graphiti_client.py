@@ -339,6 +339,7 @@ class GraphitiClient:
         session_id: str,
         summary_text: str,
         reference_time: datetime,
+        bridge_text: Optional[str] = None,
         episode_uuid: Optional[str] = None
     ) -> Dict[str, Any]:
         """Store a SessionSummary node in Graphiti and optionally link to an episode."""
@@ -362,6 +363,7 @@ class GraphitiClient:
             summary=summary_text,
             attributes={
                 "summary_text": summary_text,
+                "bridge_text": bridge_text,
                 "session_id": session_id,
                 "reference_time": reference_time.isoformat()
             }
