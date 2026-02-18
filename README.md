@@ -8,7 +8,7 @@ A FastAPI memory service with a sliding‑window session buffer and Graphiti‑n
 - **/session/startbrief**: minimal start bridge (bridgeText + up to 5 durable items). Optional `sessionId`, `personaId`, `timezone`.
 - **/session/brief**: Graphiti‑native start brief (structured briefContext + facts/openLoops/commitments + currentFocus).
 - **/memory/query**: on‑demand Graphiti memory query (facts/openLoops/commitments + recallSheet).
-- **/session/close**: flushes raw transcript to Graphiti and extracts procedural loops (best‑effort).
+- **/session/close**: flushes raw transcript to Graphiti, stores a SessionSummary node, and extracts procedural loops (best‑effort).
 - **/session/ingest**: send a full session transcript in one call.
 - **Outbox**: reliable delivery of evicted turns; raw transcript is sent to Graphiti on session close.
 
@@ -87,7 +87,7 @@ Docs:
 ## Key concepts
 - **Session buffer**: Postgres keeps rolling summary + last 12 messages (6 user+assistant turns).
 - **Outbox**: evicted turns are queued; retries are backoff‑controlled.
-- **Graphiti**: semantic memory (episodes/facts/entities). Receives raw session transcripts on close.
+- **Graphiti**: semantic memory (episodes/facts/entities + SessionSummary nodes). Receives raw session transcripts on close.
 - **Loops**: procedural memory (commitments/decisions/frictions/habits/threads) extracted on session close into Postgres.
 
 ## Configuration (important)
@@ -128,6 +128,7 @@ Require header `X-Internal-Token` = `INTERNAL_TOKEN`.
 - `/internal/debug/session?tenantId&userId&sessionId`
 - `/internal/debug/nudges?tenantId&userId`
 - `/internal/debug/graphiti/episodes?tenantId&userId&limit=5`
+- `/internal/debug/graphiti/session_summaries?tenantId&userId&limit=5`
 - `POST /internal/debug/graphiti/query`
 - `POST /internal/debug/close_session?tenantId&userId&sessionId`
 - `POST /internal/debug/close_user_sessions?tenantId&userId&limit=20`

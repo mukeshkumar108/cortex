@@ -1008,7 +1008,7 @@ Do not include filler or meta-commentary."""
             # 2. Send raw transcript episode to Graphiti (best-effort)
             started_at = buffer.get("created_at")
             ended_at = datetime.utcnow()
-            await self._send_raw_transcript_episode(
+            episode_uuid = await self._send_raw_transcript_episode(
                 tenant_id=tenant_id,
                 session_id=session_id,
                 user_id=user_id,
@@ -1060,6 +1060,40 @@ Do not include filler or meta-commentary."""
                     logger.info(f"Skipping loop extraction (missing persona_id) for session {session_id}")
             except Exception as e:
                 logger.error(f"Loop extraction on session close failed: {e}")
+
+            # 2c. Create SessionSummary node in Graphiti (best-effort)
+            try:
+                full_messages = await self._get_full_transcript_messages(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    user_id=user_id,
+                    buffer=buffer
+                )
+                recent_turns = full_messages[-6:] if full_messages else []
+                summary_input = self._build_session_summary_input(
+                    rolling_summary=buffer.get("rolling_summary") or "",
+                    recent_turns=recent_turns
+                )
+                summary_text = await self._summarize_session_close(summary_input)
+                if not summary_text:
+                    summary_text = (buffer.get("rolling_summary") or "").strip()
+                if not summary_text and recent_turns:
+                    last_user = next(
+                        (m.get("text") for m in reversed(recent_turns) if m.get("role") == "user" and m.get("text")),
+                        None
+                    )
+                    summary_text = (last_user or "").strip()
+                if summary_text:
+                    await graphiti_client.add_session_summary(
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        session_id=session_id,
+                        summary_text=summary_text,
+                        reference_time=ended_at or datetime.utcnow(),
+                        episode_uuid=episode_uuid
+                    )
+            except Exception as e:
+                logger.error(f"Session summary creation failed: {e}")
 
             # 3. Mark session closed and clear messages
             query = """
@@ -1133,7 +1167,7 @@ Do not include filler or meta-commentary."""
         graphiti_client,
         started_at: Optional[datetime] = None,
         ended_at: Optional[datetime] = None
-    ) -> None:
+    ) -> Optional[str]:
         try:
             buffer = await self.get_or_create_buffer(tenant_id, session_id, user_id)
             full_messages = await self._get_full_transcript_messages(
@@ -1144,14 +1178,14 @@ Do not include filler or meta-commentary."""
             )
 
             if not full_messages:
-                return
+                return None
 
             ended_at = ended_at or datetime.utcnow()
             raw_text = "\n".join(
                 [f"{m.get('role')}: {m.get('text')}" for m in full_messages]
             )
             raw_episode_name = f"session_raw_{session_id}_{int(ended_at.timestamp())}"
-            await graphiti_client.add_episode(
+            result = await graphiti_client.add_episode(
                 tenant_id=tenant_id,
                 user_id=user_id,
                 text=raw_text,
@@ -1165,8 +1199,12 @@ Do not include filler or meta-commentary."""
                     "episode_type": "session_raw"
                 }
             )
+            if isinstance(result, dict):
+                return result.get("episode_uuid")
+            return None
         except Exception as e:
             logger.error(f"Failed to send raw transcript episode: {e}")
+            return None
 
     async def close_idle_sessions_once(
         self,

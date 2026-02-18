@@ -8,6 +8,7 @@ import pytest
 
 from src.main import app, graphiti_client
 from src.graphiti_client import NARRATIVE_EXTRACTION_INSTRUCTIONS
+from graphiti_core.nodes import EntityNode
 from src.briefing import build_briefing
 from src import session as session_module
 from src.config import get_settings
@@ -142,6 +143,45 @@ async def test_session_close_sends_raw_transcript_episode():
         assert row["closed_at"] is not None
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_add_session_summary_sets_summary_field(monkeypatch):
+    from src.graphiti_client import GraphitiClient
+
+    gc = GraphitiClient()
+    gc._initialized = True
+
+    class _FakeDriver:
+        pass
+
+    class _FakeClient:
+        driver = _FakeDriver()
+
+    gc.client = _FakeClient()
+
+    saved = {}
+
+    async def _fake_save(self, _driver):
+        saved["summary"] = getattr(self, "summary", None)
+        saved["labels"] = getattr(self, "labels", [])
+        saved["name"] = getattr(self, "name", None)
+        return True
+
+    monkeypatch.setattr(EntityNode, "save", _fake_save, raising=True)
+
+    resp = await gc.add_session_summary(
+        tenant_id="t",
+        user_id="u",
+        session_id="session-1",
+        summary_text="User finished portfolio updates.",
+        reference_time=datetime.utcnow(),
+        episode_uuid=None
+    )
+
+    assert resp["success"] is True
+    assert saved["summary"] == "User finished portfolio updates."
+    assert "SessionSummary" in saved["labels"]
 
 
 @pytest.mark.asyncio
@@ -436,7 +476,14 @@ async def test_memory_query_recall_sheet_filters_interpretive_language():
     from src.main import memory_query
     from src.models import MemoryQueryRequest
 
-    resp = await memory_query(MemoryQueryRequest(tenantId="t", userId="u", query="launch"))
+    resp = await memory_query(
+        MemoryQueryRequest(
+            tenantId="t",
+            userId="u",
+            query="launch",
+            referenceTime="2026-02-05T01:00:00Z"
+        )
+    )
     assert resp.recallSheet is not None
     assert _contains_required_sections(resp.recallSheet)
     assert len(resp.recallSheet) <= 720

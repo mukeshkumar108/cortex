@@ -195,7 +195,7 @@ Write both user and assistant turns. This stores the session transcript only.
 
 Notes:
 - /ingest returns quickly after buffer write; background janitor runs later.
-- Session close (idle) sends **raw transcript** to Graphiti as one episode.
+- Session close (idle) sends **raw transcript** to Graphiti as one episode and stores a `SessionSummary` node.
 
 ---
 
@@ -222,8 +222,9 @@ Public close endpoint to flush raw transcript to Graphiti.
 
 Notes:
 - If `sessionId` is omitted, Synapse closes the most recent open session for the user.
-- On close, Synapse sends the raw transcript to Graphiti and performs best‑effort loop extraction
-  (commitments/decisions/frictions/habits/threads) into Postgres with provenance metadata.
+- On close, Synapse sends the raw transcript to Graphiti, stores a `SessionSummary` node in Graphiti,
+  and performs best‑effort loop extraction (commitments/decisions/frictions/habits/threads) into Postgres
+  with provenance metadata.
 
 ---
 

@@ -2,7 +2,7 @@ import inspect
 from graphiti_core import Graphiti
 from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig
-from graphiti_core.nodes import EpisodeType, EpisodicNode
+from graphiti_core.nodes import EpisodeType, EpisodicNode, EntityNode
 from graphiti_core.edges import EntityEdge
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from typing import List, Dict, Any, Optional, Tuple
@@ -285,7 +285,7 @@ class GraphitiClient:
                 role_tag = "ASSISTANT" if role.lower() == "assistant" else "USER" if role.lower() == "user" else "SYSTEM"
                 tagged_text = f"{role_tag}: {text}"
 
-            await self.client.add_episode(
+            result = await self.client.add_episode(
                 name=episode_name or f"episode_{timestamp.isoformat()}",
                 episode_body=tagged_text,
                 source=EpisodeType.message,
@@ -299,7 +299,13 @@ class GraphitiClient:
             )
 
             logger.info(f"Added episode for user {composite_user_id} (role={role})")
-            return {"success": True}
+            episode_uuid = None
+            try:
+                episode = getattr(result, "episode", None)
+                episode_uuid = getattr(episode, "uuid", None)
+            except Exception:
+                episode_uuid = None
+            return {"success": True, "episode_uuid": episode_uuid}
 
         except Exception as e:
             logger.error(f"Failed to add episode: {e}")
@@ -324,6 +330,73 @@ class GraphitiClient:
             metadata=metadata,
             episode_name=episode_name
         )
+
+    async def add_session_summary(
+        self,
+        tenant_id: str,
+        user_id: str,
+        session_id: str,
+        summary_text: str,
+        reference_time: datetime,
+        episode_uuid: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Store a SessionSummary node in Graphiti and optionally link to an episode."""
+        if not self._initialized:
+            await self.initialize()
+        if not self._initialized or self.client is None:
+            logger.warning("Graphiti client unavailable; skipping add_session_summary")
+            return {"success": False}
+
+        driver = getattr(self.client, "driver", None)
+        if not driver:
+            logger.warning("Graphiti driver unavailable; skipping add_session_summary")
+            return {"success": False}
+
+        composite_user_id = self._make_composite_user_id(tenant_id, user_id)
+        name = f"session_summary_{session_id}_{int(reference_time.timestamp())}"
+        node = EntityNode(
+            name=name,
+            group_id=composite_user_id,
+            labels=["SessionSummary"],
+            summary=summary_text,
+            attributes={
+                "summary_text": summary_text,
+                "session_id": session_id,
+                "reference_time": reference_time.isoformat()
+            }
+        )
+        try:
+            saved = node.save(driver)
+            if inspect.isawaitable(saved):
+                await saved
+            logger.info(
+                f"SessionSummary node saved name={name} uuid={node.uuid} len={len(summary_text)}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to save SessionSummary node: {e}")
+            return {"success": False}
+
+        if episode_uuid:
+            try:
+                edge = EntityEdge(
+                    group_id=composite_user_id,
+                    source_node_uuid=node.uuid,
+                    target_node_uuid=episode_uuid,
+                    created_at=reference_time,
+                    name="SUMMARIZES",
+                    fact=f"Summary of session {session_id}",
+                    attributes={
+                        "session_id": session_id,
+                        "reference_time": reference_time.isoformat()
+                    }
+                )
+                saved_edge = edge.save(driver)
+                if inspect.isawaitable(saved_edge):
+                    await saved_edge
+            except Exception as e:
+                logger.error(f"Failed to save SUMMARIZES edge: {e}")
+
+        return {"success": True, "summary_uuid": node.uuid}
 
     async def search_facts(
         self,

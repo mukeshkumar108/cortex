@@ -319,6 +319,26 @@ def _resolve_timezone(tz: Optional[str]) -> Optional[ZoneInfo]:
         return None
 
 
+def _explicit_environment_in_text(text: Optional[str]) -> bool:
+    """Allow environment only if explicitly stated in most recent user text."""
+    if not text:
+        return False
+    lower = _normalize_text(text).lower()
+    patterns = (
+        r"\bi'm at\b",
+        r"\bi am at\b",
+        r"\bi'm in\b",
+        r"\bi am in\b",
+        r"\bi'm outside\b",
+        r"\bi am outside\b",
+        r"\bon my walk\b",
+        r"\bin the park\b",
+    )
+    if extract_location(lower):
+        return True
+    return any(re.search(p, lower) for p in patterns)
+
+
 def _extract_commitments(texts: List[str], limit: int = 3) -> List[str]:
     commitment_patterns = (
         r"\bi will\b",
@@ -996,6 +1016,16 @@ async def session_startbrief(
     Minimal start-brief: short bridgeText + durable items.
     """
     try:
+        logger.info(
+            "startbrief input: tenant=%s user=%s session=%s persona=%s now=%s timezone=%s",
+            tenantId,
+            userId,
+            sessionId,
+            personaId,
+            now,
+            timezone
+        )
+
         reference_now = datetime.utcnow()
         if now:
             reference_now = datetime.fromisoformat(now.replace("Z", "+00:00"))
@@ -1013,13 +1043,23 @@ async def session_startbrief(
 
         # Prefer session/message timestamps for time gap.
         session_id = sessionId or await _get_latest_session_id(tenantId, userId)
+        last_user_text = None
         if session_id:
             try:
                 last_activity_time = await session.get_last_interaction_time(tenantId, session_id)
             except Exception:
                 last_activity_time = None
+            try:
+                working_memory = await session.get_working_memory(tenantId, session_id)
+                for msg in reversed(working_memory):
+                    if msg.role == "user" and msg.text:
+                        last_user_text = msg.text
+                        break
+            except Exception:
+                last_user_text = None
 
         try:
+            logger.info("startbrief graphiti: get_recent_episode_summaries")
             episodes = await graphiti_client.get_recent_episode_summaries(
                 tenant_id=tenantId,
                 user_id=userId,
@@ -1039,6 +1079,32 @@ async def session_startbrief(
         except Exception:
             last_session_summary = None
 
+        # Diagnostics: environment nodes (not used in output)
+        try:
+            logger.info("startbrief graphiti: search_nodes (environment diagnostics)")
+            env_nodes = await graphiti_client.search_nodes(
+                tenant_id=tenantId,
+                user_id=userId,
+                query="environment location place context",
+                limit=3,
+                reference_time=reference_now
+            )
+            env_info = []
+            for node in env_nodes or []:
+                node_type = (node.get("type") or "").lower() if isinstance(node, dict) else ""
+                if node_type != "environment":
+                    continue
+                env_info.append({
+                    "summary": node.get("summary"),
+                    "uuid": node.get("uuid"),
+                    "created_at": node.get("created_at"),
+                    "updated_at": node.get("updated_at"),
+                    "reference_time": node.get("reference_time")
+                })
+            logger.info("startbrief env_nodes=%s", env_info)
+        except Exception as e:
+            logger.info("startbrief env_nodes lookup failed: %s", e)
+
         if last_activity_time:
             if last_activity_time.tzinfo is None:
                 last_activity_time = last_activity_time.replace(tzinfo=tzinfo or timezone.utc)
@@ -1052,22 +1118,39 @@ async def session_startbrief(
             else:
                 time_gap_human = f"{minutes} minutes since last spoke"
 
+        logger.info(
+            "startbrief timegap: last_activity=%s time_gap_human=%s time_of_day=%s",
+            last_activity_time.isoformat() if isinstance(last_activity_time, datetime) else None,
+            time_gap_human,
+            time_of_day_label
+        )
+        logger.info("startbrief graphiti: search_facts not used")
+
         bridge_text = None
         if last_session_summary:
             candidates = []
+            allow_environment = _explicit_environment_in_text(last_user_text)
+            logger.info(
+                "startbrief env guard: allow_environment=%s last_user_text=%s",
+                allow_environment,
+                (last_user_text or "")[:120]
+            )
             for claim in _split_claims(last_session_summary):
                 if not _allow_claim(claim) or _is_explicit_user_state_claim(claim):
                     continue
                 if not _allow_fact_text(claim):
                     continue
-                if _looks_like_environment(claim):
+                if _looks_like_environment(claim) and not allow_environment:
                     continue
                 candidates.append(_shorten_line(claim, 140))
                 if len(candidates) >= 2:
                     break
             if candidates:
+                logger.info("startbrief bridge_parts=%s", candidates)
                 bridge_text = " ".join(candidates)
+                logger.info("startbrief bridge_text=%s", bridge_text)
 
+        logger.info("startbrief loops: get_top_loops_for_startbrief")
         top_loops = await loops.get_top_loops_for_startbrief(
             tenant_id=tenantId,
             user_id=userId,
@@ -1090,6 +1173,7 @@ async def session_startbrief(
                 break
 
         if len(items) < 5:
+            logger.info("startbrief graphiti: search_nodes (tensions)")
             tensions = await graphiti_client.search_nodes(
                 tenant_id=tenantId,
                 user_id=userId,
@@ -1646,6 +1730,51 @@ async def debug_graphiti_query(
     except Exception as e:
         logger.error(f"Debug graphiti query failed: {e}")
         raise HTTPException(status_code=500, detail="Debug graphiti query failed")
+
+
+@app.get("/internal/debug/graphiti/session_summaries")
+async def debug_graphiti_session_summaries(
+    tenantId: str,
+    userId: str,
+    limit: int = 5,
+    x_internal_token: str | None = Header(default=None)
+):
+    _require_internal_token(x_internal_token)
+    try:
+        if not graphiti_client._initialized:
+            await graphiti_client.initialize()
+        if not graphiti_client.client:
+            return {"count": 0, "summaries": [], "reason": "graphiti_unavailable"}
+
+        driver = getattr(graphiti_client.client, "driver", None)
+        if not driver:
+            return {"count": 0, "summaries": [], "reason": "driver_unavailable"}
+
+        composite_user_id = graphiti_client._make_composite_user_id(tenantId, userId)
+        rows = await driver.execute_query(
+            """
+            MATCH (n:SessionSummary {group_id: $group_id})
+            RETURN n
+            ORDER BY n.created_at DESC
+            LIMIT $limit
+            """,
+            group_id=composite_user_id,
+            limit=limit
+        )
+        summaries = []
+        for row in rows or []:
+            node = row.get("n") or {}
+            summaries.append({
+                "name": node.get("name"),
+                "summary": node.get("summary"),
+                "attributes": node.get("attributes") or {},
+                "created_at": node.get("created_at"),
+                "uuid": node.get("uuid")
+            })
+        return {"count": len(summaries), "summaries": summaries}
+    except Exception as e:
+        logger.error(f"Debug graphiti session_summaries failed: {e}")
+        raise HTTPException(status_code=500, detail="Debug graphiti session_summaries failed")
 
 
 if __name__ == "__main__":
