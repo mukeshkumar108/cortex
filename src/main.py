@@ -1810,8 +1810,12 @@ async def debug_graphiti_session_summaries(
                 if row.get("name") == "name" and row.get("summary") == "summary":
                     continue
                 props = row
-                if isinstance(row.get("name"), dict) and row["name"].get("name"):
-                    props = row["name"]
+                # Falkor may return column-name keys mapped to full node dicts
+                if any(isinstance(v, dict) for v in row.values()):
+                    for v in row.values():
+                        if isinstance(v, dict) and v.get("name") and v.get("summary"):
+                            props = v
+                            break
                 if props.get("name") is None and props.get("summary") is None and props.get("uuid") is None:
                     continue
                 summaries.append({
