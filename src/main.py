@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import re
 from typing import Optional, Dict, Any, List, Tuple
@@ -25,6 +25,7 @@ from .models import (
     PurgeUserRequest,
 )
 from .utils import extract_location
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import io
 import csv
 from .config import get_settings
@@ -307,6 +308,15 @@ def _looks_like_environment(value: Optional[str]) -> bool:
         return True
     lower = _normalize_text(value).lower()
     return any(term in lower for term in ("raining", "weather", "noisy", "quiet", "outside", "indoors"))
+
+
+def _resolve_timezone(tz: Optional[str]) -> Optional[ZoneInfo]:
+    if not tz:
+        return None
+    try:
+        return ZoneInfo(tz)
+    except ZoneInfoNotFoundError:
+        return None
 
 
 def _extract_commitments(texts: List[str], limit: int = 3) -> List[str]:
@@ -977,7 +987,10 @@ async def session_brief(
 async def session_startbrief(
     tenantId: str,
     userId: str,
-    now: Optional[str] = None
+    now: Optional[str] = None,
+    sessionId: Optional[str] = None,
+    personaId: Optional[str] = None,
+    timezone: Optional[str] = None
 ):
     """
     Minimal start-brief: short bridgeText + durable items.
@@ -987,9 +1000,24 @@ async def session_startbrief(
         if now:
             reference_now = datetime.fromisoformat(now.replace("Z", "+00:00"))
 
-        time_of_day_label = _time_of_day_label(reference_now)
+        tzinfo = _resolve_timezone(timezone)
+        if reference_now.tzinfo is None:
+            reference_now = reference_now.replace(tzinfo=tzinfo or timezone.utc)
+        if tzinfo:
+            reference_now = reference_now.astimezone(tzinfo)
+
+        time_of_day_label = _time_of_day_label(reference_now.replace(tzinfo=None))
         time_gap_human = None
         last_session_summary = None
+        last_activity_time: Optional[datetime] = None
+
+        # Prefer session/message timestamps for time gap.
+        session_id = sessionId or await _get_latest_session_id(tenantId, userId)
+        if session_id:
+            try:
+                last_activity_time = await session.get_last_interaction_time(tenantId, session_id)
+            except Exception:
+                last_activity_time = None
 
         try:
             episodes = await graphiti_client.get_recent_episode_summaries(
@@ -999,22 +1027,30 @@ async def session_startbrief(
             )
             if episodes:
                 last_session_summary = episodes[0].get("summary")
-                last_time = episodes[0].get("reference_time")
-                if isinstance(last_time, str):
-                    try:
-                        last_time = datetime.fromisoformat(last_time.replace("Z", "+00:00"))
-                    except Exception:
-                        last_time = None
-                if isinstance(last_time, datetime):
-                    delta = reference_now - last_time
-                    hours = int(delta.total_seconds() // 3600)
-                    minutes = int((delta.total_seconds() % 3600) // 60)
-                    if hours > 0:
-                        time_gap_human = f"{hours} hours since last spoke"
-                    else:
-                        time_gap_human = f"{minutes} minutes since last spoke"
+                if not last_activity_time:
+                    last_time = episodes[0].get("reference_time")
+                    if isinstance(last_time, str):
+                        try:
+                            last_time = datetime.fromisoformat(last_time.replace("Z", "+00:00"))
+                        except Exception:
+                            last_time = None
+                    if isinstance(last_time, datetime):
+                        last_activity_time = last_time
         except Exception:
             last_session_summary = None
+
+        if last_activity_time:
+            if last_activity_time.tzinfo is None:
+                last_activity_time = last_activity_time.replace(tzinfo=tzinfo or timezone.utc)
+            if tzinfo:
+                last_activity_time = last_activity_time.astimezone(tzinfo)
+            delta = reference_now - last_activity_time
+            hours = int(delta.total_seconds() // 3600)
+            minutes = int((delta.total_seconds() % 3600) // 60)
+            if hours > 0:
+                time_gap_human = f"{hours} hours since last spoke"
+            else:
+                time_gap_human = f"{minutes} minutes since last spoke"
 
         bridge_text = None
         if last_session_summary:
@@ -1035,7 +1071,8 @@ async def session_startbrief(
         top_loops = await loops.get_top_loops_for_startbrief(
             tenant_id=tenantId,
             user_id=userId,
-            limit=5
+            limit=5,
+            persona_id=personaId
         )
 
         items: List[SessionStartBriefItem] = []
@@ -1046,7 +1083,8 @@ async def session_startbrief(
                 text=loop_item.text,
                 timeHorizon=loop_item.timeHorizon,
                 dueDate=loop_item.dueDate,
-                salience=loop_item.salience
+                salience=loop_item.salience,
+                lastSeenAt=loop_item.lastSeenAt
             ))
             if len(items) >= 5:
                 break

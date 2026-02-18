@@ -109,7 +109,7 @@ Example response:
   "timeGapHuman": "8 hours since last spoke",
   "bridgeText": "Last time you spoke, you were focused on the portfolio refresh.",
   "items": [
-    {"kind": "loop", "type": "thread", "text": "Finish portfolio site", "timeHorizon": "this_week", "salience": 4},
+    {"kind": "loop", "type": "thread", "text": "Finish portfolio site", "timeHorizon": "this_week", "salience": 4, "lastSeenAt": "2026-02-06T10:15:00Z"},
     {"kind": "tension", "text": "Flaky tests in release pipeline"}
   ]
 }
@@ -117,6 +117,8 @@ Example response:
 Notes:
 - `bridgeText` is fact‑only, <= 280 chars, and excludes environment/observation by default.
 - Items come primarily from Postgres loops (salience + recency), with optional unresolved tensions from Graphiti.
+- `timeGapHuman` is derived from session/message timestamps when available, otherwise Graphiti episode time.
+- `timeOfDayLabel` uses `timezone` when provided (fallback UTC).
 
 ### POST /ingest
 Stores the turn in the session transcript and buffer.

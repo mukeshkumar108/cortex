@@ -155,6 +155,7 @@ class SessionStartBriefItem(BaseModel):
     timeHorizon: Optional[str] = None
     dueDate: Optional[str] = None
     salience: Optional[int] = None
+    lastSeenAt: Optional[str] = None
 
 
 class SessionStartBriefResponse(BaseModel):

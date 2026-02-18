@@ -5,7 +5,7 @@ A FastAPI memory service with a sliding‑window session buffer and Graphiti‑n
 ## What it does (short)
 - **/ingest**: writes turns to Postgres (rolling summary + last 12 messages). Never blocks.
 - **/brief**: minimal session seed (time + working memory + rolling summary).
-- **/session/startbrief**: minimal start bridge (bridgeText + up to 5 durable items).
+- **/session/startbrief**: minimal start bridge (bridgeText + up to 5 durable items). Optional `sessionId`, `personaId`, `timezone`.
 - **/session/brief**: Graphiti‑native start brief (structured briefContext + facts/openLoops/commitments + currentFocus).
 - **/memory/query**: on‑demand Graphiti memory query (facts/openLoops/commitments + recallSheet).
 - **/session/close**: flushes raw transcript to Graphiti and extracts procedural loops (best‑effort).
@@ -52,7 +52,7 @@ curl -s "http://localhost:8000/session/brief?tenantId=tenant_a&userId=user_1&now
 
 **GET /session/startbrief**
 ```bash
-curl -s "http://localhost:8000/session/startbrief?tenantId=tenant_a&userId=user_1&now=2026-02-06T10:15:00Z"
+curl -s "http://localhost:8000/session/startbrief?tenantId=tenant_a&userId=user_1&now=2026-02-06T10:15:00Z&timezone=America/Los_Angeles"
 ```
 
 **POST /memory/query**

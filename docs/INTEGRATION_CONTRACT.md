@@ -25,7 +25,7 @@ This doc is a concise API contract for external clients (e.g., Sophie orchestrat
 
 **Request (query params)**
 ```
-tenantId, userId, now (optional ISO timestamp)
+tenantId, userId, now (optional ISO timestamp), sessionId (optional), personaId (optional), timezone (optional)
 ```
 
 **Response JSON (example)**
@@ -35,7 +35,7 @@ tenantId, userId, now (optional ISO timestamp)
   "timeGapHuman": "8 hours since last spoke",
   "bridgeText": "Last time you spoke, you were focused on the portfolio refresh.",
   "items": [
-    {"kind": "loop", "type": "thread", "text": "Finish portfolio site", "timeHorizon": "this_week", "salience": 4},
+    {"kind": "loop", "type": "thread", "text": "Finish portfolio site", "timeHorizon": "this_week", "salience": 4, "lastSeenAt": "2026-02-06T10:15:00Z"},
     {"kind": "tension", "text": "Flaky tests in release pipeline"}
   ]
 }
@@ -44,6 +44,8 @@ tenantId, userId, now (optional ISO timestamp)
 Notes:
 - `bridgeText` is fact‑only, <= 280 chars, and excludes environment/observation by default.
 - Items come primarily from Postgres loops (salience + recency), with optional unresolved tensions from Graphiti.
+- `timeGapHuman` is derived from session/message timestamps when available, otherwise Graphiti episode time.
+- `timeOfDayLabel` uses `timezone` when provided (fallback UTC).
 
 ---
 

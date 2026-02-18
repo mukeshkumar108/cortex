@@ -1,16 +1,19 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from httpx import AsyncClient, ASGITransport
 
 from src.main import app, graphiti_client
+from src import session as session_module
 from src import loops as loops_module
 from src.models import Loop
 
 
 @pytest.mark.asyncio
 async def test_session_startbrief_uses_loops_and_filters_summary(monkeypatch):
-    now = datetime.utcnow().isoformat() + "Z"
+    now_dt = datetime(2026, 2, 6, 10, 15, tzinfo=timezone.utc)
+    now = now_dt.isoformat().replace("+00:00", "Z")
+    session_id = "session-test"
 
     async def _stub_recent_summaries(*_args, **_kwargs):
         return [{
@@ -41,13 +44,22 @@ async def test_session_startbrief_uses_loops_and_filters_summary(monkeypatch):
                 tags=[],
                 createdAt=now,
                 updatedAt=None,
-                lastSeenAt=None,
+                lastSeenAt=now,
                 metadata={}
             )
         ]
 
+    async def _stub_last_interaction_time(_tenant_id, _session_id):
+        return now_dt - timedelta(hours=8)
+
     graphiti_client.get_recent_episode_summaries = _stub_recent_summaries
     graphiti_client.search_nodes = _stub_search_nodes
+    monkeypatch.setattr(
+        session_module,
+        "get_last_interaction_time",
+        _stub_last_interaction_time,
+        raising=True
+    )
     monkeypatch.setattr(
         loops_module,
         "get_top_loops_for_startbrief",
@@ -62,7 +74,13 @@ async def test_session_startbrief_uses_loops_and_filters_summary(monkeypatch):
         ) as client:
             resp = await client.get(
                 "/session/startbrief",
-                params={"tenantId": "t", "userId": "u", "now": now}
+                params={
+                    "tenantId": "t",
+                    "userId": "u",
+                    "now": now,
+                    "sessionId": session_id,
+                    "timezone": "America/Los_Angeles"
+                }
             )
             assert resp.status_code == 200
             data = resp.json()
@@ -72,3 +90,6 @@ async def test_session_startbrief_uses_loops_and_filters_summary(monkeypatch):
             assert "feel" not in data["bridgeText"].lower()
             assert len(data["items"]) >= 1
             assert data["items"][0]["kind"] == "loop"
+            assert data["items"][0]["lastSeenAt"] == now
+            assert data["timeGapHuman"]
+            assert data["timeOfDayLabel"] == "NIGHT"

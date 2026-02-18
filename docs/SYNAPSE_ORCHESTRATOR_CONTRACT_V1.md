@@ -89,7 +89,7 @@ Narrative start‑brief derived from Graphiti custom entities.
 
 **Query params**
 ```
-tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z
+tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z&sessionId=session-abc&personaId=persona_1&timezone=America/Los_Angeles
 ```
 
 **Response (example)**
@@ -141,7 +141,7 @@ tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z
   "timeGapHuman": "8 hours since last spoke",
   "bridgeText": "Last time you spoke, you were focused on the portfolio refresh.",
   "items": [
-    {"kind": "loop", "type": "thread", "text": "Finish portfolio site", "timeHorizon": "this_week", "salience": 4},
+    {"kind": "loop", "type": "thread", "text": "Finish portfolio site", "timeHorizon": "this_week", "salience": 4, "lastSeenAt": "2026-02-06T10:15:00Z"},
     {"kind": "tension", "text": "Flaky tests in release pipeline"}
   ]
 }
@@ -150,6 +150,8 @@ tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z
 Notes:
 - `bridgeText` is fact‑only, <= 280 chars, and excludes environment/observation by default.
 - Items come primarily from Postgres loops (salience + recency), with optional unresolved tensions from Graphiti.
+- `timeGapHuman` is derived from session/message timestamps when available, otherwise Graphiti episode time.
+- `timeOfDayLabel` uses `timezone` when provided (fallback UTC).
 
 ---
 

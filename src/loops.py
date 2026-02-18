@@ -204,25 +204,46 @@ class LoopManager:
         self,
         tenant_id: str,
         user_id: str,
-        limit: int = 5
+        limit: int = 5,
+        persona_id: Optional[str] = None
     ) -> List[Loop]:
         """Get top loops by salience/recency for start-brief."""
         try:
-            query = """
-                SELECT id, type, status, text, confidence, salience, time_horizon,
-                       source_turn_ts, due_date, entity_refs, tags,
-                       created_at, updated_at, last_seen_at, metadata
-                FROM loops
-                WHERE tenant_id = $1
-                    AND user_id = $2
-                    AND status = 'active'
-                ORDER BY
-                    salience DESC NULLS LAST,
-                    last_seen_at DESC NULLS LAST,
-                    updated_at DESC NULLS LAST
-                LIMIT $3
-            """
-            rows = await self.db.fetch(query, tenant_id, user_id, limit)
+            rows = []
+            if persona_id:
+                persona_query = """
+                    SELECT id, type, status, text, confidence, salience, time_horizon,
+                           source_turn_ts, due_date, entity_refs, tags,
+                           created_at, updated_at, last_seen_at, metadata
+                    FROM loops
+                    WHERE tenant_id = $1
+                        AND user_id = $2
+                        AND persona_id = $3
+                        AND status = 'active'
+                    ORDER BY
+                        salience DESC NULLS LAST,
+                        last_seen_at DESC NULLS LAST,
+                        updated_at DESC NULLS LAST
+                    LIMIT $4
+                """
+                rows = await self.db.fetch(persona_query, tenant_id, user_id, persona_id, limit)
+
+            if not rows:
+                query = """
+                    SELECT id, type, status, text, confidence, salience, time_horizon,
+                           source_turn_ts, due_date, entity_refs, tags,
+                           created_at, updated_at, last_seen_at, metadata
+                    FROM loops
+                    WHERE tenant_id = $1
+                        AND user_id = $2
+                        AND status = 'active'
+                    ORDER BY
+                        salience DESC NULLS LAST,
+                        last_seen_at DESC NULLS LAST,
+                        updated_at DESC NULLS LAST
+                    LIMIT $3
+                """
+                rows = await self.db.fetch(query, tenant_id, user_id, limit)
             loops = []
             for row in rows:
                 loops.append(Loop(
@@ -897,12 +918,13 @@ async def get_active_loops_any(
 async def get_top_loops_for_startbrief(
     tenant_id: str,
     user_id: str,
-    limit: int = 5
+    limit: int = 5,
+    persona_id: Optional[str] = None
 ) -> List[Loop]:
     """Get top loops by salience/recency for start-brief."""
     if _manager is None:
         raise RuntimeError("LoopManager not initialized")
-    return await _manager.get_top_loops_for_startbrief(tenant_id, user_id, limit)
+    return await _manager.get_top_loops_for_startbrief(tenant_id, user_id, limit, persona_id)
 
 
 async def get_active_loops_debug(
