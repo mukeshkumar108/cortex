@@ -827,10 +827,16 @@ Do not include filler or meta-commentary."""
 
     async def _summarize_session_close(self, summary_input: str) -> str:
         prompt = (
-            "Write a short session summary (2-4 sentences). "
-            "Preserve key facts, commitments, and narrative continuity. "
-            "Use 'User' and 'Assistant' labels only. Do NOT use names like Sophie or Mukesh.\n\n"
-            f"{summary_input}\n\nSummary:"
+            "You are a summarizer. Write a short, human-readable recap of the session in 2–4 sentences.\n\n"
+            "Rules:\n"
+            "- Do NOT include speaker labels (no “User:” or “Assistant:”).\n"
+            "- Do NOT quote or paraphrase the transcript line-by-line.\n"
+            "- Write in past tense.\n"
+            "- Capture only key facts, commitments, decisions, ongoing threads, and notable context.\n"
+            "- Be concise and neutral.\n"
+            "- If a detail is uncertain, omit it.\n"
+            "- Do NOT use names like “Sophie” or “Mukesh”; use “the user” or “the assistant” if needed.\n\n"
+            f"Session:\n{summary_input}\n\nSummary:"
         )
         response = await self.llm_client._call_llm(
             prompt=prompt,
@@ -845,7 +851,9 @@ Do not include filler or meta-commentary."""
     async def _summarize_session_bridge(self, summary_text: str) -> str:
         prompt = (
             "Rewrite the session summary into a 1-2 sentence bridge for the next session. "
-            "Be factual and concise. Use 'User' and 'Assistant' labels only. "
+            "Be factual, concise, and in past tense. "
+            "Do NOT include speaker labels or verbatim transcript. "
+            "Use 'User' and 'Assistant' labels only if absolutely necessary. "
             "Do NOT use names like Sophie or Mukesh. "
             "Prefer concrete plans, commitments, and state of ongoing work. "
             "Exclude environment unless it was explicitly stated.\n\n"
@@ -1533,5 +1541,6 @@ async def summarize_session_messages(
         except Exception:
             bridge_text = ""
     if not bridge_text:
+        # Fall back to summary_text (not transcript) if bridge rewrite fails
         bridge_text = summary_text
     return {"summary_text": summary_text, "bridge_text": bridge_text}
