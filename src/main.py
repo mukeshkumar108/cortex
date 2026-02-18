@@ -1879,7 +1879,7 @@ async def debug_graphiti_session_summaries_clean(
         rows = await driver.execute_query(
             """
             MATCH (n:SessionSummary {group_id: $group_id})
-            RETURN n
+            RETURN properties(n) AS props
             ORDER BY n.created_at DESC
             LIMIT $limit
             """,
@@ -1890,20 +1890,44 @@ async def debug_graphiti_session_summaries_clean(
         seen = set()
         summaries = []
         for row in rows or []:
-            for node in extract_node_dicts(row, required_keys=("uuid", "summary")):
-                uuid = node.get("uuid")
-                if not uuid or uuid in seen:
-                    continue
-                seen.add(uuid)
-                summaries.append({
-                    "name": node.get("name"),
-                    "summary": node.get("summary"),
-                    "attributes": node.get("attributes") or {},
-                    "created_at": node.get("created_at"),
-                    "uuid": node.get("uuid"),
-                    "group_id": node.get("group_id")
-                })
-        return {"count": len(summaries), "summaries": summaries}
+            props = None
+            if isinstance(row, dict):
+                props = row.get("props") if isinstance(row.get("props"), dict) else None
+            elif isinstance(row, (list, tuple)) and row:
+                props = row[0] if isinstance(row[0], dict) else None
+            if not props:
+                # Fallback to generic extraction if props isn't available
+                for node in extract_node_dicts(row, required_keys=("uuid", "summary")):
+                    uuid = node.get("uuid")
+                    if not uuid or uuid in seen:
+                        continue
+                    seen.add(uuid)
+                    summaries.append({
+                        "name": node.get("name"),
+                        "summary": node.get("summary"),
+                        "attributes": node.get("attributes") or {},
+                        "created_at": node.get("created_at"),
+                        "uuid": node.get("uuid"),
+                        "group_id": node.get("group_id")
+                    })
+                continue
+
+            uuid = props.get("uuid")
+            if not uuid or uuid in seen:
+                continue
+            seen.add(uuid)
+            summaries.append({
+                "name": props.get("name"),
+                "summary": props.get("summary"),
+                "attributes": props.get("attributes") or {},
+                "created_at": props.get("created_at"),
+                "uuid": props.get("uuid"),
+                "group_id": props.get("group_id")
+            })
+        response = {"count": len(summaries), "summaries": summaries}
+        if not summaries:
+            response["raw_rows"] = rows
+        return response
     except Exception as e:
         logger.error(f"Debug graphiti session_summaries_clean failed: {e}")
         raise HTTPException(status_code=500, detail="Debug graphiti session_summaries_clean failed")
