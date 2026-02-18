@@ -148,6 +148,22 @@ class SessionBriefResponse(BaseModel):
     currentVibe: Dict[str, Any] = {}
 
 
+class SessionStartBriefItem(BaseModel):
+    kind: str
+    text: str
+    type: Optional[str] = None
+    timeHorizon: Optional[str] = None
+    dueDate: Optional[str] = None
+    salience: Optional[int] = None
+
+
+class SessionStartBriefResponse(BaseModel):
+    timeOfDayLabel: Optional[str] = None
+    timeGapHuman: Optional[str] = None
+    bridgeText: Optional[str] = None
+    items: List[SessionStartBriefItem] = []
+
+
 class SessionCloseRequest(BaseModel):
     tenantId: str
     userId: str

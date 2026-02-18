@@ -200,6 +200,53 @@ class LoopManager:
             logger.error(f"Failed to get active loops (any persona): {e}")
             return []
 
+    async def get_top_loops_for_startbrief(
+        self,
+        tenant_id: str,
+        user_id: str,
+        limit: int = 5
+    ) -> List[Loop]:
+        """Get top loops by salience/recency for start-brief."""
+        try:
+            query = """
+                SELECT id, type, status, text, confidence, salience, time_horizon,
+                       source_turn_ts, due_date, entity_refs, tags,
+                       created_at, updated_at, last_seen_at, metadata
+                FROM loops
+                WHERE tenant_id = $1
+                    AND user_id = $2
+                    AND status = 'active'
+                ORDER BY
+                    salience DESC NULLS LAST,
+                    last_seen_at DESC NULLS LAST,
+                    updated_at DESC NULLS LAST
+                LIMIT $3
+            """
+            rows = await self.db.fetch(query, tenant_id, user_id, limit)
+            loops = []
+            for row in rows:
+                loops.append(Loop(
+                    id=row['id'],
+                    type=row['type'],
+                    status=row['status'],
+                    text=row['text'],
+                    confidence=row.get('confidence'),
+                    salience=row.get('salience'),
+                    timeHorizon=row.get('time_horizon'),
+                    sourceTurnTs=row['source_turn_ts'].isoformat() if row.get('source_turn_ts') else None,
+                    dueDate=row['due_date'].isoformat() if row.get('due_date') else None,
+                    entityRefs=row.get('entity_refs') or [],
+                    tags=row.get('tags') or [],
+                    createdAt=row['created_at'].isoformat() if row['created_at'] else None,
+                    updatedAt=row['updated_at'].isoformat() if row.get('updated_at') else None,
+                    lastSeenAt=row['last_seen_at'].isoformat() if row.get('last_seen_at') else None,
+                    metadata=row['metadata']
+                ))
+            return loops
+        except Exception as e:
+            logger.error(f"Failed to get top loops for startbrief: {e}")
+            return []
+
     async def get_active_loops_debug(
         self,
         tenant_id: str,
@@ -845,6 +892,17 @@ async def get_active_loops_any(
     if _manager is None:
         raise RuntimeError("LoopManager not initialized")
     return await _manager.get_active_loops_any(tenant_id, user_id, limit)
+
+
+async def get_top_loops_for_startbrief(
+    tenant_id: str,
+    user_id: str,
+    limit: int = 5
+) -> List[Loop]:
+    """Get top loops by salience/recency for start-brief."""
+    if _manager is None:
+        raise RuntimeError("LoopManager not initialized")
+    return await _manager.get_top_loops_for_startbrief(tenant_id, user_id, limit)
 
 
 async def get_active_loops_debug(

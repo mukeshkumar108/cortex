@@ -16,12 +16,15 @@ from .models import (
     MemoryQueryResponse,
     Fact,
     Entity,
+    SessionStartBriefResponse,
+    SessionStartBriefItem,
     SessionCloseRequest,
     SessionIngestRequest,
     SessionIngestResponse,
     SessionBriefResponse,
     PurgeUserRequest,
 )
+from .utils import extract_location
 import io
 import csv
 from .config import get_settings
@@ -295,6 +298,15 @@ def _extract_energy_hint_from_texts(texts: List[str]) -> Optional[str]:
             if term in lower:
                 return term.upper().replace(" ", "_")
     return None
+
+
+def _looks_like_environment(value: Optional[str]) -> bool:
+    if not value:
+        return False
+    if extract_location(value):
+        return True
+    lower = _normalize_text(value).lower()
+    return any(term in lower for term in ("raining", "weather", "noisy", "quiet", "outside", "indoors"))
 
 
 def _extract_commitments(texts: List[str], limit: int = 3) -> List[str]:
@@ -959,6 +971,137 @@ async def session_brief(
     except Exception as e:
         logger.error(f"Session brief failed: {e}")
         raise HTTPException(status_code=500, detail="Session brief failed")
+
+
+@app.get("/session/startbrief", response_model=SessionStartBriefResponse)
+async def session_startbrief(
+    tenantId: str,
+    userId: str,
+    now: Optional[str] = None
+):
+    """
+    Minimal start-brief: short bridgeText + durable items.
+    """
+    try:
+        reference_now = datetime.utcnow()
+        if now:
+            reference_now = datetime.fromisoformat(now.replace("Z", "+00:00"))
+
+        time_of_day_label = _time_of_day_label(reference_now)
+        time_gap_human = None
+        last_session_summary = None
+
+        try:
+            episodes = await graphiti_client.get_recent_episode_summaries(
+                tenant_id=tenantId,
+                user_id=userId,
+                limit=1
+            )
+            if episodes:
+                last_session_summary = episodes[0].get("summary")
+                last_time = episodes[0].get("reference_time")
+                if isinstance(last_time, str):
+                    try:
+                        last_time = datetime.fromisoformat(last_time.replace("Z", "+00:00"))
+                    except Exception:
+                        last_time = None
+                if isinstance(last_time, datetime):
+                    delta = reference_now - last_time
+                    hours = int(delta.total_seconds() // 3600)
+                    minutes = int((delta.total_seconds() % 3600) // 60)
+                    if hours > 0:
+                        time_gap_human = f"{hours} hours since last spoke"
+                    else:
+                        time_gap_human = f"{minutes} minutes since last spoke"
+        except Exception:
+            last_session_summary = None
+
+        bridge_text = None
+        if last_session_summary:
+            candidates = []
+            for claim in _split_claims(last_session_summary):
+                if not _allow_claim(claim) or _is_explicit_user_state_claim(claim):
+                    continue
+                if not _allow_fact_text(claim):
+                    continue
+                if _looks_like_environment(claim):
+                    continue
+                candidates.append(_shorten_line(claim, 140))
+                if len(candidates) >= 2:
+                    break
+            if candidates:
+                bridge_text = " ".join(candidates)
+
+        top_loops = await loops.get_top_loops_for_startbrief(
+            tenant_id=tenantId,
+            user_id=userId,
+            limit=5
+        )
+
+        items: List[SessionStartBriefItem] = []
+        for loop_item in top_loops:
+            items.append(SessionStartBriefItem(
+                kind="loop",
+                type=loop_item.type,
+                text=loop_item.text,
+                timeHorizon=loop_item.timeHorizon,
+                dueDate=loop_item.dueDate,
+                salience=loop_item.salience
+            ))
+            if len(items) >= 5:
+                break
+
+        if len(items) < 5:
+            tensions = await graphiti_client.search_nodes(
+                tenant_id=tenantId,
+                user_id=userId,
+                query="current problems tasks unresolved blockers open loops",
+                limit=5,
+                reference_time=reference_now
+            )
+            for t in tensions or []:
+                attrs = t.get("attributes") if isinstance(t, dict) else None
+                t_type = (t.get("type") or "").lower() if isinstance(t, dict) else ""
+                is_tension = t_type == "tension"
+                if isinstance(attrs, dict) and ("description" in attrs or "status" in attrs):
+                    is_tension = True
+                if not is_tension:
+                    continue
+                status = (attrs.get("status") if isinstance(attrs, dict) else None) or "unresolved"
+                if isinstance(status, str) and status.lower() != "unresolved":
+                    continue
+                description = (attrs.get("description") if isinstance(attrs, dict) else None) or t.get("summary")
+                description = _normalize_text(description)
+                if not description:
+                    continue
+                if not _allow_claim(description) or _is_explicit_user_state_claim(description):
+                    continue
+                if _looks_like_environment(description):
+                    continue
+                if any(i.text.lower() == description.lower() for i in items):
+                    continue
+                items.append(SessionStartBriefItem(
+                    kind="tension",
+                    text=_shorten_line(description, 120)
+                ))
+                if len(items) >= 5:
+                    break
+
+        if not bridge_text and items:
+            bridge_text = f"Last time you spoke, you mentioned: {items[0].text}."
+
+        if bridge_text and len(bridge_text) > 280:
+            bridge_text = bridge_text[:277].rstrip() + "..."
+
+        return SessionStartBriefResponse(
+            timeOfDayLabel=time_of_day_label,
+            timeGapHuman=time_gap_human,
+            bridgeText=bridge_text,
+            items=items
+        )
+    except Exception as e:
+        logger.error(f"Session startbrief failed: {e}")
+        raise HTTPException(status_code=500, detail="Session startbrief failed")
 
 
 @app.post("/admin/purgeUser")
