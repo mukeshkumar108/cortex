@@ -1830,6 +1830,23 @@ async def debug_graphiti_session_summaries(
                 # Skip header-like rows
                 if len(row) >= 2 and row[0] == "name" and row[1] == "summary":
                     continue
+                # If row elements are dicts (Falkor projection quirk), pick the first full node dict
+                picked = None
+                for item in row:
+                    if isinstance(item, dict) and item.get("name") and item.get("summary"):
+                        picked = item
+                        break
+                if picked:
+                    summaries.append({
+                        "name": picked.get("name"),
+                        "summary": picked.get("summary"),
+                        "attributes": picked.get("attributes") or {},
+                        "created_at": picked.get("created_at"),
+                        "uuid": picked.get("uuid"),
+                        "group_id": picked.get("group_id")
+                    })
+                    continue
+
                 name = row[0] if len(row) > 0 else None
                 summary = row[1] if len(row) > 1 else None
                 attributes = row[2] if len(row) > 2 else {}
