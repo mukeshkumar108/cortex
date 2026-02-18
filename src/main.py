@@ -1045,19 +1045,50 @@ async def session_startbrief(
         # Prefer session/message timestamps for time gap.
         session_id = sessionId or await _get_latest_session_id(tenantId, userId)
         last_user_text = None
-        if session_id:
+        # Prefer transcript last message timestamp (session/ingest path)
+        try:
+            row = await db.fetchone(
+                """
+                SELECT messages
+                FROM session_transcript
+                WHERE tenant_id = $1 AND user_id = $2
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                tenantId,
+                userId
+            )
+            messages = row.get("messages") if row else None
+            if isinstance(messages, list) and messages:
+                last_msg = messages[-1]
+                ts = last_msg.get("timestamp")
+                if isinstance(ts, str):
+                    try:
+                        last_activity_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    except Exception:
+                        last_activity_time = None
+                last_user_text = next(
+                    (m.get("text") for m in reversed(messages) if m.get("role") == "user" and m.get("text")),
+                    None
+                )
+        except Exception:
+            last_activity_time = None
+
+        # Fallback to session buffer if available
+        if session_id and not last_activity_time:
             try:
                 last_activity_time = await session.get_last_interaction_time(tenantId, session_id)
             except Exception:
                 last_activity_time = None
-            try:
-                working_memory = await session.get_working_memory(tenantId, session_id)
-                for msg in reversed(working_memory):
-                    if msg.role == "user" and msg.text:
-                        last_user_text = msg.text
-                        break
-            except Exception:
-                last_user_text = None
+            if last_user_text is None:
+                try:
+                    working_memory = await session.get_working_memory(tenantId, session_id)
+                    for msg in reversed(working_memory):
+                        if msg.role == "user" and msg.text:
+                            last_user_text = msg.text
+                            break
+                except Exception:
+                    last_user_text = None
 
         try:
             logger.info("startbrief graphiti: get_latest_session_summary_node")

@@ -53,6 +53,14 @@ async def test_session_startbrief_uses_loops_and_filters_summary(monkeypatch):
     async def _stub_last_interaction_time(_tenant_id, _session_id):
         return now_dt - timedelta(hours=8)
 
+    async def _stub_db_fetchone(*_args, **_kwargs):
+        return {
+            "messages": [
+                {"role": "user", "text": "Last message", "timestamp": (now_dt - timedelta(hours=8)).isoformat()},
+                {"role": "assistant", "text": "Ok", "timestamp": (now_dt - timedelta(hours=8)).isoformat()},
+            ]
+        }
+
     graphiti_client.get_latest_session_summary_node = _stub_latest_summary_node
     graphiti_client.search_nodes = _stub_search_nodes
     monkeypatch.setattr(
@@ -60,6 +68,11 @@ async def test_session_startbrief_uses_loops_and_filters_summary(monkeypatch):
         "get_last_interaction_time",
         _stub_last_interaction_time,
         raising=True
+    )
+    monkeypatch.setattr(
+        "src.main.db.fetchone",
+        _stub_db_fetchone,
+        raising=False
     )
     monkeypatch.setattr(
         loops_module,
