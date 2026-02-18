@@ -1856,6 +1856,59 @@ async def debug_graphiti_session_summaries(
         raise HTTPException(status_code=500, detail="Debug graphiti session_summaries failed")
 
 
+@app.get("/internal/debug/graphiti/session_summaries_clean")
+async def debug_graphiti_session_summaries_clean(
+    tenantId: str,
+    userId: str,
+    limit: int = 5,
+    x_internal_token: str | None = Header(default=None)
+):
+    """Clean session summaries list (flat fields, de-duplicated)."""
+    _require_internal_token(x_internal_token)
+    try:
+        if not graphiti_client._initialized:
+            await graphiti_client.initialize()
+        if not graphiti_client.client:
+            return {"count": 0, "summaries": [], "reason": "graphiti_unavailable"}
+
+        driver = getattr(graphiti_client.client, "driver", None)
+        if not driver:
+            return {"count": 0, "summaries": [], "reason": "driver_unavailable"}
+
+        composite_user_id = graphiti_client._make_composite_user_id(tenantId, userId)
+        rows = await driver.execute_query(
+            """
+            MATCH (n:SessionSummary {group_id: $group_id})
+            RETURN n
+            ORDER BY n.created_at DESC
+            LIMIT $limit
+            """,
+            group_id=composite_user_id,
+            limit=limit
+        )
+
+        seen = set()
+        summaries = []
+        for row in rows or []:
+            for node in extract_node_dicts(row, required_keys=("uuid", "summary")):
+                uuid = node.get("uuid")
+                if not uuid or uuid in seen:
+                    continue
+                seen.add(uuid)
+                summaries.append({
+                    "name": node.get("name"),
+                    "summary": node.get("summary"),
+                    "attributes": node.get("attributes") or {},
+                    "created_at": node.get("created_at"),
+                    "uuid": node.get("uuid"),
+                    "group_id": node.get("group_id")
+                })
+        return {"count": len(summaries), "summaries": summaries}
+    except Exception as e:
+        logger.error(f"Debug graphiti session_summaries_clean failed: {e}")
+        raise HTTPException(status_code=500, detail="Debug graphiti session_summaries_clean failed")
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
