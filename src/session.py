@@ -828,7 +828,8 @@ Do not include filler or meta-commentary."""
     async def _summarize_session_close(self, summary_input: str) -> str:
         prompt = (
             "Write a short session summary (2-4 sentences). "
-            "Preserve key facts, commitments, and narrative continuity.\n\n"
+            "Preserve key facts, commitments, and narrative continuity. "
+            "Use 'User' and 'Assistant' labels only. Do NOT use names like Sophie or Mukesh.\n\n"
             f"{summary_input}\n\nSummary:"
         )
         response = await self.llm_client._call_llm(
