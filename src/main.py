@@ -1737,6 +1737,7 @@ async def debug_graphiti_session_summaries(
     tenantId: str,
     userId: str,
     limit: int = 5,
+    all: bool = False,
     x_internal_token: str | None = Header(default=None)
 ):
     _require_internal_token(x_internal_token)
@@ -1751,13 +1752,15 @@ async def debug_graphiti_session_summaries(
             return {"count": 0, "summaries": [], "reason": "driver_unavailable"}
 
         composite_user_id = graphiti_client._make_composite_user_id(tenantId, userId)
-        count_rows = await driver.execute_query(
-            """
+        count_query = """
             MATCH (n:SessionSummary {group_id: $group_id})
             RETURN count(n) AS count
-            """,
-            group_id=composite_user_id
-        )
+        """
+        count_params = {"group_id": composite_user_id}
+        if all:
+            count_query = "MATCH (n:SessionSummary) RETURN count(n) AS count"
+            count_params = {}
+        count_rows = await driver.execute_query(count_query, **count_params)
         graph_count = None
         if count_rows:
             row0 = count_rows[0]
@@ -1766,32 +1769,51 @@ async def debug_graphiti_session_summaries(
             elif isinstance(row0, (list, tuple)) and row0:
                 graph_count = row0[0]
 
-        rows = await driver.execute_query(
-            """
-            MATCH (n:SessionSummary {group_id: $group_id})
-            RETURN n.name AS name,
-                   n.summary AS summary,
-                   n.attributes AS attributes,
-                   n.created_at AS created_at,
-                   n.uuid AS uuid
-            ORDER BY n.created_at DESC
-            LIMIT $limit
-            """,
-            group_id=composite_user_id,
-            limit=limit
-        )
+        if all:
+            rows = await driver.execute_query(
+                """
+                MATCH (n:SessionSummary)
+                RETURN n.name AS name,
+                       n.summary AS summary,
+                       n.attributes AS attributes,
+                       n.created_at AS created_at,
+                       n.uuid AS uuid,
+                       n.group_id AS group_id
+                ORDER BY n.created_at DESC
+                LIMIT $limit
+                """,
+                limit=limit
+            )
+        else:
+            rows = await driver.execute_query(
+                """
+                MATCH (n:SessionSummary {group_id: $group_id})
+                RETURN n.name AS name,
+                       n.summary AS summary,
+                       n.attributes AS attributes,
+                       n.created_at AS created_at,
+                       n.uuid AS uuid
+                ORDER BY n.created_at DESC
+                LIMIT $limit
+                """,
+                group_id=composite_user_id,
+                limit=limit
+            )
         summaries = []
         for row in rows or []:
             if isinstance(row, dict):
                 # Skip header-like rows
                 if row.get("name") == "name" and row.get("summary") == "summary":
                     continue
+                if row.get("name") is None and row.get("summary") is None and row.get("uuid") is None:
+                    continue
                 summaries.append({
                     "name": row.get("name"),
                     "summary": row.get("summary"),
                     "attributes": row.get("attributes") or {},
                     "created_at": row.get("created_at"),
-                    "uuid": row.get("uuid")
+                    "uuid": row.get("uuid"),
+                    "group_id": row.get("group_id")
                 })
             elif isinstance(row, (list, tuple)):
                 # Skip header-like rows
@@ -1802,12 +1824,16 @@ async def debug_graphiti_session_summaries(
                 attributes = row[2] if len(row) > 2 else {}
                 created_at = row[3] if len(row) > 3 else None
                 uuid = row[4] if len(row) > 4 else None
+                group_id = row[5] if len(row) > 5 else None
+                if name is None and summary is None and uuid is None:
+                    continue
                 summaries.append({
                     "name": name,
                     "summary": summary,
                     "attributes": attributes or {},
                     "created_at": created_at,
-                    "uuid": uuid
+                    "uuid": uuid,
+                    "group_id": group_id
                 })
         response = {"count": len(summaries), "summaries": summaries, "graph_count": graph_count}
         if not summaries:
