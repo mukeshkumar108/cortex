@@ -40,21 +40,23 @@ async def run(args: argparse.Namespace) -> int:
     if not driver:
         raise RuntimeError("Graphiti driver unavailable")
 
-    where_clause = "n:SessionSummary"
     params: Dict[str, Any] = {}
     if args.tenant_id and args.user_id:
         group_id = graph._make_composite_user_id(args.tenant_id, args.user_id)
-        where_clause = "n:SessionSummary AND n.group_id = $group_id"
-        params["group_id"] = group_id
-
-    rows = await driver.execute_query(
-        f"""
-        MATCH (n)
-        WHERE {where_clause}
-        RETURN n.uuid AS uuid, n.summary AS summary
-        """,
-        **params
-    )
+        rows = await driver.execute_query(
+            """
+            MATCH (n:SessionSummary {group_id: $group_id})
+            RETURN n.uuid AS uuid, n.summary AS summary
+            """,
+            group_id=group_id
+        )
+    else:
+        rows = await driver.execute_query(
+            """
+            MATCH (n:SessionSummary)
+            RETURN n.uuid AS uuid, n.summary AS summary
+            """
+        )
 
     total = 0
     changed = 0
@@ -62,14 +64,22 @@ async def run(args: argparse.Namespace) -> int:
         uuid = None
         summary = None
         if isinstance(row, dict):
-            uuid = row.get("uuid")
-            summary = row.get("summary")
+            # Handle nested dict row shapes
+            if any(isinstance(v, dict) for v in row.values()):
+                for v in row.values():
+                    if isinstance(v, dict) and v.get("uuid") and v.get("summary"):
+                        uuid = v.get("uuid")
+                        summary = v.get("summary")
+                        break
+            else:
+                uuid = row.get("uuid")
+                summary = row.get("summary")
         elif isinstance(row, (list, tuple)):
             if len(row) > 0:
                 uuid = row[0]
             if len(row) > 1:
                 summary = row[1]
-        if not uuid or not summary or not isinstance(summary, str):
+        if uuid in ("uuid", None) or summary in ("summary", None) or not isinstance(summary, str):
             continue
         total += 1
         new_summary = _normalize_summary(summary)
