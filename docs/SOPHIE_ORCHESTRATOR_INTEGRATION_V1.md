@@ -30,6 +30,7 @@ Call `/session/brief` to get a short narrative start‑brief derived from Graphi
 custom entities (MentalState, Tension, Environment).
 Facts are filtered for quality (no single‑token/vague fragments). `narrativeSummary`
 is derived from Graphiti episode summaries and de‑duplicated from facts.
+Use `/session/startbrief` if you want a smaller bridgeText + durable items.
 
 ### 3) Ingest turns
 Send both user and assistant turns to `/ingest`.
@@ -98,6 +99,24 @@ Example response:
   "currentVibe": {"timeOfDayLabel": "AFTERNOON"}
 }
 ```
+
+### GET /session/startbrief
+Returns a minimal start‑brief (small bridge + durable items).
+Example response:
+```json
+{
+  "timeOfDayLabel": "AFTERNOON",
+  "timeGapHuman": "8 hours since last spoke",
+  "bridgeText": "Last time you spoke, you were focused on the portfolio refresh.",
+  "items": [
+    {"kind": "loop", "type": "thread", "text": "Finish portfolio site", "timeHorizon": "this_week", "salience": 4},
+    {"kind": "tension", "text": "Flaky tests in release pipeline"}
+  ]
+}
+```
+Notes:
+- `bridgeText` is fact‑only, <= 280 chars, and excludes environment/observation by default.
+- Items come primarily from Postgres loops (salience + recency), with optional unresolved tensions from Graphiti.
 
 ### POST /ingest
 Stores the turn in the session transcript and buffer.

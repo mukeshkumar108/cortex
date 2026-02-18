@@ -137,6 +137,7 @@ Last updated: 2026-02-18
 - Reliable outbox delivery
 - Session summary episodes
 - Tenant isolation
+- Minimal session start brief (bridgeText + durable items) via /session/startbrief
 
 **Cannot do yet / known gaps**
 - Guaranteed semantic recall if Graphiti is down

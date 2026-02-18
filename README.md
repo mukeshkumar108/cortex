@@ -5,6 +5,7 @@ A FastAPI memory service with a sliding‑window session buffer and Graphiti‑n
 ## What it does (short)
 - **/ingest**: writes turns to Postgres (rolling summary + last 12 messages). Never blocks.
 - **/brief**: minimal session seed (time + working memory + rolling summary).
+- **/session/startbrief**: minimal start bridge (bridgeText + up to 5 durable items).
 - **/session/brief**: Graphiti‑native start brief (structured briefContext + facts/openLoops/commitments + currentFocus).
 - **/memory/query**: on‑demand Graphiti memory query (facts/openLoops/commitments + recallSheet).
 - **/session/close**: flushes raw transcript to Graphiti and extracts procedural loops (best‑effort).
@@ -47,6 +48,11 @@ curl -s http://localhost:8000/brief -H 'Content-Type: application/json' -d '{
 **GET /session/brief**
 ```bash
 curl -s "http://localhost:8000/session/brief?tenantId=tenant_a&userId=user_1&now=2026-02-06T10:15:00Z"
+```
+
+**GET /session/startbrief**
+```bash
+curl -s "http://localhost:8000/session/startbrief?tenantId=tenant_a&userId=user_1&now=2026-02-06T10:15:00Z"
 ```
 
 **POST /memory/query**
@@ -101,6 +107,7 @@ OUTBOX_DRAIN_ENABLED=true
 - **Identity defaults are null** until user states name/home/timezone. Don’t assume name exists.
 - **Graphiti recall is not automatic**: call `/memory/query` to retrieve facts/entities.
 - **/session/brief is Graphiti‑native**: facts are filtered for quality (no single-token/vague fragments), and narrativeSummary is derived from Graphiti episode summaries (de‑duplicated from facts).
+- **/session/startbrief is minimal**: short bridgeText (<=280 chars) + up to 5 durable items (loops first, then unresolved tensions).
 - **Outbox won’t drain** unless `/internal/drain` is called or `OUTBOX_DRAIN_ENABLED=true`.
 - **Session close** happens via idle close loop (config) or next ingest. Enable idle close for clean session summaries.
 - **Loop extraction** runs on session close (best‑effort) and does not affect /ingest latency.

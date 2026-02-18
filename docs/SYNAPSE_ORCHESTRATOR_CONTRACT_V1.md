@@ -126,6 +126,33 @@ Notes:
 
 ---
 
+### GET /session/startbrief
+Minimal start-brief with a short human bridge and durable items.
+
+**Query params**
+```
+tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z
+```
+
+**Response (example)**
+```json
+{
+  "timeOfDayLabel": "AFTERNOON",
+  "timeGapHuman": "8 hours since last spoke",
+  "bridgeText": "Last time you spoke, you were focused on the portfolio refresh.",
+  "items": [
+    {"kind": "loop", "type": "thread", "text": "Finish portfolio site", "timeHorizon": "this_week", "salience": 4},
+    {"kind": "tension", "text": "Flaky tests in release pipeline"}
+  ]
+}
+```
+
+Notes:
+- `bridgeText` is fact‑only, <= 280 chars, and excludes environment/observation by default.
+- Items come primarily from Postgres loops (salience + recency), with optional unresolved tensions from Graphiti.
+
+---
+
 ### POST /ingest
 Write both user and assistant turns. This stores the session transcript only.
 

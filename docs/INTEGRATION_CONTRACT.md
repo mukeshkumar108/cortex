@@ -19,6 +19,34 @@ This doc is a concise API contract for external clients (e.g., Sophie orchestrat
 
 ---
 
+### GET /session/startbrief
+**Auth:** none (public endpoint)
+**Headers:** none
+
+**Request (query params)**
+```
+tenantId, userId, now (optional ISO timestamp)
+```
+
+**Response JSON (example)**
+```json
+{
+  "timeOfDayLabel": "AFTERNOON",
+  "timeGapHuman": "8 hours since last spoke",
+  "bridgeText": "Last time you spoke, you were focused on the portfolio refresh.",
+  "items": [
+    {"kind": "loop", "type": "thread", "text": "Finish portfolio site", "timeHorizon": "this_week", "salience": 4},
+    {"kind": "tension", "text": "Flaky tests in release pipeline"}
+  ]
+}
+```
+
+Notes:
+- `bridgeText` is fact‑only, <= 280 chars, and excludes environment/observation by default.
+- Items come primarily from Postgres loops (salience + recency), with optional unresolved tensions from Graphiti.
+
+---
+
 ### POST /brief
 **Auth:** none (public endpoint)
 **Headers:**
