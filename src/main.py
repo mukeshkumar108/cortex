@@ -1754,46 +1754,40 @@ async def debug_graphiti_session_summaries(
         rows = await driver.execute_query(
             """
             MATCH (n:SessionSummary {group_id: $group_id})
-            RETURN n
+            RETURN n.name AS name,
+                   n.summary AS summary,
+                   n.attributes AS attributes,
+                   n.created_at AS created_at,
+                   n.uuid AS uuid
             ORDER BY n.created_at DESC
             LIMIT $limit
             """,
             group_id=composite_user_id,
             limit=limit
         )
-
-        def _extract_props(value: Any) -> Optional[Dict[str, Any]]:
-            if isinstance(value, dict):
-                return value.get("properties") if isinstance(value.get("properties"), dict) else value
-            if hasattr(value, "properties"):
-                props = getattr(value, "properties")
-                if isinstance(props, dict):
-                    return props
-            return None
-
         summaries = []
         for row in rows or []:
-            node = None
             if isinstance(row, dict):
-                node = row.get("n") or row
-            elif isinstance(row, (list, tuple)) and row:
-                node = row[0]
-            props = _extract_props(node)
-            if props is None and isinstance(node, (list, tuple)):
-                for item in node:
-                    props = _extract_props(item)
-                    if props is not None:
-                        break
-            if props is None:
-                props = {}
-            summaries.append({
-                "name": props.get("name"),
-                "summary": props.get("summary"),
-                "attributes": props.get("attributes") or {},
-                "created_at": props.get("created_at"),
-                "uuid": props.get("uuid"),
-                "raw": None if props else row
-            })
+                summaries.append({
+                    "name": row.get("name"),
+                    "summary": row.get("summary"),
+                    "attributes": row.get("attributes") or {},
+                    "created_at": row.get("created_at"),
+                    "uuid": row.get("uuid")
+                })
+            elif isinstance(row, (list, tuple)):
+                name = row[0] if len(row) > 0 else None
+                summary = row[1] if len(row) > 1 else None
+                attributes = row[2] if len(row) > 2 else {}
+                created_at = row[3] if len(row) > 3 else None
+                uuid = row[4] if len(row) > 4 else None
+                summaries.append({
+                    "name": name,
+                    "summary": summary,
+                    "attributes": attributes or {},
+                    "created_at": created_at,
+                    "uuid": uuid
+                })
         return {"count": len(summaries), "summaries": summaries}
     except Exception as e:
         logger.error(f"Debug graphiti session_summaries failed: {e}")
