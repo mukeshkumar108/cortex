@@ -75,10 +75,17 @@ async def run(args: argparse.Namespace) -> int:
                 uuid = row.get("uuid")
                 summary = row.get("summary")
         elif isinstance(row, (list, tuple)):
-            if len(row) > 0:
-                uuid = row[0]
-            if len(row) > 1:
-                summary = row[1]
+            # Sometimes rows are list-of-dicts
+            for item in row:
+                if isinstance(item, dict) and item.get("uuid") and item.get("summary"):
+                    uuid = item.get("uuid")
+                    summary = item.get("summary")
+                    break
+            if uuid is None:
+                if len(row) > 0:
+                    uuid = row[0]
+                if len(row) > 1:
+                    summary = row[1]
         if uuid in ("uuid", None) or summary in ("summary", None) or not isinstance(summary, str):
             continue
         total += 1
