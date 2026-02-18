@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+import argparse
+import asyncio
+import re
+from typing import Any, Dict, List, Optional
+
+from src.graphiti_client import GraphitiClient
+
+
+def _normalize_summary(text: str) -> str:
+    if not text:
+        return text
+    # Replace Sophie (case-insensitive) with User, preserving possessive
+    text = re.sub(r"\bSophie\b", "User", text)
+    text = re.sub(r"\bSOPHIE\b", "User", text)
+    text = re.sub(r"\bSophie['’]s\b", "User's", text)
+    text = re.sub(r"\bsophie\b", "User", text)
+    text = re.sub(r"\bsophie['’]s\b", "User's", text)
+    return text
+
+
+async def _update_node(driver: Any, uuid: str, summary: str) -> None:
+    await driver.execute_query(
+        """
+        MATCH (n {uuid: $uuid})
+        SET n.summary = $summary
+        RETURN n
+        """,
+        uuid=uuid,
+        summary=summary
+    )
+
+
+async def run(args: argparse.Namespace) -> int:
+    graph = GraphitiClient()
+    await graph.initialize()
+    if not graph.client:
+        raise RuntimeError("Graphiti client unavailable")
+    driver = getattr(graph.client, "driver", None)
+    if not driver:
+        raise RuntimeError("Graphiti driver unavailable")
+
+    where_clause = "n:SessionSummary"
+    params: Dict[str, Any] = {}
+    if args.tenant_id and args.user_id:
+        group_id = graph._make_composite_user_id(args.tenant_id, args.user_id)
+        where_clause = "n:SessionSummary AND n.group_id = $group_id"
+        params["group_id"] = group_id
+
+    rows = await driver.execute_query(
+        f"""
+        MATCH (n)
+        WHERE {where_clause}
+        RETURN n.uuid AS uuid, n.summary AS summary
+        """,
+        **params
+    )
+
+    total = 0
+    changed = 0
+    for row in rows or []:
+        uuid = None
+        summary = None
+        if isinstance(row, dict):
+            uuid = row.get("uuid")
+            summary = row.get("summary")
+        elif isinstance(row, (list, tuple)):
+            if len(row) > 0:
+                uuid = row[0]
+            if len(row) > 1:
+                summary = row[1]
+        if not uuid or not summary or not isinstance(summary, str):
+            continue
+        total += 1
+        new_summary = _normalize_summary(summary)
+        if new_summary != summary:
+            changed += 1
+            if not args.dry_run:
+                await _update_node(driver, uuid, new_summary)
+
+    print(f"cleanup: total={total} changed={changed} dry_run={args.dry_run}")
+    return 0
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Cleanup SessionSummary text (replace Sophie -> User).")
+    parser.add_argument("--tenant-id", required=True)
+    parser.add_argument("--user-id", required=True)
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    asyncio.run(run(args))
+
+
+if __name__ == "__main__":
+    main()
