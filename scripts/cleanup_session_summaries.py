@@ -60,40 +60,37 @@ async def run(args: argparse.Namespace) -> int:
 
     total = 0
     changed = 0
-    for row in rows or []:
-        uuid = None
-        summary = None
+    seen = set()
+
+    def _collect_nodes(row: Any) -> List[Dict[str, Any]]:
+        nodes: List[Dict[str, Any]] = []
         if isinstance(row, dict):
-            # Handle nested dict row shapes
-            if any(isinstance(v, dict) for v in row.values()):
-                for v in row.values():
-                    if isinstance(v, dict) and v.get("uuid") and v.get("summary"):
-                        uuid = v.get("uuid")
-                        summary = v.get("summary")
-                        break
-            else:
-                uuid = row.get("uuid")
-                summary = row.get("summary")
+            if "uuid" in row and "summary" in row:
+                nodes.append(row)
+            for v in row.values():
+                if isinstance(v, dict) and v.get("uuid") and v.get("summary"):
+                    nodes.append(v)
         elif isinstance(row, (list, tuple)):
-            # Sometimes rows are list-of-dicts
             for item in row:
                 if isinstance(item, dict) and item.get("uuid") and item.get("summary"):
-                    uuid = item.get("uuid")
-                    summary = item.get("summary")
-                    break
-            if uuid is None:
-                if len(row) > 0:
-                    uuid = row[0]
-                if len(row) > 1:
-                    summary = row[1]
-        if uuid in ("uuid", None) or summary in ("summary", None) or not isinstance(summary, str):
-            continue
-        total += 1
-        new_summary = _normalize_summary(summary)
-        if new_summary != summary:
-            changed += 1
-            if not args.dry_run:
-                await _update_node(driver, uuid, new_summary)
+                    nodes.append(item)
+        return nodes
+
+    for row in rows or []:
+        for node in _collect_nodes(row):
+            uuid = node.get("uuid")
+            summary = node.get("summary")
+            if uuid in ("uuid", None) or summary in ("summary", None) or not isinstance(summary, str):
+                continue
+            if uuid in seen:
+                continue
+            seen.add(uuid)
+            total += 1
+            new_summary = _normalize_summary(summary)
+            if new_summary != summary:
+                changed += 1
+                if not args.dry_run:
+                    await _update_node(driver, uuid, new_summary)
 
     print(f"cleanup: total={total} changed={changed} dry_run={args.dry_run}")
     return 0
