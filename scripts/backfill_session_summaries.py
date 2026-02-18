@@ -121,31 +121,26 @@ async def run(args: argparse.Namespace) -> int:
                 skipped += 1
                 continue
 
-        recent_turns = _extract_recent_turns(messages, limit=6)
-        if not recent_turns:
-            skipped += 1
-            continue
-
-        rolling_summary = row.get("rolling_summary") or ""
-        summary_input = session_mgr._build_session_summary_input(
-            rolling_summary=rolling_summary,
-            recent_turns=recent_turns
+        transcript = "\n".join(
+            [f"{m.get('role')}: {m.get('text')}" for m in (messages or []) if m.get("text")]
         )
-        summary_text = await session_mgr._summarize_session_close(summary_input)
-        if not summary_text:
-            summary_text = rolling_summary.strip()
-        if not summary_text and recent_turns:
-            last_user = next(
-                (m.get("text") for m in reversed(recent_turns) if m.get("role") == "user" and m.get("text")),
-                None
-            )
-            summary_text = (last_user or "").strip()
 
         reference_time = None
         if messages:
             reference_time = _parse_iso(messages[-1].get("timestamp"))
         if not reference_time:
             reference_time = row.get("updated_at") or row.get("created_at") or datetime.utcnow()
+
+        recaps = await session_mgr._summarize_session_close(
+            transcript=transcript,
+            reference_time=reference_time
+        )
+        summary_text = (recaps.get("summary") or "").strip()
+        bridge_text = (recaps.get("bridge") or "").strip()
+
+        if not summary_text:
+            skipped += 1
+            continue
 
         processed += 1
         if args.dry_run:
@@ -156,6 +151,7 @@ async def run(args: argparse.Namespace) -> int:
             user_id=user_id,
             session_id=session_id,
             summary_text=summary_text,
+            bridge_text=bridge_text,
             reference_time=reference_time,
             episode_uuid=None
         )

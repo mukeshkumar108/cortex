@@ -12,7 +12,7 @@ Rolling summary is a compressor, not a memory:
 - Graphiti receives raw turns for full-fidelity long-term storage
 """
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timedelta
 import hashlib
 import inspect
@@ -825,35 +825,52 @@ Do not include filler or meta-commentary."""
             return f"Earlier summary:\n{rolling_summary}\n\nRecent turns:\n{recent}"
         return f"Recent turns:\n{recent}"
 
-    async def _summarize_session_close(self, summary_input: str) -> str:
+    async def _summarize_session_close(
+        self,
+        transcript: str,
+        reference_time: datetime
+    ) -> Dict[str, str]:
+        date_str = reference_time.strftime("%A, %b %d, %Y")
         prompt = (
-            "You are a summarizer. Write a short, human-readable recap of the session in 2–4 sentences.\n\n"
+            f"Current Date: {date_str}\n\n"
+            "You are a memory processor. Your job is to extract two distinct texts from the transcript below.\n\n"
+            "TASK 1: HISTORICAL SUMMARY\n"
             "Rules:\n"
-            "- Do NOT include speaker labels (no “User:” or “Assistant:”).\n"
-            "- Do NOT quote or paraphrase the transcript line-by-line.\n"
-            "- Write in past tense.\n"
-            "- Capture only key facts, commitments, decisions, ongoing threads, and notable context.\n"
+            "- 2-4 sentences max.\n"
+            "- Write in PAST TENSE.\n"
+            "- No speaker labels, no line-by-line quoting.\n"
+            f"- Convert relative dates (like \"tomorrow\") into absolute dates based on the current date ({date_str}).\n"
+            "- Capture only facts, commitments, decisions, ongoing threads, and notable context.\n"
             "- Be concise and neutral.\n"
             "- If a detail is uncertain, omit it.\n"
             "- Do NOT use user name or assistant name; use “the user” or “the assistant” if needed.\n\n"
-            f"Session:\n{summary_input}\n\nSummary:"
+            "TASK 2: BRIDGING TEXT\n"
+            "Rules:\n"
+            "- 1-2 sentences max.\n"
+            "- Write in PRESENT or FUTURE tense.\n"
+            "- This text is to bridge the gap to the next session.\n"
+            "- Focus on what is pending or what the assistant should check on next.\n"
+            "- Do NOT include speaker labels or verbatim transcript.\n"
+            "- Do NOT use user name or assistant name; use “the user” or “the assistant” if needed.\n\n"
+            f"Session Transcript:\n{transcript}\n\n"
+            "Response format:\n"
+            "SUMMARY: ...\n"
+            "BRIDGE: ...\n"
         )
         response = await self.llm_client._call_llm(
             prompt=prompt,
-            max_tokens=200,
-            temperature=0.2,
+            max_tokens=300,
+            temperature=0.1,
             task="session_episode"
         )
-        if response:
-            text = response.strip()
-            if self._looks_like_transcript(text):
-                strict = await self._summarize_session_close_strict(summary_input)
-                if strict:
-                    text = strict
-            if self._looks_like_transcript(text):
-                return ""
-            return text
-        return ""
+        if not response:
+            return {"summary": "", "bridge": ""}
+        summary, bridge = self._parse_summary_bridge(response)
+        if self._looks_like_transcript(summary):
+            summary = ""
+        if self._looks_like_transcript(bridge):
+            bridge = ""
+        return {"summary": summary, "bridge": bridge}
 
     async def _summarize_session_bridge(self, summary_text: str) -> str:
         if self._looks_like_transcript(summary_text):
@@ -884,20 +901,33 @@ Do not include filler or meta-commentary."""
             return text
         return ""
 
-    async def _summarize_session_close_strict(self, summary_input: str) -> str:
-        prompt = (
-            "Write a short recap of the session in 2–4 sentences.\n"
-            "ABSOLUTELY NO speaker labels. NO transcript. Past tense only. "
-            "If you include 'User:' or 'Assistant:' you fail.\n\n"
-            f"Session:\n{summary_input}\n\nSummary:"
-        )
-        response = await self.llm_client._call_llm(
-            prompt=prompt,
-            max_tokens=200,
-            temperature=0.1,
-            task="session_episode_strict"
-        )
-        return response.strip() if response else ""
+    @staticmethod
+    def _parse_summary_bridge(text: str) -> Tuple[str, str]:
+        summary_lines: List[str] = []
+        bridge_lines: List[str] = []
+        mode: Optional[str] = None
+        for raw in (text or "").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            upper = line.upper()
+            if upper.startswith("SUMMARY:"):
+                mode = "summary"
+                content = line.split(":", 1)[1].strip()
+                if content:
+                    summary_lines.append(content)
+                continue
+            if upper.startswith("BRIDGE:"):
+                mode = "bridge"
+                content = line.split(":", 1)[1].strip()
+                if content:
+                    bridge_lines.append(content)
+                continue
+            if mode == "summary":
+                summary_lines.append(line)
+            elif mode == "bridge":
+                bridge_lines.append(line)
+        return (" ".join(summary_lines).strip(), " ".join(bridge_lines).strip())
 
     async def _summarize_session_bridge_strict(self, summary_text: str) -> str:
         prompt = (
@@ -1189,27 +1219,16 @@ Do not include filler or meta-commentary."""
                     user_id=user_id,
                     buffer=buffer
                 )
-                recent_turns = full_messages[-6:] if full_messages else []
-                summary_input = self._build_session_summary_input(
-                    rolling_summary=buffer.get("rolling_summary") or "",
-                    recent_turns=recent_turns
+                transcript = "\n".join(
+                    [f"{m.get('role')}: {m.get('text')}" for m in (full_messages or []) if m.get("text")]
                 )
-                summary_text = await self._summarize_session_close(summary_input)
-                if not summary_text:
-                    rolling_summary = (buffer.get("rolling_summary") or "").strip()
-                    if rolling_summary:
-                        if self._looks_like_transcript(rolling_summary):
-                            summary_text = await self._rewrite_summary_from_text(rolling_summary)
-                        else:
-                            summary_text = rolling_summary
-                if summary_text and self._looks_like_transcript(summary_text):
-                    summary_text = ""
+                recaps = await self._summarize_session_close(
+                    transcript=transcript,
+                    reference_time=ended_at or datetime.utcnow()
+                )
+                summary_text = (recaps.get("summary") or "").strip()
+                bridge_text = (recaps.get("bridge") or "").strip()
                 if summary_text:
-                    bridge_text = ""
-                    try:
-                        bridge_text = await self._summarize_session_bridge(summary_text)
-                    except Exception:
-                        bridge_text = ""
                     await graphiti_client.add_session_summary(
                         tenant_id=tenant_id,
                         user_id=user_id,
@@ -1615,16 +1634,23 @@ async def summarize_session_messages(
     if mgr is None:
         mgr = SessionManager(Database())
 
-    recent_turns = messages[-6:] if messages else []
-    summary_input = mgr._build_session_summary_input(
-        rolling_summary="",
-        recent_turns=recent_turns
+    transcript = "\n".join(
+        [f"{m.get('role')}: {m.get('text')}" for m in (messages or []) if m.get("text")]
     )
-    summary_text = await mgr._summarize_session_close(summary_input)
-    bridge_text = ""
-    if summary_text:
+    reference_time = datetime.utcnow()
+    for m in reversed(messages or []):
+        ts = m.get("timestamp")
+        if not ts:
+            continue
         try:
-            bridge_text = await mgr._summarize_session_bridge(summary_text)
+            reference_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            break
         except Exception:
-            bridge_text = ""
+            continue
+    recaps = await mgr._summarize_session_close(
+        transcript=transcript,
+        reference_time=reference_time
+    )
+    summary_text = (recaps.get("summary") or "").strip()
+    bridge_text = (recaps.get("bridge") or "").strip()
     return {"summary_text": summary_text, "bridge_text": bridge_text}
