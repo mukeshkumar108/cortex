@@ -1353,7 +1353,7 @@ async def ingest_session(request: SessionIngestRequest):
         reference_time = datetime.fromisoformat(ended_at.replace("Z", "+00:00")) if ended_at else datetime.utcnow()
         messages_payload = [m.model_dump() for m in request.messages]
 
-        await graphiti_client.add_session_episode(
+        episode_result = await graphiti_client.add_session_episode(
             tenant_id=request.tenantId,
             user_id=request.userId,
             messages=messages_payload,
@@ -1366,6 +1366,27 @@ async def ingest_session(request: SessionIngestRequest):
                 "episode_type": "session_raw"
             }
         )
+        episode_uuid = None
+        if isinstance(episode_result, dict):
+            episode_uuid = episode_result.get("episode_uuid")
+
+        # Create SessionSummary + bridge from full transcript
+        try:
+            summary_payload = await session.summarize_session_messages(messages_payload)
+            summary_text = summary_payload.get("summary_text")
+            bridge_text = summary_payload.get("bridge_text")
+            if summary_text:
+                await graphiti_client.add_session_summary(
+                    tenant_id=request.tenantId,
+                    user_id=request.userId,
+                    session_id=request.sessionId,
+                    summary_text=summary_text,
+                    bridge_text=bridge_text,
+                    reference_time=reference_time,
+                    episode_uuid=episode_uuid
+                )
+        except Exception as e:
+            logger.error(f"Session ingest summary failed: {e}")
 
         # Optional: store transcript for debug/audit
         await db.execute(

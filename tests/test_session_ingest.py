@@ -5,6 +5,7 @@ import pytest
 from httpx import AsyncClient, ASGITransport
 
 from src.main import app, graphiti_client
+from src import session as session_module
 
 
 @pytest.mark.asyncio
@@ -18,9 +19,17 @@ async def test_session_ingest_calls_graphiti_once():
 
     async def _stub_add_session_episode(**kwargs):
         called.update(kwargs)
-        return {"ok": True}
+        return {"ok": True, "episode_uuid": "ep1"}
+
+    async def _stub_summarize_messages(_messages):
+        return {"summary_text": "User said hello.", "bridge_text": "User said hello."}
+
+    async def _stub_add_session_summary(**kwargs):
+        called["summary"] = kwargs
 
     graphiti_client.add_session_episode = _stub_add_session_episode
+    graphiti_client.add_session_summary = _stub_add_session_summary
+    session_module.summarize_session_messages = _stub_summarize_messages
 
     async with app.router.lifespan_context(app):
         async with AsyncClient(
@@ -51,3 +60,4 @@ async def test_session_ingest_calls_graphiti_once():
     transcript = graphiti_client._format_message_transcript(called["messages"])
     assert "User: My name is Mukesh" in transcript
     assert "Assistant: Nice to meet you" in transcript
+    assert called.get("summary", {}).get("summary_text") == "User said hello."

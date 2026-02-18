@@ -17,18 +17,27 @@ def _normalize_summary(text: str) -> str:
     text = re.sub(r"\bSophie['’]s\b", "User's", text)
     text = re.sub(r"\bsophie\b", "User", text)
     text = re.sub(r"\bsophie['’]s\b", "User's", text)
+    # Normalize pronouns: she/her -> he/him/his
+    text = re.sub(r"\bShe\b", "He", text)
+    text = re.sub(r"\bshe\b", "he", text)
+    text = re.sub(r"\bHer\b", "His", text)
+    text = re.sub(r"\bher\b", "his", text)
+    text = re.sub(r"\bHers\b", "His", text)
+    text = re.sub(r"\bhers\b", "his", text)
     return text
 
 
-async def _update_node(driver: Any, uuid: str, summary: str) -> None:
+async def _update_node(driver: Any, uuid: str, summary: str, summary_text: Optional[str]) -> None:
     await driver.execute_query(
         """
         MATCH (n {uuid: $uuid})
-        SET n.summary = $summary
+        SET n.summary = $summary,
+            n.summary_text = $summary_text
         RETURN n
         """,
         uuid=uuid,
-        summary=summary
+        summary=summary,
+        summary_text=summary_text
     )
 
 
@@ -47,7 +56,7 @@ async def run(args: argparse.Namespace) -> int:
         rows = await driver.execute_query(
             """
             MATCH (n:SessionSummary {group_id: $group_id})
-            RETURN n.uuid AS uuid, n.summary AS summary
+            RETURN n.uuid AS uuid, n.summary AS summary, n.summary_text AS summary_text
             """,
             group_id=group_id
         )
@@ -55,7 +64,7 @@ async def run(args: argparse.Namespace) -> int:
         rows = await driver.execute_query(
             """
             MATCH (n:SessionSummary)
-            RETURN n.uuid AS uuid, n.summary AS summary
+            RETURN n.uuid AS uuid, n.summary AS summary, n.summary_text AS summary_text
             """
         )
 
@@ -67,6 +76,7 @@ async def run(args: argparse.Namespace) -> int:
         for node in extract_node_dicts(row, required_keys=("uuid", "summary")):
             uuid = node.get("uuid")
             summary = node.get("summary")
+            summary_text = node.get("summary_text")
             if uuid in ("uuid", None) or summary in ("summary", None) or not isinstance(summary, str):
                 continue
             if uuid in seen:
@@ -74,10 +84,11 @@ async def run(args: argparse.Namespace) -> int:
             seen.add(uuid)
             total += 1
             new_summary = _normalize_summary(summary)
-            if new_summary != summary:
+            new_summary_text = _normalize_summary(summary_text) if isinstance(summary_text, str) else summary_text
+            if new_summary != summary or (isinstance(summary_text, str) and new_summary_text != summary_text):
                 changed += 1
                 if not args.dry_run:
-                    await _update_node(driver, uuid, new_summary)
+                    await _update_node(driver, uuid, new_summary, new_summary_text)
 
     print(f"cleanup: total={total} changed={changed} dry_run={args.dry_run}")
     return 0

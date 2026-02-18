@@ -842,6 +842,25 @@ Do not include filler or meta-commentary."""
             return response.strip()
         return summary_input[:500]
 
+    async def _summarize_session_bridge(self, summary_text: str) -> str:
+        prompt = (
+            "Rewrite the session summary into a 1-2 sentence bridge for the next session. "
+            "Be factual and concise. Use 'User' and 'Assistant' labels only. "
+            "Do NOT use names like Sophie or Mukesh. "
+            "Prefer concrete plans, commitments, and state of ongoing work. "
+            "Exclude environment unless it was explicitly stated.\n\n"
+            f"Summary:\n{summary_text}\n\nBridge:"
+        )
+        response = await self.llm_client._call_llm(
+            prompt=prompt,
+            max_tokens=120,
+            temperature=0.2,
+            task="session_bridge"
+        )
+        if response:
+            return response.strip()
+        return ""
+
     @staticmethod
     def _build_session_episode_text(
         summary_text: str,
@@ -1084,12 +1103,18 @@ Do not include filler or meta-commentary."""
                         None
                     )
                     summary_text = (last_user or "").strip()
+                bridge_text = ""
                 if summary_text:
+                    try:
+                        bridge_text = await self._summarize_session_bridge(summary_text)
+                    except Exception:
+                        bridge_text = ""
                     await graphiti_client.add_session_summary(
                         tenant_id=tenant_id,
                         user_id=user_id,
                         session_id=session_id,
                         summary_text=summary_text,
+                        bridge_text=bridge_text,
                         reference_time=ended_at or datetime.utcnow(),
                         episode_uuid=episode_uuid
                     )
@@ -1479,3 +1504,32 @@ async def close_session(
         graphiti_client,
         persona_id=persona_id
     )
+
+
+async def summarize_session_messages(
+    messages: List[Dict[str, Any]]
+) -> Dict[str, str]:
+    """Summarize a full session transcript into summary + bridge."""
+    mgr = _manager
+    if mgr is None:
+        mgr = SessionManager(Database())
+
+    recent_turns = messages[-6:] if messages else []
+    summary_input = mgr._build_session_summary_input(
+        rolling_summary="",
+        recent_turns=recent_turns
+    )
+    summary_text = await mgr._summarize_session_close(summary_input)
+    if not summary_text:
+        last_user = next(
+            (m.get("text") for m in reversed(recent_turns) if m.get("role") == "user" and m.get("text")),
+            None
+        )
+        summary_text = (last_user or "").strip()
+    bridge_text = ""
+    if summary_text:
+        try:
+            bridge_text = await mgr._summarize_session_bridge(summary_text)
+        except Exception:
+            bridge_text = ""
+    return {"summary_text": summary_text, "bridge_text": bridge_text}

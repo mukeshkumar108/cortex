@@ -344,6 +344,10 @@ Use this if you keep working memory locally and only send full transcripts.
 }
 ```
 
+Notes:
+- `/session/ingest` sends the full transcript to Graphiti as one episode.
+- Synapse also creates a `SessionSummary` node and precomputes `bridge_text` for startbrief.
+
 ### Semantic Memory (Graphiti)
 - Facts/entities/episodes in Graphiti (best-effort)
 - Retrieved via /memory/query (on-demand)

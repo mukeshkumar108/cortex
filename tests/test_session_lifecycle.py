@@ -330,6 +330,9 @@ async def test_session_close_gap():
                     "metadata": {"sessionId": session_id}
                 }
             )
+    # Avoid LLM calls during close_session in tests
+    session_module._manager._summarize_session_close = lambda _self, _input=None: asyncio.sleep(0, result="summary")
+    session_module._manager._summarize_session_bridge = lambda _self, _summary: asyncio.sleep(0, result="bridge")
     await session_module.close_session(tenant, session_id, user, graphiti_client)
     await asyncio.sleep(0.05)
 

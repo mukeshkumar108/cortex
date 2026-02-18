@@ -105,6 +105,9 @@ async def test_session_close_sends_raw_transcript_episode():
     fake_graphiti = type("G", (), {"add_episode": _fake_add_episode})
 
     async with app.router.lifespan_context(app):
+        # Avoid LLM calls during close_session in tests
+        session_module._manager._summarize_session_close = lambda _self, _input=None: asyncio.sleep(0, result="summary")
+        session_module._manager._summarize_session_bridge = lambda _self, _summary: asyncio.sleep(0, result="bridge")
         await session_module.add_turn(
             tenant_id=tenant,
             session_id=session_id,

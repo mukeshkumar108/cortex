@@ -157,6 +157,9 @@ Use if Sophie stores working memory locally and only sends full transcripts.
   ]
 }
 ```
+Notes:
+- `/session/ingest` sends the full transcript to Graphiti as one episode.
+- Synapse also creates a `SessionSummary` node and precomputes `bridge_text` for startbrief.
 ## Failure behavior
 - Graphiti down → /brief and /ingest still succeed.
 - Memory query fails → orchestrator proceeds without semantic memory.

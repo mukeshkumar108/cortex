@@ -18,6 +18,7 @@ async def test_session_startbrief_uses_loops_and_filters_summary(monkeypatch):
     async def _stub_latest_summary_node(*_args, **_kwargs):
         return {
             "summary": "I feel anxious about the demo. At the gym. Finish portfolio site this week.",
+            "attributes": {"bridge_text": "Finish portfolio site this week."},
             "created_at": now
         }
 
