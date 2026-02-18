@@ -15,6 +15,12 @@ def extract_node_dicts(row: Any, required_keys: Optional[Iterable[str]] = None) 
     required = set(required_keys or [])
     nodes: List[Dict[str, Any]] = []
 
+    def _normalize(d: Dict[str, Any]) -> Dict[str, Any]:
+        # Some drivers wrap node properties under "properties"
+        if isinstance(d.get("properties"), dict):
+            return d["properties"]
+        return d
+
     def _is_header(d: Dict[str, Any]) -> bool:
         # Common header markers
         if d.get("name") == "name" or d.get("summary") == "summary" or d.get("uuid") == "uuid":
@@ -24,6 +30,7 @@ def extract_node_dicts(row: Any, required_keys: Optional[Iterable[str]] = None) 
     def _accept(d: Dict[str, Any]) -> bool:
         if not isinstance(d, dict):
             return False
+        d = _normalize(d)
         if _is_header(d):
             return False
         if required and not required.issubset(set(d.keys())):
@@ -33,15 +40,15 @@ def extract_node_dicts(row: Any, required_keys: Optional[Iterable[str]] = None) 
     if isinstance(row, dict):
         # If row is already a node dict
         if _accept(row):
-            nodes.append(row)
+            nodes.append(_normalize(row))
         # If row values are node dicts
         for value in row.values():
             if isinstance(value, dict) and _accept(value):
-                nodes.append(value)
+                nodes.append(_normalize(value))
     elif isinstance(row, (list, tuple)):
         for value in row:
             if isinstance(value, dict) and _accept(value):
-                nodes.append(value)
+                nodes.append(_normalize(value))
 
     return nodes
 
