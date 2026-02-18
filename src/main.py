@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Header
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
@@ -22,6 +22,8 @@ from .models import (
     SessionBriefResponse,
     PurgeUserRequest,
 )
+import io
+import csv
 from .config import get_settings
 from .db import Database
 from .graphiti_client import GraphitiClient
@@ -1240,6 +1242,30 @@ async def debug_outbox(
         return {"rows": rows}
     except Exception as e:
         logger.error(f"Debug outbox endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/internal/debug/loops")
+async def debug_loops(
+    tenantId: str,
+    userId: str,
+    format: str | None = None,
+    x_internal_token: str | None = Header(default=None)
+):
+    _require_internal_token(x_internal_token)
+    try:
+        rows = await loops.get_active_loops_debug(tenantId, userId)
+        if (format or "").lower() == "csv":
+            output = io.StringIO()
+            fieldnames = sorted({key for row in rows for key in row.keys()})
+            writer = csv.DictWriter(output, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+            return Response(content=output.getvalue(), media_type="text/csv")
+        return {"count": len(rows), "rows": rows}
+    except Exception as e:
+        logger.error(f"Debug loops endpoint error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

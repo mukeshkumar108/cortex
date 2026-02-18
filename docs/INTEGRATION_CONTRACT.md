@@ -123,6 +123,7 @@ These require header `X-Internal-Token` and are intended for ops/debug only:
 - `GET /internal/debug/session`
 - `GET /internal/debug/user`
 - `GET /internal/debug/outbox`
+- `GET /internal/debug/loops`
 - `POST /internal/debug/close_session`
 - `POST /internal/debug/close_user_sessions`
 - `POST /internal/debug/emit_raw_episode`

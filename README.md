@@ -117,6 +117,7 @@ Require header `X-Internal-Token` = `INTERNAL_TOKEN`.
 - `/internal/debug/session?tenantId&userId&sessionId`
 - `/internal/debug/user?tenantId&userId`
 - `/internal/debug/outbox?tenantId&limit=50`
+- `/internal/debug/loops?tenantId&userId&format=csv`
 - `/internal/debug/session?tenantId&userId&sessionId`
 - `/internal/debug/nudges?tenantId&userId`
 - `/internal/debug/graphiti/episodes?tenantId&userId&limit=5`
