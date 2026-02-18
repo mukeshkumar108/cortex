@@ -1761,21 +1761,38 @@ async def debug_graphiti_session_summaries(
             group_id=composite_user_id,
             limit=limit
         )
+
+        def _extract_props(value: Any) -> Optional[Dict[str, Any]]:
+            if isinstance(value, dict):
+                return value.get("properties") if isinstance(value.get("properties"), dict) else value
+            if hasattr(value, "properties"):
+                props = getattr(value, "properties")
+                if isinstance(props, dict):
+                    return props
+            return None
+
         summaries = []
         for row in rows or []:
             node = None
             if isinstance(row, dict):
-                node = row.get("n")
+                node = row.get("n") or row
             elif isinstance(row, (list, tuple)) and row:
                 node = row[0]
-            if not isinstance(node, dict):
-                node = {}
+            props = _extract_props(node)
+            if props is None and isinstance(node, (list, tuple)):
+                for item in node:
+                    props = _extract_props(item)
+                    if props is not None:
+                        break
+            if props is None:
+                props = {}
             summaries.append({
-                "name": node.get("name"),
-                "summary": node.get("summary"),
-                "attributes": node.get("attributes") or {},
-                "created_at": node.get("created_at"),
-                "uuid": node.get("uuid")
+                "name": props.get("name"),
+                "summary": props.get("summary"),
+                "attributes": props.get("attributes") or {},
+                "created_at": props.get("created_at"),
+                "uuid": props.get("uuid"),
+                "raw": None if props else row
             })
         return {"count": len(summaries), "summaries": summaries}
     except Exception as e:
