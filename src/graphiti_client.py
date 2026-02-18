@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import logging
 from .config import get_settings
+from .falkor_utils import extract_node_dicts, pick_first_node
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -787,22 +788,17 @@ class GraphitiClient:
             )
             if not rows:
                 return None
-            row = rows[0]
-            if isinstance(row, dict):
-                # Some drivers return nested dicts; pick the first dict with name/summary.
-                if any(isinstance(v, dict) for v in row.values()):
-                    for v in row.values():
-                        if isinstance(v, dict) and v.get("name") and v.get("summary"):
-                            row = v
-                            break
+            node = pick_first_node(rows, required_keys=("name", "summary"))
+            if node:
                 return {
-                    "name": row.get("name"),
-                    "summary": row.get("summary"),
-                    "created_at": row.get("created_at"),
-                    "uuid": row.get("uuid"),
-                    "group_id": row.get("group_id"),
-                    "attributes": row.get("attributes") or {}
+                    "name": node.get("name"),
+                    "summary": node.get("summary"),
+                    "created_at": node.get("created_at"),
+                    "uuid": node.get("uuid"),
+                    "group_id": node.get("group_id"),
+                    "attributes": node.get("attributes") or {}
                 }
+            row = rows[0]
             if isinstance(row, (list, tuple)):
                 return {
                     "name": row[0] if len(row) > 0 else None,

@@ -113,6 +113,7 @@ OUTBOX_DRAIN_ENABLED=true
 - **Loop extraction** runs on session close (best‑effort) and does not affect /ingest latency.
 - **Graphiti LLM** uses OpenAI by default (via `OPENAI_API_KEY`) unless overridden by `GRAPHITI_LLM_*` settings.
 - **Noise filter**: very short messages may be marked `skipped`.
+- **Falkor result shapes vary**: use `src/falkor_utils.py` helpers when parsing `driver.execute_query` output.
 
 ## Dev / Test
 ```bash

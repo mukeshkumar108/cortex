@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import io
 import csv
 from .config import get_settings
+from .falkor_utils import extract_count, extract_node_dicts, pick_first_node
 from .db import Database
 from .graphiti_client import GraphitiClient
 from . import session
@@ -1783,17 +1784,7 @@ async def debug_graphiti_session_summaries(
             count_query = "MATCH (n:SessionSummary) RETURN count(n) AS count"
             count_params = {}
         count_rows = await driver.execute_query(count_query, **count_params)
-        graph_count = None
-        if count_rows:
-            row0 = count_rows[0]
-            if isinstance(row0, dict):
-                value = row0.get("count")
-                if isinstance(value, dict) and "count" in value:
-                    graph_count = value.get("count")
-                else:
-                    graph_count = value
-            elif isinstance(row0, (list, tuple)) and row0:
-                graph_count = row0[0]
+        graph_count = extract_count(count_rows or [])
 
         if all:
             rows = await driver.execute_query(
@@ -1827,48 +1818,19 @@ async def debug_graphiti_session_summaries(
             )
         summaries = []
         for row in rows or []:
-            if isinstance(row, dict):
-                # Skip header-like rows
-                if row.get("name") == "name" and row.get("summary") == "summary":
-                    continue
-                props = row
-                # Falkor may return column-name keys mapped to full node dicts
-                if any(isinstance(v, dict) for v in row.values()):
-                    for v in row.values():
-                        if isinstance(v, dict) and v.get("name") and v.get("summary"):
-                            props = v
-                            break
-                if props.get("name") is None and props.get("summary") is None and props.get("uuid") is None:
-                    continue
-                summaries.append({
-                    "name": props.get("name"),
-                    "summary": props.get("summary"),
-                    "attributes": props.get("attributes") or {},
-                    "created_at": props.get("created_at"),
-                    "uuid": props.get("uuid"),
-                    "group_id": props.get("group_id")
-                })
-            elif isinstance(row, (list, tuple)):
-                # Skip header-like rows
-                if len(row) >= 2 and row[0] == "name" and row[1] == "summary":
-                    continue
-                # If row elements are dicts (Falkor projection quirk), pick the first full node dict
-                picked = None
-                for item in row:
-                    if isinstance(item, dict) and item.get("name") and item.get("summary"):
-                        picked = item
-                        break
-                if picked:
+            nodes = extract_node_dicts(row, required_keys=("name", "summary"))
+            if nodes:
+                for node in nodes:
                     summaries.append({
-                        "name": picked.get("name"),
-                        "summary": picked.get("summary"),
-                        "attributes": picked.get("attributes") or {},
-                        "created_at": picked.get("created_at"),
-                        "uuid": picked.get("uuid"),
-                        "group_id": picked.get("group_id")
+                        "name": node.get("name"),
+                        "summary": node.get("summary"),
+                        "attributes": node.get("attributes") or {},
+                        "created_at": node.get("created_at"),
+                        "uuid": node.get("uuid"),
+                        "group_id": node.get("group_id")
                     })
-                    continue
-
+                continue
+            if isinstance(row, (list, tuple)):
                 name = row[0] if len(row) > 0 else None
                 summary = row[1] if len(row) > 1 else None
                 attributes = row[2] if len(row) > 2 else {}

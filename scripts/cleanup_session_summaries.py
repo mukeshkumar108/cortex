@@ -5,6 +5,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from src.graphiti_client import GraphitiClient
+from src.falkor_utils import extract_node_dicts
 
 
 def _normalize_summary(text: str) -> str:
@@ -62,22 +63,8 @@ async def run(args: argparse.Namespace) -> int:
     changed = 0
     seen = set()
 
-    def _collect_nodes(row: Any) -> List[Dict[str, Any]]:
-        nodes: List[Dict[str, Any]] = []
-        if isinstance(row, dict):
-            if "uuid" in row and "summary" in row:
-                nodes.append(row)
-            for v in row.values():
-                if isinstance(v, dict) and v.get("uuid") and v.get("summary"):
-                    nodes.append(v)
-        elif isinstance(row, (list, tuple)):
-            for item in row:
-                if isinstance(item, dict) and item.get("uuid") and item.get("summary"):
-                    nodes.append(item)
-        return nodes
-
     for row in rows or []:
-        for node in _collect_nodes(row):
+        for node in extract_node_dicts(row, required_keys=("uuid", "summary")):
             uuid = node.get("uuid")
             summary = node.get("summary")
             if uuid in ("uuid", None) or summary in ("summary", None) or not isinstance(summary, str):
