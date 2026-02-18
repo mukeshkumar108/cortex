@@ -1066,7 +1066,8 @@ async def session_startbrief(
                 user_id=userId
             )
             if summary_node:
-                last_session_summary = summary_node.get("summary")
+                bridge_text = summary_node.get("attributes", {}).get("bridge_text")
+                last_session_summary = bridge_text or summary_node.get("summary")
                 if not last_activity_time:
                     last_time = summary_node.get("created_at")
                     if isinstance(last_time, str):
@@ -1931,6 +1932,58 @@ async def debug_graphiti_session_summaries_clean(
     except Exception as e:
         logger.error(f"Debug graphiti session_summaries_clean failed: {e}")
         raise HTTPException(status_code=500, detail="Debug graphiti session_summaries_clean failed")
+
+
+@app.get("/internal/debug/graphiti/session_summaries_view")
+async def debug_graphiti_session_summaries_view(
+    tenantId: str,
+    userId: str,
+    limit: int = 10,
+    x_internal_token: str | None = Header(default=None)
+):
+    """Human-readable view of recent session summaries + bridge_text."""
+    _require_internal_token(x_internal_token)
+    try:
+        if not graphiti_client._initialized:
+            await graphiti_client.initialize()
+        if not graphiti_client.client:
+            return {"count": 0, "summaries": [], "reason": "graphiti_unavailable"}
+
+        driver = getattr(graphiti_client.client, "driver", None)
+        if not driver:
+            return {"count": 0, "summaries": [], "reason": "driver_unavailable"}
+
+        composite_user_id = graphiti_client._make_composite_user_id(tenantId, userId)
+        rows = await driver.execute_query(
+            """
+            MATCH (n:SessionSummary {group_id: $group_id})
+            RETURN properties(n) AS props
+            ORDER BY n.created_at DESC
+            LIMIT $limit
+            """,
+            group_id=composite_user_id,
+            limit=limit
+        )
+
+        summaries = []
+        for row in rows or []:
+            props = None
+            if isinstance(row, dict):
+                props = row.get("props") if isinstance(row.get("props"), dict) else None
+            elif isinstance(row, (list, tuple)) and row:
+                props = row[0] if isinstance(row[0], dict) else None
+            if not props or props.get("summary") in (None, "summary"):
+                continue
+            summaries.append({
+                "created_at": props.get("created_at"),
+                "summary": props.get("summary"),
+                "bridge_text": props.get("bridge_text"),
+                "session_id": props.get("session_id")
+            })
+        return {"count": len(summaries), "summaries": summaries}
+    except Exception as e:
+        logger.error(f"Debug graphiti session_summaries_view failed: {e}")
+        raise HTTPException(status_code=500, detail="Debug graphiti session_summaries_view failed")
 
 
 if __name__ == "__main__":

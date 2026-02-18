@@ -141,6 +141,7 @@ Require header `X-Internal-Token` = `INTERNAL_TOKEN`.
 - `/internal/debug/graphiti/episodes?tenantId&userId&limit=5`
 - `/internal/debug/graphiti/session_summaries?tenantId&userId&limit=5`
 - `/internal/debug/graphiti/session_summaries_clean?tenantId&userId&limit=5`
+- `/internal/debug/graphiti/session_summaries_view?tenantId&userId&limit=10`
 - `POST /internal/debug/graphiti/query`
 - `POST /internal/debug/close_session?tenantId&userId&sessionId`
 - `POST /internal/debug/close_user_sessions?tenantId&userId&limit=20`
