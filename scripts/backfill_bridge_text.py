@@ -62,6 +62,8 @@ async def run(args: argparse.Namespace) -> int:
         if args.dry_run:
             continue
         new_bridge = await mgr._summarize_session_bridge(summary)
+        if not new_bridge:
+            new_bridge = summary
         if new_bridge:
             await _update_bridge_text(driver, uuid, new_bridge)
             updated += 1

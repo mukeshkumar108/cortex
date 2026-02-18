@@ -2023,7 +2023,11 @@ async def debug_graphiti_session_summaries_view(
             if isinstance(row, dict):
                 props = row.get("props") if isinstance(row.get("props"), dict) else None
             elif isinstance(row, (list, tuple)) and row:
-                props = row[0] if isinstance(row[0], dict) else None
+                # rows sometimes come back as list-of-dicts
+                if isinstance(row[0], dict) and "props" in row[0]:
+                    props = row[0].get("props")
+                elif isinstance(row[0], dict):
+                    props = row[0]
             if not props or props.get("summary") in (None, "summary"):
                 continue
             summaries.append({

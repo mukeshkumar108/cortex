@@ -1532,4 +1532,6 @@ async def summarize_session_messages(
             bridge_text = await mgr._summarize_session_bridge(summary_text)
         except Exception:
             bridge_text = ""
+    if not bridge_text:
+        bridge_text = summary_text
     return {"summary_text": summary_text, "bridge_text": bridge_text}
