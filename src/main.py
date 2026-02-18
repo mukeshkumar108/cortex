@@ -1763,7 +1763,13 @@ async def debug_graphiti_session_summaries(
         )
         summaries = []
         for row in rows or []:
-            node = row.get("n") or {}
+            node = None
+            if isinstance(row, dict):
+                node = row.get("n")
+            elif isinstance(row, (list, tuple)) and row:
+                node = row[0]
+            if not isinstance(node, dict):
+                node = {}
             summaries.append({
                 "name": node.get("name"),
                 "summary": node.get("summary"),
