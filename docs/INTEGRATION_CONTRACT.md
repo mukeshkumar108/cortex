@@ -348,6 +348,10 @@ Notes:
 - `/session/ingest` sends the full transcript to Graphiti as one episode.
 - Synapse also creates a `SessionSummary` node and precomputes `bridge_text` for startbrief.
 
+Operational note:
+- If historical SessionSummary nodes contain transcript-like text, use `scripts/redo_session_summaries.py`
+  to rewrite them into narrative recaps and regenerate `bridge_text`.
+
 ### Semantic Memory (Graphiti)
 - Facts/entities/episodes in Graphiti (best-effort)
 - Retrieved via /memory/query (on-demand)

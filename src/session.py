@@ -845,15 +845,23 @@ Do not include filler or meta-commentary."""
             task="session_episode"
         )
         if response:
-            return response.strip()
-        return summary_input[:500]
+            text = response.strip()
+            if self._looks_like_transcript(text):
+                strict = await self._summarize_session_close_strict(summary_input)
+                if strict:
+                    text = strict
+            if self._looks_like_transcript(text):
+                return ""
+            return text
+        return ""
 
     async def _summarize_session_bridge(self, summary_text: str) -> str:
+        if self._looks_like_transcript(summary_text):
+            return ""
         prompt = (
             "Rewrite the session summary into a 1-2 sentence bridge for the next session. "
             "Be factual, concise, and in past tense. "
             "Do NOT include speaker labels or verbatim transcript. "
-            "Use 'User' and 'Assistant' labels only if absolutely necessary. "
             "Do NOT use user name or assistant name; use “the user” or “the assistant” if needed. "
             "Prefer concrete plans, commitments, and state of ongoing work. "
             "Exclude environment unless it was explicitly stated.\n\n"
@@ -866,7 +874,91 @@ Do not include filler or meta-commentary."""
             task="session_bridge"
         )
         if response:
-            return response.strip()
+            text = response.strip()
+            if self._looks_like_transcript(text):
+                strict = await self._summarize_session_bridge_strict(summary_text)
+                if strict:
+                    text = strict
+            if self._looks_like_transcript(text):
+                return ""
+            return text
+        return ""
+
+    async def _summarize_session_close_strict(self, summary_input: str) -> str:
+        prompt = (
+            "Write a short recap of the session in 2–4 sentences.\n"
+            "ABSOLUTELY NO speaker labels. NO transcript. Past tense only. "
+            "If you include 'User:' or 'Assistant:' you fail.\n\n"
+            f"Session:\n{summary_input}\n\nSummary:"
+        )
+        response = await self.llm_client._call_llm(
+            prompt=prompt,
+            max_tokens=200,
+            temperature=0.1,
+            task="session_episode_strict"
+        )
+        return response.strip() if response else ""
+
+    async def _summarize_session_bridge_strict(self, summary_text: str) -> str:
+        prompt = (
+            "Rewrite into a 1–2 sentence bridge recap. "
+            "ABSOLUTELY NO speaker labels. NO transcript. Past tense only.\n\n"
+            f"Summary:\n{summary_text}\n\nBridge:"
+        )
+        response = await self.llm_client._call_llm(
+            prompt=prompt,
+            max_tokens=120,
+            temperature=0.1,
+            task="session_bridge_strict"
+        )
+        return response.strip() if response else ""
+
+    @staticmethod
+    def _contains_speaker_labels(text: str) -> bool:
+        if not text:
+            return False
+        lower = text.lower()
+        return "user:" in lower or "assistant:" in lower
+
+    @staticmethod
+    def _looks_like_transcript(text: str) -> bool:
+        if not text:
+            return False
+        lower = text.lower()
+        if "user:" in lower or "assistant:" in lower:
+            return True
+        if "recent turns:" in lower or "earlier summary:" in lower:
+            return True
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return False
+        labelish = 0
+        for line in lines:
+            l = line.lower()
+            if l.startswith(("user:", "assistant:")):
+                labelish += 1
+            elif l.startswith("user ") or l.startswith("assistant "):
+                labelish += 1
+        return labelish >= 2
+
+    async def _rewrite_summary_from_text(self, text: str) -> str:
+        prompt = (
+            "Rewrite this into a 2–4 sentence narrative recap. "
+            "No speaker labels. No transcript. Past tense. "
+            "Focus on key facts, commitments, and ongoing threads.\n\n"
+            f"Text:\n{text}\n\nSummary:"
+        )
+        response = await self.llm_client._call_llm(
+            prompt=prompt,
+            max_tokens=200,
+            temperature=0.2,
+            task="session_rewrite"
+        )
+        if response:
+            cleaned = response.strip()
+            if self._looks_like_transcript(cleaned):
+                return ""
+            return cleaned
         return ""
 
     @staticmethod
@@ -1104,15 +1196,16 @@ Do not include filler or meta-commentary."""
                 )
                 summary_text = await self._summarize_session_close(summary_input)
                 if not summary_text:
-                    summary_text = (buffer.get("rolling_summary") or "").strip()
-                if not summary_text and recent_turns:
-                    last_user = next(
-                        (m.get("text") for m in reversed(recent_turns) if m.get("role") == "user" and m.get("text")),
-                        None
-                    )
-                    summary_text = (last_user or "").strip()
-                bridge_text = ""
+                    rolling_summary = (buffer.get("rolling_summary") or "").strip()
+                    if rolling_summary:
+                        if self._looks_like_transcript(rolling_summary):
+                            summary_text = await self._rewrite_summary_from_text(rolling_summary)
+                        else:
+                            summary_text = rolling_summary
+                if summary_text and self._looks_like_transcript(summary_text):
+                    summary_text = ""
                 if summary_text:
+                    bridge_text = ""
                     try:
                         bridge_text = await self._summarize_session_bridge(summary_text)
                     except Exception:
@@ -1528,19 +1621,10 @@ async def summarize_session_messages(
         recent_turns=recent_turns
     )
     summary_text = await mgr._summarize_session_close(summary_input)
-    if not summary_text:
-        last_user = next(
-            (m.get("text") for m in reversed(recent_turns) if m.get("role") == "user" and m.get("text")),
-            None
-        )
-        summary_text = (last_user or "").strip()
     bridge_text = ""
     if summary_text:
         try:
             bridge_text = await mgr._summarize_session_bridge(summary_text)
         except Exception:
             bridge_text = ""
-    if not bridge_text:
-        # Fall back to summary_text (not transcript) if bridge rewrite fails
-        bridge_text = summary_text
     return {"summary_text": summary_text, "bridge_text": bridge_text}
