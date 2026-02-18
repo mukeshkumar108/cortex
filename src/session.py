@@ -866,6 +866,11 @@ Do not include filler or meta-commentary."""
         if not response:
             return {"summary": "", "bridge": ""}
         summary, bridge = self._parse_summary_bridge(response)
+        if not summary and not bridge:
+            logger.warning(
+                "Session recap parse returned empty output. Raw response (truncated): %s",
+                response[:500]
+            )
         if self._looks_like_transcript(summary):
             summary = ""
         if self._looks_like_transcript(bridge):
@@ -1653,4 +1658,6 @@ async def summarize_session_messages(
     )
     summary_text = (recaps.get("summary") or "").strip()
     bridge_text = (recaps.get("bridge") or "").strip()
+    if not summary_text:
+        logger.warning("Session recap returned empty summary (bridge_len=%s)", len(bridge_text))
     return {"summary_text": summary_text, "bridge_text": bridge_text}

@@ -1406,6 +1406,14 @@ async def ingest_session(request: SessionIngestRequest):
             summary_payload = await session.summarize_session_messages(messages_payload)
             summary_text = summary_payload.get("summary_text")
             bridge_text = summary_payload.get("bridge_text")
+            logger.info(
+                "Session ingest recap result tenant=%s user=%s session=%s summary_len=%s bridge_len=%s",
+                request.tenantId,
+                request.userId,
+                request.sessionId,
+                len(summary_text or ""),
+                len(bridge_text or "")
+            )
             if summary_text:
                 await graphiti_client.add_session_summary(
                     tenant_id=request.tenantId,
