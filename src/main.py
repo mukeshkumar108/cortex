@@ -1765,7 +1765,11 @@ async def debug_graphiti_session_summaries(
         if count_rows:
             row0 = count_rows[0]
             if isinstance(row0, dict):
-                graph_count = row0.get("count")
+                value = row0.get("count")
+                if isinstance(value, dict) and "count" in value:
+                    graph_count = value.get("count")
+                else:
+                    graph_count = value
             elif isinstance(row0, (list, tuple)) and row0:
                 graph_count = row0[0]
 
@@ -1805,15 +1809,18 @@ async def debug_graphiti_session_summaries(
                 # Skip header-like rows
                 if row.get("name") == "name" and row.get("summary") == "summary":
                     continue
-                if row.get("name") is None and row.get("summary") is None and row.get("uuid") is None:
+                props = row
+                if isinstance(row.get("name"), dict) and row["name"].get("name"):
+                    props = row["name"]
+                if props.get("name") is None and props.get("summary") is None and props.get("uuid") is None:
                     continue
                 summaries.append({
-                    "name": row.get("name"),
-                    "summary": row.get("summary"),
-                    "attributes": row.get("attributes") or {},
-                    "created_at": row.get("created_at"),
-                    "uuid": row.get("uuid"),
-                    "group_id": row.get("group_id")
+                    "name": props.get("name"),
+                    "summary": props.get("summary"),
+                    "attributes": props.get("attributes") or {},
+                    "created_at": props.get("created_at"),
+                    "uuid": props.get("uuid"),
+                    "group_id": props.get("group_id")
                 })
             elif isinstance(row, (list, tuple)):
                 # Skip header-like rows
