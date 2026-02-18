@@ -1751,6 +1751,21 @@ async def debug_graphiti_session_summaries(
             return {"count": 0, "summaries": [], "reason": "driver_unavailable"}
 
         composite_user_id = graphiti_client._make_composite_user_id(tenantId, userId)
+        count_rows = await driver.execute_query(
+            """
+            MATCH (n:SessionSummary {group_id: $group_id})
+            RETURN count(n) AS count
+            """,
+            group_id=composite_user_id
+        )
+        graph_count = None
+        if count_rows:
+            row0 = count_rows[0]
+            if isinstance(row0, dict):
+                graph_count = row0.get("count")
+            elif isinstance(row0, (list, tuple)) and row0:
+                graph_count = row0[0]
+
         rows = await driver.execute_query(
             """
             MATCH (n:SessionSummary {group_id: $group_id})
@@ -1768,6 +1783,9 @@ async def debug_graphiti_session_summaries(
         summaries = []
         for row in rows or []:
             if isinstance(row, dict):
+                # Skip header-like rows
+                if row.get("name") == "name" and row.get("summary") == "summary":
+                    continue
                 summaries.append({
                     "name": row.get("name"),
                     "summary": row.get("summary"),
@@ -1776,6 +1794,9 @@ async def debug_graphiti_session_summaries(
                     "uuid": row.get("uuid")
                 })
             elif isinstance(row, (list, tuple)):
+                # Skip header-like rows
+                if len(row) >= 2 and row[0] == "name" and row[1] == "summary":
+                    continue
                 name = row[0] if len(row) > 0 else None
                 summary = row[1] if len(row) > 1 else None
                 attributes = row[2] if len(row) > 2 else {}
@@ -1788,7 +1809,10 @@ async def debug_graphiti_session_summaries(
                     "created_at": created_at,
                     "uuid": uuid
                 })
-        return {"count": len(summaries), "summaries": summaries}
+        response = {"count": len(summaries), "summaries": summaries, "graph_count": graph_count}
+        if not summaries:
+            response["raw_rows"] = rows
+        return response
     except Exception as e:
         logger.error(f"Debug graphiti session_summaries failed: {e}")
         raise HTTPException(status_code=500, detail="Debug graphiti session_summaries failed")
