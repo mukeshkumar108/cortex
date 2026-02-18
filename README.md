@@ -119,6 +119,16 @@ OUTBOX_DRAIN_ENABLED=true
 docker compose exec synapse pytest -q
 ```
 
+## Backfill session summaries
+Create Graphiti `SessionSummary` nodes for existing sessions.
+```bash
+docker compose exec synapse python scripts/backfill_session_summaries.py \
+  --tenant-id tenant_a \
+  --user-id user_1 \
+  --limit 200
+```
+Use `--dry-run` to preview and `--force` to overwrite existing summaries.
+
 ## Internal debug endpoints
 Require header `X-Internal-Token` = `INTERNAL_TOKEN`.
 - `/internal/debug/session?tenantId&userId&sessionId`
