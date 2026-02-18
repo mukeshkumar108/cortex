@@ -40,13 +40,25 @@ async def _summary_exists(driver: Any, group_id: str, session_id: str) -> bool:
         """
         MATCH (n:SessionSummary {group_id: $group_id})
         WHERE n.attributes.session_id = $session_id
-        RETURN n
+        RETURN n.uuid AS uuid
         LIMIT 1
         """,
         group_id=group_id,
         session_id=session_id
     )
-    return bool(rows)
+    if not rows:
+        return False
+    for row in rows:
+        # Falkor may return header-like rows
+        if isinstance(row, dict):
+            value = row.get("uuid")
+            if value and value != "uuid":
+                return True
+        elif isinstance(row, (list, tuple)) and row:
+            value = row[0]
+            if value and value != "uuid":
+                return True
+    return False
 
 
 async def run(args: argparse.Namespace) -> int:
