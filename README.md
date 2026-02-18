@@ -130,6 +130,24 @@ docker compose exec synapse python scripts/backfill_session_summaries.py \
 ```
 Use `--dry-run` to preview and `--force` to overwrite existing summaries.
 
+## Backfill bridge_text
+Create/refresh `bridge_text` for SessionSummary nodes.
+```bash
+docker compose exec synapse python scripts/backfill_bridge_text.py \
+  --tenant-id tenant_a \
+  --user-id user_1
+```
+Use `--dry-run` to preview and `--force` to overwrite existing bridge_text.
+
+## Force close open sessions
+Close any open sessions still in `session_buffer` (legacy).
+```bash
+docker compose exec synapse python scripts/force_close_sessions.py \
+  --limit 100 \
+  --tenant-id tenant_a \
+  --user-id user_1
+```
+
 ## Internal debug endpoints
 Require header `X-Internal-Token` = `INTERNAL_TOKEN`.
 - `/internal/debug/session?tenantId&userId&sessionId`
