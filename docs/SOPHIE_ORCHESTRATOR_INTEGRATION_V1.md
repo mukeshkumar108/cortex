@@ -116,6 +116,7 @@ Example response:
 ```
 Notes:
 - `bridgeText` is fact‑only, <= 280 chars, and excludes environment/observation by default.
+- `bridgeText` is sourced from the latest Graphiti `SessionSummary` node (fallback: legacy episode summary).
 - Items come primarily from Postgres loops (salience + recency), with optional unresolved tensions from Graphiti.
 - `timeGapHuman` is derived from session/message timestamps when available, otherwise Graphiti episode time.
 - `timeOfDayLabel` uses `timezone` when provided (fallback UTC).
