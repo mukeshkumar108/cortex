@@ -26,6 +26,7 @@ from .config import get_settings
 from .db import Database
 from .graphiti_client import GraphitiClient
 from . import session
+from . import loops
 from .ingestion import ingest as process_ingest
 from .briefing import build_briefing
 from .migrate import run_migrations
@@ -463,6 +464,8 @@ async def lifespan(app: FastAPI):
         # Initialize managers
         session.init_session_manager(db)
         logger.info("Session manager initialized")
+        loops.init_loop_manager(db)
+        logger.info("Loop manager initialized")
 
         settings = get_settings()
         if settings.idle_close_enabled:

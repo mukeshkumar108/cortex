@@ -104,6 +104,7 @@ Stores the turn in the session transcript and buffer.
 
 ### POST /session/close
 Use after inactivity to flush raw transcript to Graphiti.
+Also performs best‑effort loop extraction (commitments/decisions/frictions/habits/threads) into Postgres.
 
 **Request**
 ```json

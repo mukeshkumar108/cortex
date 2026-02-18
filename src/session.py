@@ -23,6 +23,7 @@ from .db import Database
 from .models import Message
 from .config import get_settings
 from .openrouter_client import get_llm_client
+from . import loops
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +245,56 @@ class SessionManager:
             turn["text"],
             ts
         )
+
+    @staticmethod
+    def _parse_ts(value: Any) -> Optional[datetime]:
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            dt = value
+        elif isinstance(value, str):
+            try:
+                dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except Exception:
+                return None
+        else:
+            return None
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return dt
+
+    async def _get_full_transcript_messages(
+        self,
+        tenant_id: str,
+        session_id: str,
+        user_id: str,
+        buffer: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        transcript = await self.db.fetchone(
+            """
+            SELECT messages
+            FROM session_transcript
+            WHERE tenant_id = $1 AND session_id = $2
+            """,
+            tenant_id,
+            session_id
+        )
+        transcript_messages = transcript.get("messages") if transcript else []
+        if isinstance(transcript_messages, str):
+            try:
+                transcript_messages = json.loads(transcript_messages)
+            except Exception:
+                transcript_messages = []
+
+        if buffer is None:
+            buffer = await self.get_or_create_buffer(tenant_id, session_id, user_id)
+
+        full_messages: List[Dict[str, Any]] = []
+        if isinstance(transcript_messages, list):
+            full_messages.extend(transcript_messages)
+        if isinstance(buffer.get("messages"), list):
+            full_messages.extend(buffer["messages"])
+        return full_messages
 
     async def get_outbox_count(
         self,
@@ -966,6 +1017,50 @@ Do not include filler or meta-commentary."""
                 ended_at=ended_at
             )
 
+            # 2b. Extract loops from full session transcript (best-effort)
+            try:
+                if persona_id:
+                    full_messages = await self._get_full_transcript_messages(
+                        tenant_id=tenant_id,
+                        session_id=session_id,
+                        user_id=user_id,
+                        buffer=buffer
+                    )
+                    if full_messages:
+                        last_user_text = next(
+                            (m.get("text") for m in reversed(full_messages) if m.get("role") == "user" and m.get("text")),
+                            None
+                        )
+                        if not last_user_text:
+                            last_user_text = full_messages[-1].get("text") if full_messages[-1].get("text") else ""
+
+                        ts_values = [self._parse_ts(m.get("timestamp")) for m in full_messages]
+                        ts_values = [t for t in ts_values if t]
+                        start_ts = min(ts_values) if ts_values else None
+                        end_ts = max(ts_values) if ts_values else ended_at
+
+                        provenance = {
+                            "session_id": session_id,
+                            "start_ts": start_ts.isoformat() if start_ts else None,
+                            "end_ts": end_ts.isoformat() if end_ts else None
+                        }
+
+                        if last_user_text:
+                            await loops.extract_and_create_loops(
+                                tenant_id=tenant_id,
+                                user_id=user_id,
+                                persona_id=persona_id,
+                                user_text=last_user_text,
+                                recent_turns=full_messages,
+                                source_turn_ts=end_ts or datetime.utcnow(),
+                                session_id=session_id,
+                                provenance=provenance
+                            )
+                else:
+                    logger.info(f"Skipping loop extraction (missing persona_id) for session {session_id}")
+            except Exception as e:
+                logger.error(f"Loop extraction on session close failed: {e}")
+
             # 3. Mark session closed and clear messages
             query = """
                 UPDATE session_buffer
@@ -1040,28 +1135,13 @@ Do not include filler or meta-commentary."""
         ended_at: Optional[datetime] = None
     ) -> None:
         try:
-            transcript = await self.db.fetchone(
-                """
-                SELECT messages
-                FROM session_transcript
-                WHERE tenant_id = $1 AND session_id = $2
-                """,
-                tenant_id,
-                session_id
-            )
-            transcript_messages = transcript.get("messages") if transcript else []
-            if isinstance(transcript_messages, str):
-                try:
-                    transcript_messages = json.loads(transcript_messages)
-                except Exception:
-                    transcript_messages = []
-
             buffer = await self.get_or_create_buffer(tenant_id, session_id, user_id)
-            full_messages = []
-            if isinstance(transcript_messages, list):
-                full_messages.extend(transcript_messages)
-            if isinstance(buffer.get("messages"), list):
-                full_messages.extend(buffer["messages"])
+            full_messages = await self._get_full_transcript_messages(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                user_id=user_id,
+                buffer=buffer
+            )
 
             if not full_messages:
                 return

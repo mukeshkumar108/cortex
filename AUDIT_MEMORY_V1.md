@@ -1,12 +1,13 @@
 # Synapse Memory Audit v1 (As-Built)
 
-Last updated: 2026-02-05
+Last updated: 2026-02-18
 
 ## 0) System definition (10 lines max)
 - Synapse is a FastAPI memory service with a sliding-window session buffer and Graphiti‑native semantic memory.
 - Postgres is the system of record for session_buffer, session_transcript, and graphiti_outbox (operational only).
 - Session buffer keeps rolling_summary + last 12 messages (6 user+assistant turns); evicted turns go to graphiti_outbox.
 - Background janitor/drain folds outbox rows into rolling_summary; raw transcripts are sent to Graphiti on session close.
+- Procedural loops are extracted at session close (best-effort) and stored in Postgres with provenance.
 - Graphiti is best-effort; failures never block /ingest or /brief.
 - Loop extraction is LLM-first and best-effort; procedural state lives in Postgres.
 - Tenant isolation uses composite group_id `f"{tenant_id}__{user_id}"` in Graphiti.
@@ -91,9 +92,10 @@ Last updated: 2026-02-05
 
 ## 6.5) Extraction responsibilities (who does what)
 - **Entities/edges/facts** are extracted by **Graphiti’s LLM pipeline**, not Synapse.
-- Synapse **only creates episodes** (session summaries by default, per-turn optional).
-- Postgres stores **operational memory only** (sessions, transcripts, outbox).
-- **We do not mirror entities/edges in Postgres**; they remain in Graphiti and are queried on demand.
+- Synapse creates Graphiti episodes (session summaries by default, per-turn optional).
+- **Loops** are extracted by Synapse’s LoopManager at **session close** and stored in Postgres.
+- Postgres stores operational memory (sessions, transcripts, outbox) plus procedural loops.
+- We do not mirror Graphiti entities/edges in Postgres; they remain in Graphiti and are queried on demand.
 
 ## 6.6) Graphiti narrative entities (what /session/brief uses)
 **Custom entity types**
@@ -116,7 +118,7 @@ Last updated: 2026-02-05
 - Sliding window invariant (<=12) and outbox behaviors
 - Outbox error classification + backoff
 - Session close flush + local summary + raw transcript episode
-- Loop creation/reinforcement/completion/drop (LLM-first)
+- Loop extraction on session close + provenance metadata (LLM-first)
 - Nudge candidates behavior
 - Ingest session_id auto-create + metadata fallback
 

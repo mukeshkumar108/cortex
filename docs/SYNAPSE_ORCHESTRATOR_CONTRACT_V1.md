@@ -193,6 +193,8 @@ Public close endpoint to flush raw transcript to Graphiti.
 
 Notes:
 - If `sessionId` is omitted, Synapse closes the most recent open session for the user.
+- On close, Synapse sends the raw transcript to Graphiti and performs best‑effort loop extraction
+  (commitments/decisions/frictions/habits/threads) into Postgres with provenance metadata.
 
 ---
 

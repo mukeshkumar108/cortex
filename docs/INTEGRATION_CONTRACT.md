@@ -70,6 +70,10 @@ This doc is a concise API contract for external clients (e.g., Sophie orchestrat
 **Failure modes**
 - `500` on unexpected server errors.
 
+Notes:
+- `/brief` does not return procedural loops; `activeLoops` is empty in the current implementation.
+- Procedural loop extraction happens on `/session/close` and is stored in Postgres.
+
 ---
 
 ### POST /ingest
@@ -270,6 +274,8 @@ Notes:
 
 Notes:
 - If `sessionId` is omitted, Synapse closes the most recent open session for the user.
+- On close, Synapse sends the raw transcript to Graphiti and performs best‑effort loop extraction
+  (commitments/decisions/frictions/habits/threads) into Postgres with provenance metadata.
 
 ---
 

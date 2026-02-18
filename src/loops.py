@@ -279,7 +279,8 @@ class LoopManager:
         user_text: str,
         recent_turns: List[Dict[str, Any]],
         source_turn_ts: datetime,
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
+        provenance: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Extract loops from conversation context using LLM.
@@ -427,7 +428,11 @@ class LoopManager:
                     due_date=due_date,
                     entity_refs=entity_refs,
                     tags=tags,
-                    metadata={"dedupe_key": dedupe_key, "reason": reason}
+                    metadata={
+                        "dedupe_key": dedupe_key,
+                        "reason": reason,
+                        "provenance": provenance or {}
+                    }
                 )
                 new_loop_count += 1
 
@@ -878,11 +883,19 @@ async def extract_and_create_loops(
     user_text: str,
     recent_turns: List[Dict[str, Any]],
     source_turn_ts: datetime,
-    session_id: Optional[str] = None
+    session_id: Optional[str] = None,
+    provenance: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """Extract and create loops from conversation context"""
     if _manager is None:
         raise RuntimeError("LoopManager not initialized")
     return await _manager.extract_and_create_loops(
-        tenant_id, user_id, persona_id, user_text, recent_turns, source_turn_ts, session_id
+        tenant_id,
+        user_id,
+        persona_id,
+        user_text,
+        recent_turns,
+        source_turn_ts,
+        session_id,
+        provenance
     )
