@@ -25,6 +25,8 @@ Call `/memory/query` for targeted questions when needed:
 - “What is the user worried about?”
 - “Any pending tasks?”
 
+Call `/memory/loops` when you need prioritized procedural loops directly (commitments/habits/frictions/threads/decisions), optionally filtered by domain.
+
 ### 2b) Start‑brief (optional)
 Call `/session/brief` to get a short narrative start‑brief derived from Graphiti’s
 custom entities (MentalState, Tension, Environment).
@@ -42,6 +44,17 @@ Returns temporal authority + working memory + rolling summary.
 
 ### POST /memory/query (Graphiti)
 Returns facts/entities for a natural‑language query.
+Exact request payload:
+```json
+{
+  "tenantId": "string",
+  "userId": "string",
+  "query": "string",
+  "limit": 10,
+  "referenceTime": "ISO-8601 string (optional)",
+  "includeContext": false
+}
+```
 Example response:
 ```json
 {
@@ -49,25 +62,94 @@ Example response:
     "User is at the gym",
     "Launch is scheduled for Friday 9 AM"
   ],
-  "openLoops": ["blue-widget-glitch"],
-  "commitments": ["I will send the demo notes tomorrow"],
-  "contextAnchors": {
-    "timeOfDayLabel": "AFTERNOON",
-    "timeGapDescription": null,
-    "lastInteraction": "2026-02-06T10:14:30Z",
-    "sessionId": "session-abc"
-  },
-  "userStatedState": "I feel anxious about the demo",
-  "currentFocus": "I'm focused on stabilizing the release pipeline",
-  "recallSheet": "FACTS:\n- User is at the gym\n- Launch is scheduled for Friday 9 AM\nOPEN_LOOPS:\n- blue-widget-glitch\nCOMMITMENTS:\n- I will send the demo notes tomorrow\nCONTEXT_ANCHORS:\n- timeOfDayLabel: AFTERNOON\n- lastInteraction: 2026-02-06T10:14:30Z\n- sessionId: session-abc\nUSER_STATED_STATE:\n- I feel anxious about the demo\nCURRENT_FOCUS:\n- I'm focused on stabilizing the release pipeline",
+  "factItems": [
+    {"text": "User is at the gym", "relevance": null, "source": "graphiti"},
+    {"text": "Launch is scheduled for Friday 9 AM", "relevance": null, "source": "graphiti"}
+  ],
   "entities": [
     {"summary": "gym", "type": "Environment", "uuid": "..."},
-    {"summary": "blue-widget-glitch", "type": "Tension", "uuid": "..."},
-    {"summary": "I'm focused on stabilizing the release pipeline", "type": "UserFocus", "uuid": "..."}
+    {"summary": "release pipeline", "type": "Project", "uuid": "..."}
   ],
-  "metadata": {"query": "What is the user stressed about?", "facts": 3, "entities": 3}
+  "metadata": {"query": "What is the user stressed about?", "responseMode": "recall", "facts": 2, "entities": 2, "limit": 10}
 }
 ```
+Compatibility mode:
+- Set `includeContext=true` to include `openLoops`, `commitments`, `contextAnchors`, `userStatedState`, `currentFocus`, `recallSheet`, `supplementalContext`.
+
+### GET /memory/loops
+Returns prioritized active loops (procedural memory) without Graphiti semantic context noise.
+
+Request shape (query params):
+```
+tenantId=<string>&userId=<string>&limit=<optional>&personaId=<optional>&domain=<optional>
+```
+Note: loops are user-scoped memory. `personaId` is compatibility-only and ignored for retrieval.
+
+Example response:
+```json
+{
+  "items": [
+    {
+      "id": "uuid",
+      "type": "thread",
+      "text": "Complete portfolio refresh and model rollout",
+      "status": "active|needs_review",
+      "salience": 5,
+      "timeHorizon": "ongoing",
+      "dueDate": null,
+      "lastSeenAt": "2026-02-18T14:49:19.144334+00:00",
+      "domain": "career",
+      "importance": 5,
+      "urgency": 3,
+      "tags": ["portfolio", "rollout"],
+      "personaId": null
+    }
+  ],
+  "metadata": {"count": 1, "limit": 10, "sort": "priority_desc", "domainFilter": null, "personaId": null, "scope": "user"}
+}
+```
+Loop lifecycle notes:
+- `today` loops older than 48h and `this_week` loops older than 10d auto-transition to `stale` and are not returned.
+- `ongoing` loops older than 21d transition to `needs_review` and are still returned.
+
+### GET /user/model
+Returns persistent synthesized user model + completeness scores.
+
+Request shape (query params):
+```
+tenantId=<string>&userId=<string>
+```
+
+Key response fields:
+- `model.north_star` per-domain object:
+  - domains: `relationships|work|health|spirituality|general`
+  - each domain has `vision`, `goal`, `status` (`active|inactive|unknown`)
+  - plus confidence/source metadata for vision/goal
+- `completenessScore`: `{relationships, work, north_star, health, spirituality, general}` 0-100
+- `metadata.staleness`: per-field stale flags based on `updated_at` (`21d` default, `current_focus` after `10d`)
+- `version`, `lastSource`, timestamps
+
+### GET /analysis/daily
+Returns nightly synthesis for user-level steering.
+
+Request shape (query params):
+```
+tenantId=<string>&userId=<string>&date=<optional YYYY-MM-DD>
+```
+
+Key response fields:
+- `themes`: dominant emotional/cognitive themes (not task lists)
+- `scores`: `curiosity|warmth|usefulness|forward_motion` on 1-5 scale
+- `steeringNote`: one sentence for tomorrow session steering
+- `exists`: `false` when no row exists yet
+
+Runtime usage:
+- Pull at session start and cache by `(tenantId,userId,sessionId)`.
+- Inject only domains above your threshold (for example `>= 40`) as concise natural lines.
+- Prefer `source=user_stated` over inferred when selecting relationship/pattern highlights.
+- Background updater semantics:
+  - writes `north_star.*.goal` from loops/sessions (low confidence when inferred)
+  - writes `north_star.*.vision` only from explicit user-stated signals (high confidence)
 
 ### GET /session/brief
 Returns a structured start‑brief:
@@ -102,6 +184,29 @@ Example response:
 
 ### GET /session/startbrief
 Returns a minimal start‑brief (small bridge + durable items).
+Exact request shape (query params):
+```
+tenantId=<string>&userId=<string>&now=<ISO-8601 optional>&sessionId=<optional>&personaId=<optional>&timezone=<IANA optional>
+```
+Exact response payload shape:
+```json
+{
+  "timeOfDayLabel": "MORNING|AFTERNOON|EVENING|NIGHT|null",
+  "timeGapHuman": "string|null",
+  "bridgeText": "string|null",
+  "items": [
+    {
+      "kind": "loop|tension",
+      "text": "string",
+      "type": "string|null",
+      "timeHorizon": "string|null",
+      "dueDate": "ISO-8601 string|null",
+      "salience": "number|null",
+      "lastSeenAt": "ISO-8601 string|null"
+    }
+  ]
+}
+```
 Example response:
 ```json
 {
@@ -116,6 +221,8 @@ Example response:
 ```
 Notes:
 - `bridgeText` is fact‑only, <= 280 chars, and excludes environment/observation by default.
+- `bridgeText` may be prefixed with one steering line from latest prior daily analysis:
+  - `Steering note: ...`
 - `bridgeText` is sourced from the latest Graphiti `SessionSummary` node (fallback: legacy episode summary).
 - Items come primarily from Postgres loops (salience + recency), with optional unresolved tensions from Graphiti.
 - `timeGapHuman` is derived from session/message timestamps when available, otherwise Graphiti episode time.
@@ -159,7 +266,8 @@ Use if Sophie stores working memory locally and only sends full transcripts.
 ```
 Notes:
 - `/session/ingest` sends the full transcript to Graphiti as one episode.
-- Synapse also creates a `SessionSummary` node and precomputes `bridge_text` for startbrief.
+- Synapse also creates/replaces a canonical `SessionSummary` node for `(group_id, session_id)` and precomputes `bridge_text` for startbrief.
+- Session summaries are generated from the full transcript with fallback tiers (`llm_primary`, `llm_repair`, `deterministic_fallback`) so summary/bridge are always non-empty.
 ## Failure behavior
 - Graphiti down → /brief and /ingest still succeed.
 - Memory query fails → orchestrator proceeds without semantic memory.

@@ -21,8 +21,19 @@ from .openrouter_client import get_llm_client
 logger = logging.getLogger(__name__)
 
 LOOP_TYPES = {"commitment", "decision", "friction", "habit", "thread"}
-LOOP_STATUSES = {"active", "completed", "dropped", "snoozed"}
+LOOP_STATUSES = {"active", "completed", "dropped", "snoozed", "stale", "needs_review"}
 TIME_HORIZONS = {"today", "this_week", "ongoing"}
+LOOP_DOMAINS = {
+    "general",
+    "health",
+    "career",
+    "relationships",
+    "family",
+    "finance",
+    "home",
+    "learning",
+    "spirituality",
+}
 
 
 class LoopManager:
@@ -31,6 +42,136 @@ class LoopManager:
         self.settings = get_settings()
         self.openai_client = openai.OpenAI(api_key=self.settings.openai_api_key)
         self.llm_client = get_llm_client()
+
+    @staticmethod
+    def _staleness_target_status(
+        time_horizon: Optional[str],
+        last_seen_at: Optional[datetime],
+        now: Optional[datetime] = None
+    ) -> Optional[str]:
+        if not time_horizon or not last_seen_at:
+            return None
+        horizon = str(time_horizon).lower().strip()
+        now_dt = now or datetime.utcnow()
+        age = now_dt - last_seen_at
+        if horizon == "today" and age.total_seconds() > 48 * 3600:
+            return "stale"
+        if horizon == "this_week" and age.total_seconds() > 10 * 24 * 3600:
+            return "stale"
+        if horizon == "ongoing" and age.total_seconds() > 21 * 24 * 3600:
+            return "needs_review"
+        return None
+
+    async def apply_staleness_policy(self, tenant_id: str, user_id: str) -> None:
+        """
+        Apply loop staleness policy for a user.
+
+        - today > 48h without reinforcement: stale
+        - this_week > 10d without reinforcement: stale
+        - ongoing > 21d without reinforcement: needs_review
+        """
+        try:
+            await self.db.execute(
+                """
+                UPDATE loops
+                SET status = 'stale',
+                    updated_at = NOW()
+                WHERE tenant_id = $1
+                  AND user_id = $2
+                  AND status IN ('active', 'needs_review')
+                  AND time_horizon = 'today'
+                  AND COALESCE(last_seen_at, updated_at, created_at) < NOW() - INTERVAL '48 hours'
+                """,
+                tenant_id,
+                user_id
+            )
+
+            await self.db.execute(
+                """
+                UPDATE loops
+                SET status = 'stale',
+                    updated_at = NOW()
+                WHERE tenant_id = $1
+                  AND user_id = $2
+                  AND status IN ('active', 'needs_review')
+                  AND time_horizon = 'this_week'
+                  AND COALESCE(last_seen_at, updated_at, created_at) < NOW() - INTERVAL '10 days'
+                """,
+                tenant_id,
+                user_id
+            )
+
+            await self.db.execute(
+                """
+                UPDATE loops
+                SET status = 'needs_review',
+                    updated_at = NOW()
+                WHERE tenant_id = $1
+                  AND user_id = $2
+                  AND status = 'active'
+                  AND time_horizon = 'ongoing'
+                  AND COALESCE(last_seen_at, updated_at, created_at) < NOW() - INTERVAL '21 days'
+                """,
+                tenant_id,
+                user_id
+            )
+        except Exception as e:
+            logger.error(f"Failed to apply loop staleness policy: {e}")
+
+    async def apply_global_staleness_policy(self) -> Dict[str, int]:
+        """
+        Apply loop staleness policy across all users.
+        Returns count of updated rows by status transition.
+        """
+        counts = {"stale_today": 0, "stale_this_week": 0, "needs_review_ongoing": 0}
+        try:
+            counts["stale_today"] = int(await self.db.fetchval(
+                """
+                WITH updated AS (
+                    UPDATE loops
+                    SET status = 'stale',
+                        updated_at = NOW()
+                    WHERE status IN ('active', 'needs_review')
+                      AND time_horizon = 'today'
+                      AND COALESCE(last_seen_at, updated_at, created_at) < NOW() - INTERVAL '48 hours'
+                    RETURNING 1
+                )
+                SELECT COUNT(*) FROM updated
+                """
+            ) or 0)
+
+            counts["stale_this_week"] = int(await self.db.fetchval(
+                """
+                WITH updated AS (
+                    UPDATE loops
+                    SET status = 'stale',
+                        updated_at = NOW()
+                    WHERE status IN ('active', 'needs_review')
+                      AND time_horizon = 'this_week'
+                      AND COALESCE(last_seen_at, updated_at, created_at) < NOW() - INTERVAL '10 days'
+                    RETURNING 1
+                )
+                SELECT COUNT(*) FROM updated
+                """
+            ) or 0)
+
+            counts["needs_review_ongoing"] = int(await self.db.fetchval(
+                """
+                WITH updated AS (
+                    UPDATE loops
+                    SET status = 'needs_review',
+                        updated_at = NOW()
+                    WHERE status = 'active'
+                      AND time_horizon = 'ongoing'
+                      AND COALESCE(last_seen_at, updated_at, created_at) < NOW() - INTERVAL '21 days'
+                    RETURNING 1
+                )
+                SELECT COUNT(*) FROM updated
+                """
+            ) or 0)
+        except Exception as e:
+            logger.error(f"Failed to apply global loop staleness policy: {e}")
+        return counts
 
     async def create_loop(
         self,
@@ -115,6 +256,7 @@ class LoopManager:
     ) -> List[Loop]:
         """Get active loops"""
         try:
+            await self.apply_staleness_policy(tenant_id, user_id)
             query = """
                 SELECT id, type, status, text, confidence, salience, time_horizon,
                        source_turn_ts, due_date, entity_refs, tags,
@@ -123,7 +265,7 @@ class LoopManager:
                 WHERE tenant_id = $1
                     AND user_id = $2
                     AND persona_id = $3
-                    AND status = 'active'
+                    AND status IN ('active', 'needs_review')
                 ORDER BY last_seen_at DESC
                 LIMIT $4
             """
@@ -164,6 +306,7 @@ class LoopManager:
     ) -> List[Loop]:
         """Get active loops without persona filter"""
         try:
+            await self.apply_staleness_policy(tenant_id, user_id)
             query = """
                 SELECT id, type, status, text, confidence, salience, time_horizon,
                        source_turn_ts, due_date, entity_refs, tags,
@@ -171,7 +314,7 @@ class LoopManager:
                 FROM loops
                 WHERE tenant_id = $1
                     AND user_id = $2
-                    AND status = 'active'
+                    AND status IN ('active', 'needs_review')
                 ORDER BY last_seen_at DESC
                 LIMIT $3
             """
@@ -207,9 +350,11 @@ class LoopManager:
         limit: int = 5,
         persona_id: Optional[str] = None
     ) -> List[Loop]:
-        """Get top loops by salience/recency for start-brief."""
+        """Get top loops by weighted relevance for start-brief."""
         try:
+            await self.apply_staleness_policy(tenant_id, user_id)
             rows = []
+            fetch_limit = max(limit * 4, 20)
             if persona_id:
                 persona_query = """
                     SELECT id, type, status, text, confidence, salience, time_horizon,
@@ -219,14 +364,14 @@ class LoopManager:
                     WHERE tenant_id = $1
                         AND user_id = $2
                         AND persona_id = $3
-                        AND status = 'active'
+                        AND status IN ('active', 'needs_review')
                     ORDER BY
                         salience DESC NULLS LAST,
                         last_seen_at DESC NULLS LAST,
                         updated_at DESC NULLS LAST
                     LIMIT $4
                 """
-                rows = await self.db.fetch(persona_query, tenant_id, user_id, persona_id, limit)
+                rows = await self.db.fetch(persona_query, tenant_id, user_id, persona_id, fetch_limit)
 
             if not rows:
                 query = """
@@ -236,14 +381,14 @@ class LoopManager:
                     FROM loops
                     WHERE tenant_id = $1
                         AND user_id = $2
-                        AND status = 'active'
+                        AND status IN ('active', 'needs_review')
                     ORDER BY
                         salience DESC NULLS LAST,
                         last_seen_at DESC NULLS LAST,
                         updated_at DESC NULLS LAST
                     LIMIT $3
                 """
-                rows = await self.db.fetch(query, tenant_id, user_id, limit)
+                rows = await self.db.fetch(query, tenant_id, user_id, fetch_limit)
             loops = []
             for row in rows:
                 loops.append(Loop(
@@ -263,7 +408,16 @@ class LoopManager:
                     lastSeenAt=row['last_seen_at'].isoformat() if row.get('last_seen_at') else None,
                     metadata=row['metadata']
                 ))
-            return loops
+            loops.sort(
+                key=lambda loop: (
+                    self._loop_priority_score(loop),
+                    loop.lastSeenAt or "",
+                    loop.updatedAt or "",
+                    str(loop.id)
+                ),
+                reverse=True
+            )
+            return loops[:limit]
         except Exception as e:
             logger.error(f"Failed to get top loops for startbrief: {e}")
             return []
@@ -283,7 +437,7 @@ class LoopManager:
                 FROM loops
                 WHERE tenant_id = $1
                   AND user_id = $2
-                  AND status = 'active'
+                  AND status IN ('active', 'needs_review')
                 ORDER BY last_seen_at DESC
             """
             rows = await self.db.fetch(query, tenant_id, user_id)
@@ -387,6 +541,8 @@ class LoopManager:
                 "- type=\"decision\": must be a stable choice that affects future actions.\n"
                 "- \"text\" must be <= 12 words and start with a verb where possible.\n"
                 "- \"reason\" max 12 words.\n\n"
+                "- Add domain from: general|health|career|relationships|family|finance|home|learning|spirituality.\n"
+                "- Set importance 1-5 (long-term significance), urgency 1-5 (time pressure).\n\n"
                 "INPUT:\n"
                 f"- current_user_turn: {user_text}\n"
                 f"- recent_context (last 1-2 turns):\n{recent_context}\n"
@@ -398,7 +554,9 @@ class LoopManager:
                 '  "new_loops": [\n'
                 '    {"type": "commitment|decision|friction|habit|thread", "text": "...", "confidence": 0-1, '
                 '"salience": 1-5, "time_horizon": "today|this_week|ongoing", '
-                '"due_date": "YYYY-MM-DD" | null, "entity_refs": ["..."], "tags": ["..."], "reason": "max 12 words"}\n'
+                '"due_date": "YYYY-MM-DD" | null, "importance": 1-5, "urgency": 1-5, '
+                '"domain": "general|health|career|relationships|family|finance|home|learning|spirituality", '
+                '"entity_refs": ["..."], "tags": ["..."], "reason": "max 12 words"}\n'
                 "  ],\n"
                 '  "reinforced_loops": [ {"loop_id": "...", "confidence": 0-1, "reason": "max 12 words"} ],\n'
                 '  "completed_loops": [ {"loop_id": "...", "confidence": 0-1, "reason": "max 12 words", '
@@ -458,6 +616,9 @@ class LoopManager:
                 entity_refs = loop.get("entity_refs") or []
                 tags = loop.get("tags") or []
                 reason = loop.get("reason")
+                importance = self._coerce_1_to_5(loop.get("importance"), default=salience)
+                urgency = self._coerce_1_to_5(loop.get("urgency"), default=self._default_urgency(time_horizon))
+                domain = self._normalize_domain(loop.get("domain"))
 
                 if loop_type not in LOOP_TYPES:
                     continue
@@ -499,6 +660,9 @@ class LoopManager:
                     metadata={
                         "dedupe_key": dedupe_key,
                         "reason": reason,
+                        "domain": domain,
+                        "importance": importance,
+                        "urgency": urgency,
                         "provenance": provenance or {}
                     }
                 )
@@ -619,6 +783,43 @@ class LoopManager:
     def _normalize_loop_text(text: str) -> str:
         return " ".join(text.strip().lower().split())
 
+    @staticmethod
+    def _coerce_1_to_5(value: Any, default: int = 3) -> int:
+        try:
+            n = int(value)
+        except Exception:
+            n = int(default)
+        return max(1, min(5, n))
+
+    @staticmethod
+    def _default_urgency(time_horizon: str) -> int:
+        mapping = {
+            "today": 5,
+            "this_week": 3,
+            "ongoing": 2
+        }
+        return mapping.get((time_horizon or "").lower().strip(), 3)
+
+    @staticmethod
+    def _normalize_domain(value: Any) -> str:
+        domain = str(value or "").strip().lower()
+        if domain in LOOP_DOMAINS:
+            return domain
+        return "general"
+
+    def _loop_priority_score(self, loop: Loop) -> float:
+        metadata = loop.metadata or {}
+        importance = self._coerce_1_to_5(metadata.get("importance"), default=loop.salience or 3)
+        urgency = self._coerce_1_to_5(metadata.get("urgency"), default=self._default_urgency(loop.timeHorizon or "ongoing"))
+        salience = self._coerce_1_to_5(loop.salience, default=3)
+        domain = self._normalize_domain(metadata.get("domain"))
+        status = (loop.status or "active").lower()
+
+        # Keep domain bias minimal so we don't overfit labels.
+        domain_bonus = 0.1 if domain != "general" else 0.0
+        review_penalty = -1.0 if status == "needs_review" else 0.0
+        return (salience * 2.0) + (importance * 2.0) + (urgency * 1.5) + domain_bonus + review_penalty
+
     async def _find_active_loop_by_text(
         self,
         tenant_id: str,
@@ -633,7 +834,7 @@ class LoopManager:
                 WHERE tenant_id = $1
                   AND user_id = $2
                   AND type = $3
-                  AND status = 'active'
+                  AND status IN ('active', 'needs_review')
                   AND lower(text) = $4
                 LIMIT 1
             """
@@ -647,6 +848,7 @@ class LoopManager:
         query = """
             UPDATE loops
             SET salience = LEAST(5, COALESCE(salience, 1) + 1),
+                status = 'active',
                 last_seen_at = NOW(),
                 updated_at = NOW()
             WHERE id = $1
@@ -979,3 +1181,10 @@ async def extract_and_create_loops(
         session_id,
         provenance
     )
+
+
+async def apply_global_staleness_policy() -> Dict[str, int]:
+    """Apply staleness policy across all loops."""
+    if _manager is None:
+        raise RuntimeError("LoopManager not initialized")
+    return await _manager.apply_global_staleness_policy()

@@ -16,9 +16,11 @@ def extract_node_dicts(row: Any, required_keys: Optional[Iterable[str]] = None) 
     nodes: List[Dict[str, Any]] = []
 
     def _normalize(d: Dict[str, Any]) -> Dict[str, Any]:
-        # Some drivers wrap node properties under "properties"
+        # Some drivers wrap node properties under "properties" or "props"
         if isinstance(d.get("properties"), dict):
             return d["properties"]
+        if isinstance(d.get("props"), dict):
+            return d["props"]
         return d
 
     def _is_header(d: Dict[str, Any]) -> bool:
@@ -41,14 +43,22 @@ def extract_node_dicts(row: Any, required_keys: Optional[Iterable[str]] = None) 
         # If row is already a node dict
         if _accept(row):
             nodes.append(_normalize(row))
-        # If row values are node dicts
+        # If row values are node dicts or nested rows
         for value in row.values():
             if isinstance(value, dict) and _accept(value):
                 nodes.append(_normalize(value))
+            elif isinstance(value, (list, tuple)):
+                for nested in value:
+                    if isinstance(nested, dict) and _accept(nested):
+                        nodes.append(_normalize(nested))
     elif isinstance(row, (list, tuple)):
         for value in row:
             if isinstance(value, dict) and _accept(value):
                 nodes.append(_normalize(value))
+            elif isinstance(value, (list, tuple)):
+                for nested in value:
+                    if isinstance(nested, dict) and _accept(nested):
+                        nodes.append(_normalize(nested))
 
     return nodes
 

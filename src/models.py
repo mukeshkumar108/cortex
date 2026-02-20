@@ -115,19 +115,41 @@ class MemoryQueryRequest(BaseModel):
     query: str
     limit: Optional[int] = 10
     referenceTime: Optional[str] = None
+    includeContext: Optional[bool] = False
 
 
 class MemoryQueryResponse(BaseModel):
     facts: List[str] = []
-    openLoops: List[str] = []
-    commitments: List[str] = []
-    contextAnchors: Dict[str, Any] = {}
+    factItems: List[Fact] = []
+    entities: List[Entity] = []
+    openLoops: Optional[List[str]] = None
+    commitments: Optional[List[str]] = None
+    contextAnchors: Optional[Dict[str, Any]] = None
     userStatedState: Optional[str] = None
     currentFocus: Optional[str] = None
-    factItems: List[Fact] = []  # Backward compatibility
-    entities: List[Entity] = []
     recallSheet: Optional[str] = None
     supplementalContext: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+
+
+class MemoryLoopItem(BaseModel):
+    id: str
+    type: str
+    text: str
+    status: Optional[str] = None
+    salience: Optional[int] = None
+    timeHorizon: Optional[str] = None
+    dueDate: Optional[str] = None
+    lastSeenAt: Optional[str] = None
+    domain: Optional[str] = None
+    importance: Optional[int] = None
+    urgency: Optional[int] = None
+    tags: List[str] = []
+    personaId: Optional[str] = None
+
+
+class MemoryLoopsResponse(BaseModel):
+    items: List[MemoryLoopItem] = []
     metadata: Dict[str, Any] = {}
 
 
@@ -159,10 +181,12 @@ class SessionStartBriefItem(BaseModel):
 
 
 class SessionStartBriefResponse(BaseModel):
-    timeOfDayLabel: Optional[str] = None
-    timeGapHuman: Optional[str] = None
-    bridgeText: Optional[str] = None
-    items: List[SessionStartBriefItem] = []
+    handover_text: str
+    handover_depth: str
+    time_context: Dict[str, Any] = {}
+    resume: Dict[str, Any] = {}
+    ops_context: Dict[str, Any] = {}
+    evidence: Dict[str, Any] = {}
 
 
 class SessionCloseRequest(BaseModel):
@@ -191,3 +215,37 @@ class SessionIngestResponse(BaseModel):
 class PurgeUserRequest(BaseModel):
     tenantId: str
     userId: str
+
+
+class UserModelPatchRequest(BaseModel):
+    tenantId: str
+    userId: str
+    patch: Dict[str, Any]
+    source: Optional[str] = None
+
+
+class UserModelResponse(BaseModel):
+    tenantId: str
+    userId: str
+    model: Dict[str, Any]
+    completenessScore: Dict[str, int] = {}
+    metadata: Dict[str, Any] = {}
+    version: int = 0
+    exists: bool = False
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+    lastSource: Optional[str] = None
+
+
+class DailyAnalysisResponse(BaseModel):
+    tenantId: str
+    userId: str
+    analysisDate: Optional[str] = None
+    themes: List[str] = []
+    scores: Dict[str, int] = {}
+    steeringNote: Optional[str] = None
+    confidence: Optional[float] = None
+    exists: bool = False
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+    metadata: Dict[str, Any] = {}

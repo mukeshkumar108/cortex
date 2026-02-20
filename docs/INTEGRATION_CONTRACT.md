@@ -28,6 +28,26 @@ This doc is a concise API contract for external clients (e.g., Sophie orchestrat
 tenantId, userId, now (optional ISO timestamp), sessionId (optional), personaId (optional), timezone (optional)
 ```
 
+**Response JSON (exact shape)**
+```json
+{
+  "timeOfDayLabel": "MORNING|AFTERNOON|EVENING|NIGHT|null",
+  "timeGapHuman": "string|null",
+  "bridgeText": "string|null",
+  "items": [
+    {
+      "kind": "loop|tension",
+      "text": "string",
+      "type": "string|null",
+      "timeHorizon": "string|null",
+      "dueDate": "ISO-8601 string|null",
+      "salience": "number|null",
+      "lastSeenAt": "ISO-8601 string|null"
+    }
+  ]
+}
+```
+
 **Response JSON (example)**
 ```json
 {
@@ -43,6 +63,7 @@ tenantId, userId, now (optional ISO timestamp), sessionId (optional), personaId 
 
 Notes:
 - `bridgeText` is fact‑only, <= 280 chars, and excludes environment/observation by default.
+- `bridgeText` may be prefixed with a single `Steering note: ...` line from the latest prior daily analysis (typically yesterday).
 - `bridgeText` is sourced from the latest Graphiti `SessionSummary` node (fallback: legacy episode summary).
 - Items come primarily from Postgres loops (salience + recency), with optional unresolved tensions from Graphiti.
 - `timeGapHuman` is derived from session/message timestamps when available, otherwise Graphiti episode time.
@@ -196,45 +217,197 @@ Admin-only (requires `X-Admin-Key`):
 **Request JSON**
 ```json
 {
-  "tenantId": "tenant_a",
-  "userId": "user_1",
-  "query": "What happened earlier today?",
+  "tenantId": "string",
+  "userId": "string",
+  "query": "string",
   "limit": 10,
-  "referenceTime": "2026-02-04T18:00:00Z"
+  "referenceTime": "ISO-8601 string (optional)",
+  "includeContext": false
 }
 ```
 
-**Response JSON (example)**
+**Response JSON (default `includeContext=false`)**
 ```json
 {
   "facts": [
     "User is at the gym",
     "Launch is scheduled for Friday 9 AM"
   ],
-  "openLoops": ["blue-widget-glitch"],
-  "commitments": ["I will send the demo notes tomorrow"],
-  "contextAnchors": {
-    "timeOfDayLabel": "AFTERNOON",
-    "timeGapDescription": null,
-    "lastInteraction": "2026-02-06T10:14:30Z",
-    "sessionId": "session-abc"
-  },
-  "userStatedState": "I feel anxious about the demo",
-  "currentFocus": "I'm focused on stabilizing the release pipeline",
-  "recallSheet": "FACTS:\n- User is at the gym\n- Launch is scheduled for Friday 9 AM\nOPEN_LOOPS:\n- blue-widget-glitch\nCOMMITMENTS:\n- I will send the demo notes tomorrow\nCONTEXT_ANCHORS:\n- timeOfDayLabel: AFTERNOON\n- lastInteraction: 2026-02-06T10:14:30Z\n- sessionId: session-abc\nUSER_STATED_STATE:\n- I feel anxious about the demo\nCURRENT_FOCUS:\n- I'm focused on stabilizing the release pipeline",
-  "supplementalContext": "FACTS:\n- User is at the gym\n- Launch is scheduled for Friday 9 AM\nOPEN_LOOPS:\n- blue-widget-glitch\nCOMMITMENTS:\n- I will send the demo notes tomorrow\nCONTEXT_ANCHORS:\n- timeOfDayLabel: AFTERNOON\n- lastInteraction: 2026-02-06T10:14:30Z\n- sessionId: session-abc\nUSER_STATED_STATE:\n- I feel anxious about the demo\nCURRENT_FOCUS:\n- I'm focused on stabilizing the release pipeline",
   "factItems": [
     {"text": "User is at the gym", "relevance": null, "source": "graphiti"},
     {"text": "Launch is scheduled for Friday 9 AM", "relevance": null, "source": "graphiti"}
   ],
   "entities": [
     {"summary": "gym", "type": "Environment", "uuid": "..."},
-    {"summary": "blue-widget-glitch", "type": "Tension", "uuid": "..."},
-    {"summary": "I'm focused on stabilizing the release pipeline", "type": "UserFocus", "uuid": "..."}
+    {"summary": "release pipeline", "type": "Project", "uuid": "..."}
   ],
-  "metadata": {"query": "What is the user stressed about?", "facts": 3, "entities": 3}
+  "metadata": {"query": "What is the user stressed about?", "responseMode": "recall", "facts": 2, "entities": 2, "limit": 10}
 }
 ```
+
+Compatibility mode:
+- Set `includeContext=true` to include additional keys:
+`openLoops`, `commitments`, `contextAnchors`, `userStatedState`, `currentFocus`, `recallSheet`, `supplementalContext`.
+
+---
+
+### GET /memory/loops
+**Auth:** none (public endpoint)
+**Headers:** none
+
+**Request (query params)**
+```
+tenantId, userId, limit (optional, default 10, max 50), personaId (optional), domain (optional)
+```
+Note: loops are user-scoped memory. `personaId` is accepted for compatibility and ignored for retrieval.
+Staleness policy:
+- `today` loops older than 48h with no reinforcement become `stale` (excluded from responses).
+- `this_week` loops older than 10d with no reinforcement become `stale` (excluded from responses).
+- `ongoing` loops older than 21d with no reinforcement become `needs_review` (included in responses).
+
+**Response JSON (example)**
+```json
+{
+  "items": [
+    {
+      "id": "1e409763-8cce-452c-85e1-0bed626ebcce",
+      "type": "thread",
+      "text": "Complete portfolio refresh and model rollout",
+      "status": "active|needs_review",
+      "salience": 5,
+      "timeHorizon": "ongoing",
+      "dueDate": null,
+      "lastSeenAt": "2026-02-18T14:49:19.144334+00:00",
+      "domain": "career",
+      "importance": 5,
+      "urgency": 3,
+      "tags": ["portfolio", "rollout"],
+      "personaId": null
+    }
+  ],
+  "metadata": {
+    "count": 1,
+    "limit": 10,
+    "sort": "priority_desc",
+    "domainFilter": null,
+    "personaId": null,
+    "scope": "user"
+  }
+}
+```
+
+---
+
+### GET /user/model
+**Auth:** none (public endpoint)  
+**Headers:** none
+
+**Request (query params)**
+```
+tenantId, userId
+```
+
+**Response JSON (example)**
+```json
+{
+  "tenantId": "default",
+  "userId": "user_1",
+  "model": {
+    "north_star": {
+      "relationships": {"vision": null, "goal": null, "status": "unknown"},
+      "work": {
+        "vision": "Build products that meaningfully help people",
+        "goal": "Ship memory reliability improvements",
+        "status": "active",
+        "vision_confidence": 0.9,
+        "vision_source": "user_stated",
+        "goal_confidence": 0.55,
+        "goal_source": "inferred",
+        "updated_at": "2026-02-19T12:29:00Z"
+      },
+      "health": {"vision": null, "goal": "Get out of bed", "status": "active"},
+      "spirituality": {"vision": null, "goal": null, "status": "unknown"},
+      "general": {"vision": null, "goal": "Walk daily in morning", "status": "active"}
+    },
+    "current_focus": {"text": "Wake at 7, leave by 8", "source": "inferred", "confidence": 0.55},
+    "key_relationships": [{"name": "Ashley", "who": "partner", "status": "repairing", "confidence": 0.8}],
+    "work_context": {"text": "Clear kitchen worktop", "source": "inferred", "confidence": 0.55},
+    "patterns": [{"text": "Juggles multiple active commitments and threads", "source": "inferred", "confidence": 0.55}],
+    "preferences": {"tone": "direct and warm", "avoid": ["therapy voice"], "notes": []},
+    "health": {"text": "Get out of bed", "source": "inferred", "confidence": 0.55},
+    "spirituality": null
+  },
+  "completenessScore": {
+    "relationships": 94,
+    "work": 86,
+    "north_star": 90,
+    "health": 86,
+    "spirituality": 0,
+    "general": 94
+  },
+  "metadata": {
+    "staleness": {
+      "fields": {
+        "current_focus": {"updatedAt": "2026-01-20T10:00:00Z", "ageDays": 30, "thresholdDays": 10, "stale": true},
+        "north_star.work": {"updatedAt": "2026-02-10T10:00:00Z", "ageDays": 9, "thresholdDays": 21, "stale": false}
+      },
+      "stalePaths": ["current_focus"],
+      "hasStaleFields": true,
+      "thresholdDays": {"default": 21, "current_focus": 10}
+    }
+  },
+  "version": 9,
+  "exists": true,
+  "createdAt": "2026-02-19T11:58:33.890479+00:00",
+  "updatedAt": "2026-02-19T12:29:01.003303+00:00",
+  "lastSource": "auto_updater"
+}
+```
+
+**Updater behavior**
+- Background updater is enabled by default.
+- `north_star.*.goal` can be inferred from recent loops/sessions (low confidence).
+- `north_star.*.vision` is only written from explicit user-stated signals (high confidence).
+- Domain status is tri-state: `active|inactive|unknown`.
+
+---
+
+### GET /analysis/daily
+**Auth:** none (public endpoint)
+**Headers:** none
+
+**Request (query params)**
+```
+tenantId, userId, date (optional YYYY-MM-DD; defaults to latest available)
+```
+
+**Response JSON (example)**
+```json
+{
+  "tenantId": "default",
+  "userId": "user_1",
+  "analysisDate": "2026-02-18",
+  "themes": [
+    "Emotional pressure and self-regulation",
+    "Planning under cognitive load"
+  ],
+  "scores": {
+    "curiosity": 4,
+    "warmth": 4,
+    "usefulness": 3,
+    "forward_motion": 3
+  },
+  "steeringNote": "Lead with one grounded question, then offer one concrete next step tied to today's dominant tension.",
+  "confidence": 0.72,
+  "exists": true,
+  "createdAt": "2026-02-19T00:05:00Z",
+  "updatedAt": "2026-02-19T00:05:00Z",
+  "metadata": {"analysis_version": "v1", "turn_count": 92}
+}
+```
+Quality metadata:
+- `metadata.quality_flag = "insufficient_data"` when fewer than 3 turns were available for that day.
+- `metadata.quality_flag = "needs_review"` when confidence is low for 2+ consecutive analysis days.
 
 ---
 
@@ -346,11 +519,13 @@ Use this if you keep working memory locally and only send full transcripts.
 
 Notes:
 - `/session/ingest` sends the full transcript to Graphiti as one episode.
-- Synapse also creates a `SessionSummary` node and precomputes `bridge_text` for startbrief.
+- Synapse also creates/replaces a canonical `SessionSummary` node for `(group_id, session_id)` and precomputes `bridge_text` for startbrief.
+- Session summaries are generated from full transcripts with fallback tiers (`llm_primary`, `llm_repair`, `deterministic_fallback`) so summary/bridge are always non-empty.
 
 Operational note:
-- If historical SessionSummary nodes contain transcript-like text, use `scripts/redo_session_summaries.py`
-  to rewrite them into narrative recaps and regenerate `bridge_text`.
+- For historical data refresh, use:
+  `POST /internal/debug/backfill/session_summaries?tenantId=<...>&userId=<...>&limit=<...>&dryRun=true|false`
+  (internal-token protected), or `scripts/backfill_session_summaries.py`.
 
 ### Semantic Memory (Graphiti)
 - Facts/entities/episodes in Graphiti (best-effort)

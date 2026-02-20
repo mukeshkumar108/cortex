@@ -12,13 +12,14 @@ Rolling summary is a compressor, not a memory:
 - Graphiti receives raw turns for full-fidelity long-term storage
 """
 
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Set
 from datetime import datetime, timedelta
 import hashlib
 import inspect
 import json
 import logging
 import asyncio
+import re
 from .db import Database
 from .models import Message
 from .config import get_settings
@@ -33,9 +34,17 @@ MAX_OUTBOX_ATTEMPTS = 5
 OUTBOX_BASE_BACKOFF_SECONDS = 5
 OUTBOX_MAX_BACKOFF_SECONDS = 300
 OUTBOX_CLAIM_HOLD_SECONDS = 30
+DEFAULT_LOOP_PERSONA_ID = "default"
 
 
 class SessionManager:
+    _SUMMARY_MAX_WORDS = 35
+    _TONE_MAX_WORDS = 12
+    _MOMENT_MAX_WORDS = 20
+    _SUMMARY_MAX_SENTENCES = 2
+    _FILLER_VERBS = ("reported", "stated", "mentioned", "noted", "said")
+    _INDEX_TEXT_MAX_CHARS = 800
+
     def __init__(self, db: Database):
         self.db = db
         self.settings = get_settings()
@@ -829,43 +838,79 @@ Do not include filler or meta-commentary."""
         self,
         transcript: str,
         reference_time: datetime
-    ) -> Dict[str, str]:
+    ) -> Dict[str, Any]:
         date_str = reference_time.strftime("%A, %b %d, %Y")
         prompt = (
             f"Current Date: {date_str}\n\n"
             "You are a memory processor. Your job is to extract two distinct texts from the transcript below.\n\n"
             "TASK 1: HISTORICAL SUMMARY\n"
             "Rules:\n"
-            "- 2-4 sentences max.\n"
             "- Write in PAST TENSE.\n"
             "- No speaker labels, no line-by-line quoting.\n"
             f"- Convert relative dates (like \"tomorrow\") into absolute dates based on the current date ({date_str}).\n"
-            "- Capture only facts, commitments, decisions, ongoing threads, and notable context.\n"
-            "- Be concise and neutral.\n"
+            "- Use this exact structure:\n"
+            "  SUMMARY: 1-2 sentences (what happened, session arc, factual)\n"
+            "  TONE: 1 sentence (emotional state of the user during this session)\n"
+            "  DECISIONS: bullet list only if explicit decisions/commitments were made; otherwise empty\n"
+            "  UNRESOLVED: bullet list only if something significant was left open; otherwise empty\n"
+            "  MOMENT: 1 sentence for the single most significant thing said/happened, if anything; omit if routine session\n"
+            "- SUMMARY must be <= 2 sentences and <= 35 words total.\n"
+            "- TONE must be <= 12 words.\n"
+            "- MOMENT (if present) must be <= 20 words.\n"
+            "- Capture only facts, commitments, decisions, unresolved items, and observed emotional tone.\n"
+            "- Be concise and neutral in all sections.\n"
             "- If a detail is uncertain, omit it.\n"
+            "- Do NOT add coaching language, advice, or prescriptive framing in any section.\n"
+            "- Do not infer or invent; include only what is explicitly present in transcript.\n"
+            "- Graphiti handles entity extraction separately; do not list people/projects unless needed for significance.\n"
+            "- Avoid filler verbs (reported, stated, mentioned, noted, said); use at most once total.\n"
+            "- DECISIONS: include only durable, future-impacting decisions/commitments (deploy/ship/commit/schedule/stop/start/change plan).\n"
+            "- DECISIONS: do NOT include trivial actions already in progress.\n"
+            "- UNRESOLVED: include only actionable items likely to recur next session.\n"
+            "- Prevent repetition: do not repeat the same fact across SUMMARY and MOMENT.\n"
             "- Do NOT use user name or assistant name; use “the user” or “the assistant” if needed.\n\n"
             "TASK 2: BRIDGING TEXT\n"
             "Rules:\n"
             "- 1-2 sentences max.\n"
             "- Write in PRESENT or FUTURE tense.\n"
             "- This text is to bridge the gap to the next session.\n"
-            "- Focus on what is pending or what the assistant should check on next.\n"
+            "- Focus on pending facts, unresolved items, and the user's stated plans.\n"
+            "- Use factual narrative only. Do NOT give instructions.\n"
+            "- Do NOT use wording like \"the assistant should\" or imperative advice.\n"
             "- Do NOT include speaker labels or verbatim transcript.\n"
             "- Do NOT use user name or assistant name; use “the user” or “the assistant” if needed.\n\n"
+            "- BRIDGE must be <= 25 words.\n"
             f"Session Transcript:\n{transcript}\n\n"
             "Response format:\n"
             "SUMMARY: ...\n"
+            "TONE: ...\n"
+            "DECISIONS:\n"
+            "- ...\n"
+            "UNRESOLVED:\n"
+            "- ...\n"
+            "MOMENT: ...\n"
             "BRIDGE: ...\n"
         )
         response = await self.llm_client._call_llm(
             prompt=prompt,
-            max_tokens=300,
+            max_tokens=220,
             temperature=0.1,
             task="session_episode"
         )
         if not response:
-            return {"summary": "", "bridge": ""}
-        summary, bridge = self._parse_summary_bridge(response)
+            return {
+                "summary": "",
+                "bridge": "",
+                "summary_facts": "",
+                "tone": "",
+                "moment": "",
+                "decisions": [],
+                "unresolved": [],
+            }
+        parsed = self._parse_summary_bridge(response)
+        parsed = await self._enforce_structured_recap_rules(transcript, parsed)
+        summary = parsed.get("summary", "")
+        bridge = parsed.get("bridge", "")
         if not summary and not bridge:
             logger.warning(
                 "Session recap parse returned empty output. Raw response (truncated): %s",
@@ -873,16 +918,203 @@ Do not include filler or meta-commentary."""
             )
         if self._looks_like_transcript(summary):
             summary = ""
+            parsed["summary_facts"] = ""
+            parsed["tone"] = ""
+            parsed["moment"] = ""
         if self._looks_like_transcript(bridge):
             bridge = ""
+        parsed["summary"] = summary
+        parsed["bridge"] = bridge
+        return parsed
+
+    @staticmethod
+    def _clean_message_text(value: Any) -> str:
+        if value is None:
+            return ""
+        return " ".join(str(value).strip().split())
+
+    @staticmethod
+    def _messages_to_transcript(messages: List[Dict[str, Any]]) -> str:
+        lines: List[str] = []
+        for msg in messages or []:
+            text = SessionManager._clean_message_text(msg.get("text"))
+            if not text:
+                continue
+            role = (msg.get("role") or "user").strip().lower()
+            lines.append(f"{role}: {text}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _select_reference_time(messages: List[Dict[str, Any]]) -> datetime:
+        reference_time = datetime.utcnow()
+        for msg in reversed(messages or []):
+            ts = msg.get("timestamp")
+            if not ts:
+                continue
+            try:
+                reference_time = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                break
+            except Exception:
+                continue
+        return reference_time
+
+    def _deterministic_session_recap(
+        self,
+        messages: List[Dict[str, Any]],
+        reference_time: datetime
+    ) -> Dict[str, str]:
+        cleaned_messages = []
+        for msg in messages or []:
+            text = self._clean_message_text(msg.get("text"))
+            if not text:
+                continue
+            cleaned_messages.append({
+                "role": (msg.get("role") or "user").lower(),
+                "text": text
+            })
+
+        date_str = reference_time.strftime("%A, %B %d, %Y")
+        user_messages = [m for m in cleaned_messages if m["role"] == "user"]
+        assistant_messages = [m for m in cleaned_messages if m["role"] == "assistant"]
+
+        commitment = None
+        commitment_markers = (" i will ", " i'm going to ", " i am going to ", " my plan ", " i need to ")
+        for m in user_messages:
+            padded = f" {m['text'].lower()} "
+            if any(marker in padded for marker in commitment_markers):
+                commitment = m["text"]
+                break
+
+        if not cleaned_messages:
+            summary = (
+                f"The session on {date_str} contained no substantive message content. "
+                "No concrete commitments or decisions were recorded."
+            )
+            bridge = "At the next session, the user's current priority can be clarified before continuing."
+            return {"summary": summary, "bridge": bridge}
+
+        if user_messages and not assistant_messages:
+            summary = (
+                f"On {date_str}, the user initiated a brief check-in without receiving a completed response. "
+                "No confirmed decision was recorded in the session."
+            )
+            bridge = "At the next session, the pending user message remains unresolved and can be addressed first."
+            return {"summary": summary, "bridge": bridge}
+
+        if commitment:
+            summary = (
+                f"On {date_str}, the user stated a concrete plan: {commitment}. "
+                "The conversation set expectations for the immediate next step."
+            )
+            bridge = "At the next session, this plan can be revisited to confirm progress and what remains pending."
+            return {"summary": summary, "bridge": bridge}
+
+        summary = (
+            f"On {date_str}, the user and assistant had a brief exchange with limited actionable detail. "
+            "No explicit commitments or unresolved blockers were captured."
+        )
+        bridge = "At the next session, it can be clarified whether to continue this thread or begin a new one."
         return {"summary": summary, "bridge": bridge}
+
+    async def summarize_session_messages_with_quality(
+        self,
+        messages: List[Dict[str, Any]],
+        reference_time: Optional[datetime] = None
+    ) -> Dict[str, Any]:
+        transcript = self._messages_to_transcript(messages or [])
+        ref_time = reference_time or self._select_reference_time(messages or [])
+
+        recaps = await self._summarize_session_close(transcript=transcript, reference_time=ref_time)
+        summary_text = self._compose_display_summary(
+            recaps.get("summary_facts") or "",
+            recaps.get("tone") or "",
+            recaps.get("moment") or ""
+        )
+        bridge_text = (recaps.get("bridge") or "").strip()
+        summary_facts = (recaps.get("summary_facts") or "").strip()
+        tone = (recaps.get("tone") or "").strip()
+        moment = (recaps.get("moment") or "").strip()
+        decisions = recaps.get("decisions") if isinstance(recaps.get("decisions"), list) else []
+        unresolved = recaps.get("unresolved") if isinstance(recaps.get("unresolved"), list) else []
+        quality_tier = "llm_primary"
+
+        if not summary_text or self._looks_like_transcript(summary_text):
+            repaired = await self._rewrite_summary_from_text(transcript)
+            repaired = (repaired or "").strip()
+            if repaired and not self._looks_like_transcript(repaired):
+                summary_text = repaired
+                summary_facts = repaired
+                tone = ""
+                moment = ""
+                quality_tier = "llm_repair"
+
+        if not bridge_text or self._looks_like_transcript(bridge_text):
+            candidate_source = summary_text if summary_text else transcript
+            repaired_bridge = await self._summarize_session_bridge(candidate_source)
+            repaired_bridge = (repaired_bridge or "").strip()
+            if repaired_bridge and not self._looks_like_transcript(repaired_bridge):
+                bridge_text = repaired_bridge
+                quality_tier = "llm_repair"
+
+        used_deterministic = False
+        if not summary_text or self._looks_like_transcript(summary_text):
+            used_deterministic = True
+        if not bridge_text or self._looks_like_transcript(bridge_text):
+            used_deterministic = True
+        if used_deterministic:
+            deterministic = self._deterministic_session_recap(messages or [], ref_time)
+            if not summary_text or self._looks_like_transcript(summary_text):
+                summary_text = deterministic.get("summary", "").strip()
+                summary_facts = summary_text
+                tone = ""
+                moment = ""
+            if not bridge_text or self._looks_like_transcript(bridge_text):
+                bridge_text = deterministic.get("bridge", "").strip()
+            quality_tier = "deterministic_fallback"
+
+        # Final hard guarantee
+        if not summary_text:
+            summary_text = "The session completed with minimal actionable detail and no confirmed commitments."
+            summary_facts = summary_text
+            tone = ""
+            moment = ""
+            quality_tier = "deterministic_fallback"
+        if not bridge_text:
+            bridge_text = "At the next session, the user's current priority and next action can be clarified."
+            quality_tier = "deterministic_fallback"
+
+        return {
+            "summary_text": summary_text,
+            "bridge_text": bridge_text,
+            "summary_facts": summary_facts,
+            "tone": tone,
+            "moment": moment,
+            "decisions": decisions,
+            "unresolved": unresolved,
+            "index_text": self._compose_index_text(
+                summary_facts=summary_facts,
+                moment=moment,
+                decisions=decisions,
+                unresolved=unresolved,
+            ),
+            "salience": self._classify_summary_salience(
+                tone=tone,
+                moment=moment,
+                decisions=decisions,
+                unresolved=unresolved,
+            ),
+            "summary_quality_tier": quality_tier,
+            "summary_source": "full_transcript"
+        }
 
     async def _summarize_session_bridge(self, summary_text: str) -> str:
         if self._looks_like_transcript(summary_text):
             return ""
         prompt = (
             "Rewrite the session summary into a 1-2 sentence bridge for the next session. "
-            "Be factual, concise, and in past tense. "
+            "Be factual, concise, and in present/future tense. "
+            "Use factual narrative only, not instructions. "
+            "Do not write phrases like 'the assistant should'. "
             "Do NOT include speaker labels or verbatim transcript. "
             "Do NOT use user name or assistant name; use “the user” or “the assistant” if needed. "
             "Prefer concrete plans, commitments, and state of ongoing work. "
@@ -907,9 +1139,348 @@ Do not include filler or meta-commentary."""
         return ""
 
     @staticmethod
-    def _parse_summary_bridge(text: str) -> Tuple[str, str]:
-        summary_lines: List[str] = []
-        bridge_lines: List[str] = []
+    def _normalize_sentence_tokens(value: str) -> Set[str]:
+        return set(re.findall(r"[a-z0-9]+", (value or "").lower()))
+
+    @classmethod
+    def _dedupe_summary_sentences(cls, summary_text: str) -> str:
+        if not summary_text:
+            return ""
+        raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", summary_text) if s.strip()]
+        kept: List[str] = []
+        kept_tokens: List[Set[str]] = []
+        for sentence in raw_sentences:
+            tokens = cls._normalize_sentence_tokens(sentence)
+            if not tokens:
+                continue
+            is_duplicate = False
+            for prev_tokens in kept_tokens:
+                overlap = len(tokens & prev_tokens)
+                base = max(1, min(len(tokens), len(prev_tokens)))
+                if (overlap / base) > 0.7:
+                    is_duplicate = True
+                    break
+            if is_duplicate:
+                continue
+            kept.append(sentence)
+            kept_tokens.append(tokens)
+        return " ".join(kept).strip()
+
+    @classmethod
+    def _compose_display_summary(cls, summary_facts: str, tone: str, moment: str) -> str:
+        parts = []
+        for value in (summary_facts, tone, moment):
+            cleaned = " ".join((value or "").split()).strip()
+            if cleaned:
+                parts.append(cleaned)
+        return " ".join(parts).strip()
+
+    @classmethod
+    def _compose_index_text(
+        cls,
+        summary_facts: str,
+        moment: str,
+        decisions: List[str],
+        unresolved: List[str],
+    ) -> str:
+        def _clean_items(items: List[str]) -> List[str]:
+            return [" ".join((i or "").split()).strip() for i in (items or []) if str(i or "").strip()]
+
+        parts: List[str] = []
+        remaining = cls._INDEX_TEXT_MAX_CHARS
+
+        def _append_text(value: str) -> None:
+            nonlocal remaining
+            if remaining <= 0:
+                return
+            text = " ".join((value or "").split()).strip()
+            if not text:
+                return
+            prefix = " " if parts else ""
+            room = remaining - len(prefix)
+            if room <= 0:
+                remaining = 0
+                return
+            if len(text) > room:
+                text = text[:room].rstrip(" ,;")
+            if not text:
+                remaining = 0
+                return
+            parts.append(text)
+            remaining -= len(prefix) + len(text)
+
+        facts = " ".join((summary_facts or "").split()).strip()
+        moment_text = " ".join((moment or "").split()).strip()
+        if facts and moment_text:
+            # Reserve room so moment is always retained (possibly clipped).
+            reserve_for_moment = min(len(moment_text) + 1, max(40, cls._INDEX_TEXT_MAX_CHARS // 5))
+            facts_room = max(0, remaining - reserve_for_moment)
+            if facts_room > 0:
+                clipped_facts = facts[:facts_room].rstrip(" ,;")
+                _append_text(clipped_facts)
+            _append_text(moment_text)
+        else:
+            _append_text(facts)
+            _append_text(moment_text)
+
+        def _append_labeled_items(label: str, items: List[str]) -> None:
+            nonlocal remaining
+            cleaned = _clean_items(items)
+            if not cleaned or remaining <= 0:
+                return
+            prefix = " " if parts else ""
+            section_prefix = f"{label}: "
+            # Must be able to fit " Label: x" at minimum.
+            if remaining <= len(prefix) + len(section_prefix):
+                return
+            available = remaining - len(prefix)
+            section = section_prefix
+            for idx, item in enumerate(cleaned):
+                sep = "" if idx == 0 else "; "
+                candidate = f"{sep}{item}"
+                if len(section) + len(candidate) <= available:
+                    section += candidate
+                    continue
+                spare = available - len(section) - len(sep)
+                if spare > 0:
+                    clipped = item[:spare].rstrip(" ,;")
+                    if clipped:
+                        section += f"{sep}{clipped}"
+                break
+            if section == section_prefix:
+                return
+            parts.append(section)
+            remaining -= len(prefix) + len(section)
+
+        _append_labeled_items("Decisions", decisions)
+        _append_labeled_items("Open loops", unresolved)
+
+        return " ".join(parts).strip()
+
+    @classmethod
+    def _classify_summary_salience(
+        cls,
+        tone: str,
+        moment: str,
+        decisions: List[str],
+        unresolved: List[str],
+    ) -> str:
+        if decisions or unresolved:
+            return "high"
+        if moment:
+            return "medium"
+        tone_lower = (tone or "").lower()
+        affect_markers = (
+            "frustrat",
+            "anxious",
+            "overwhelm",
+            "angry",
+            "upset",
+            "relieved",
+            "excited",
+            "panic",
+            "scared",
+            "afraid",
+            "devastat",
+            "proud",
+        )
+        if any(marker in tone_lower for marker in affect_markers):
+            return "medium"
+        return "low"
+
+    @staticmethod
+    def _word_count(value: str) -> int:
+        return len(re.findall(r"\b\w+\b", value or ""))
+
+    @classmethod
+    def _truncate_words(cls, value: str, max_words: int) -> str:
+        if not value:
+            return ""
+        words = re.findall(r"\S+", value.strip())
+        if len(words) <= max_words:
+            return value.strip()
+        return " ".join(words[:max_words]).strip().rstrip(",;")
+
+    @classmethod
+    def _truncate_sentences(cls, value: str, max_sentences: int) -> str:
+        if not value:
+            return ""
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", value.strip()) if s.strip()]
+        if not sentences:
+            return value.strip()
+        return " ".join(sentences[:max_sentences]).strip()
+
+    @classmethod
+    def _normalize_for_overlap(cls, value: str) -> Set[str]:
+        return cls._normalize_sentence_tokens(value)
+
+    @classmethod
+    def _overlap_ratio(cls, left: str, right: str) -> float:
+        left_tokens = cls._normalize_for_overlap(left)
+        right_tokens = cls._normalize_for_overlap(right)
+        if not left_tokens or not right_tokens:
+            return 0.0
+        base = max(1, min(len(left_tokens), len(right_tokens)))
+        return len(left_tokens & right_tokens) / base
+
+    @classmethod
+    def _count_filler_verbs(cls, *values: str) -> int:
+        text = " ".join([v for v in values if v]).lower()
+        count = 0
+        for verb in cls._FILLER_VERBS:
+            count += len(re.findall(rf"\b{re.escape(verb)}\b", text))
+        return count
+
+    @classmethod
+    def _has_cross_field_repetition(cls, summary_facts: str, tone: str, moment: str) -> bool:
+        checks = []
+        if summary_facts and tone:
+            checks.append((summary_facts, tone))
+        if summary_facts and moment:
+            checks.append((summary_facts, moment))
+        if tone and moment:
+            checks.append((tone, moment))
+        for left, right in checks:
+            if cls._overlap_ratio(left, right) > 0.7:
+                return True
+        return False
+
+    @classmethod
+    def _structured_recap_is_valid(
+        cls,
+        summary_facts: str,
+        tone: str,
+        moment: str
+    ) -> bool:
+        if cls._word_count(summary_facts) > cls._SUMMARY_MAX_WORDS:
+            return False
+        if cls._word_count(tone) > cls._TONE_MAX_WORDS:
+            return False
+        if cls._word_count(moment) > cls._MOMENT_MAX_WORDS:
+            return False
+        if cls._word_count(summary_facts) and len(
+            [s for s in re.split(r"(?<=[.!?])\s+", summary_facts.strip()) if s.strip()]
+        ) > cls._SUMMARY_MAX_SENTENCES:
+            return False
+        if cls._has_cross_field_repetition(summary_facts, tone, moment):
+            return False
+        if cls._count_filler_verbs(summary_facts, tone, moment) > 1:
+            return False
+        return True
+
+    async def _rewrite_structured_recap(
+        self,
+        transcript: str,
+        parsed: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        prompt = (
+            "Rewrite to satisfy rules exactly; remove repetition; remove filler verbs; keep meaning.\n"
+            "Return EXACTLY this format:\n"
+            "SUMMARY: <=2 sentences, <=35 words total\n"
+            "TONE: <=12 words\n"
+            "DECISIONS:\n"
+            "- durable future-impacting decisions only\n"
+            "UNRESOLVED:\n"
+            "- actionable recurring unresolved only\n"
+            "MOMENT: <=20 words (omit if routine)\n"
+            "BRIDGE: <=25 words\n\n"
+            "Current structured output:\n"
+            f"SUMMARY: {parsed.get('summary_facts','')}\n"
+            f"TONE: {parsed.get('tone','')}\n"
+            "DECISIONS:\n"
+            + "\n".join([f"- {d}" for d in (parsed.get("decisions") or [])])
+            + ("\n" if parsed.get("decisions") else "")
+            + "UNRESOLVED:\n"
+            + "\n".join([f"- {u}" for u in (parsed.get("unresolved") or [])])
+            + ("\n" if parsed.get("unresolved") else "")
+            + f"MOMENT: {parsed.get('moment','')}\n"
+            + f"BRIDGE: {parsed.get('bridge','')}\n\n"
+            + f"Transcript:\n{transcript}\n"
+        )
+        response = await self.llm_client._call_llm(
+            prompt=prompt,
+            max_tokens=220,
+            temperature=0.1,
+            task="session_episode_rewrite"
+        )
+        if not response:
+            return parsed
+        return self._parse_summary_bridge(response)
+
+    @classmethod
+    def _truncate_structured_recap_fields(cls, parsed: Dict[str, Any]) -> Dict[str, Any]:
+        summary_facts = cls._truncate_sentences(parsed.get("summary_facts") or "", cls._SUMMARY_MAX_SENTENCES)
+        summary_facts = cls._truncate_words(summary_facts, cls._SUMMARY_MAX_WORDS)
+        tone = cls._truncate_words(parsed.get("tone") or "", cls._TONE_MAX_WORDS)
+        moment = cls._truncate_words(parsed.get("moment") or "", cls._MOMENT_MAX_WORDS)
+        if cls._has_cross_field_repetition(summary_facts, tone, moment):
+            if cls._overlap_ratio(summary_facts, tone) > 0.7:
+                tone = ""
+            if cls._overlap_ratio(summary_facts, moment) > 0.7:
+                moment = ""
+            if tone and moment and cls._overlap_ratio(tone, moment) > 0.7:
+                moment = ""
+        if cls._count_filler_verbs(summary_facts, tone, moment) > 1:
+            for field in ("summary_facts", "tone", "moment"):
+                value = {"summary_facts": summary_facts, "tone": tone, "moment": moment}[field]
+                cleaned = re.sub(
+                    r"\b(reported|stated|mentioned|noted|said)\b",
+                    "",
+                    value,
+                    count=10,
+                    flags=re.IGNORECASE
+                )
+                cleaned = " ".join(cleaned.split()).strip()
+                if field == "summary_facts":
+                    summary_facts = cleaned
+                elif field == "tone":
+                    tone = cleaned
+                else:
+                    moment = cleaned
+                if cls._count_filler_verbs(summary_facts, tone, moment) <= 1:
+                    break
+        return {
+            **parsed,
+            "summary_facts": summary_facts,
+            "tone": tone,
+            "moment": moment,
+            "summary": cls._compose_display_summary(summary_facts, tone, moment),
+        }
+
+    async def _enforce_structured_recap_rules(
+        self,
+        transcript: str,
+        parsed: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        summary_facts = (parsed.get("summary_facts") or "").strip()
+        tone = (parsed.get("tone") or "").strip()
+        moment = (parsed.get("moment") or "").strip()
+        if self._structured_recap_is_valid(summary_facts, tone, moment):
+            parsed["summary"] = self._compose_display_summary(summary_facts, tone, moment)
+            return parsed
+
+        rewritten = await self._rewrite_structured_recap(transcript, parsed)
+        rewritten_summary = (rewritten.get("summary_facts") or "").strip()
+        rewritten_tone = (rewritten.get("tone") or "").strip()
+        rewritten_moment = (rewritten.get("moment") or "").strip()
+        if self._structured_recap_is_valid(rewritten_summary, rewritten_tone, rewritten_moment):
+            rewritten["summary"] = self._compose_display_summary(
+                rewritten_summary, rewritten_tone, rewritten_moment
+            )
+            return rewritten
+
+        return self._truncate_structured_recap_fields(rewritten)
+
+    @classmethod
+    def _parse_summary_bridge(cls, text: str) -> Dict[str, Any]:
+        sections: Dict[str, List[str]] = {
+            "summary": [],
+            "tone": [],
+            "decisions": [],
+            "unresolved": [],
+            "moment": [],
+            "bridge": [],
+        }
         mode: Optional[str] = None
         for raw in (text or "").splitlines():
             line = raw.strip()
@@ -920,24 +1491,82 @@ Do not include filler or meta-commentary."""
                 mode = "summary"
                 content = line.split(":", 1)[1].strip()
                 if content:
-                    summary_lines.append(content)
+                    sections["summary"].append(content)
+                continue
+            if upper.startswith("TONE:"):
+                mode = "tone"
+                content = line.split(":", 1)[1].strip()
+                if content:
+                    sections["tone"].append(content)
+                continue
+            if upper.startswith("DECISIONS:"):
+                mode = "decisions"
+                content = line.split(":", 1)[1].strip()
+                if content:
+                    sections["decisions"].append(content)
+                continue
+            if upper.startswith("UNRESOLVED:"):
+                mode = "unresolved"
+                content = line.split(":", 1)[1].strip()
+                if content:
+                    sections["unresolved"].append(content)
+                continue
+            if upper.startswith("MOMENT:"):
+                mode = "moment"
+                content = line.split(":", 1)[1].strip()
+                if content:
+                    sections["moment"].append(content)
                 continue
             if upper.startswith("BRIDGE:"):
                 mode = "bridge"
                 content = line.split(":", 1)[1].strip()
                 if content:
-                    bridge_lines.append(content)
+                    sections["bridge"].append(content)
                 continue
-            if mode == "summary":
-                summary_lines.append(line)
-            elif mode == "bridge":
-                bridge_lines.append(line)
-        return (" ".join(summary_lines).strip(), " ".join(bridge_lines).strip())
+
+            if mode in {"decisions", "unresolved"}:
+                cleaned = re.sub(r"^\s*(?:[-*•]+|\d+[.)])\s*", "", line).strip()
+                if cleaned:
+                    sections[mode].append(cleaned)
+            elif mode in sections:
+                sections[mode].append(line)
+
+        def _clean_list(items: List[str]) -> List[str]:
+            out: List[str] = []
+            for item in items:
+                value = " ".join((item or "").split()).strip()
+                if not value:
+                    continue
+                if value.lower() in {"none", "empty", "n/a", "(none)"}:
+                    continue
+                out.append(value)
+            return out
+
+        summary_text = " ".join(_clean_list(sections["summary"]))
+        summary_text = cls._dedupe_summary_sentences(summary_text)
+        tone_text = " ".join(_clean_list(sections["tone"]))
+        moment_text = " ".join(_clean_list(sections["moment"]))
+        decisions = _clean_list(sections["decisions"])
+        unresolved = _clean_list(sections["unresolved"])
+        bridge_text = " ".join(_clean_list(sections["bridge"]))
+
+        display_summary = cls._compose_display_summary(summary_text, tone_text, moment_text)
+
+        return {
+            "summary_facts": summary_text,
+            "tone": tone_text,
+            "moment": moment_text,
+            "decisions": decisions,
+            "unresolved": unresolved,
+            "summary": display_summary,
+            "bridge": bridge_text,
+        }
 
     async def _summarize_session_bridge_strict(self, summary_text: str) -> str:
         prompt = (
             "Rewrite into a 1–2 sentence bridge recap. "
-            "ABSOLUTELY NO speaker labels. NO transcript. Past tense only.\n\n"
+            "ABSOLUTELY NO speaker labels. NO transcript. Present/future tense only.\n\n"
+            "Factual narrative only. No instructions and no 'the assistant should'.\n\n"
             f"Summary:\n{summary_text}\n\nBridge:"
         )
         response = await self.llm_client._call_llm(
@@ -1174,45 +1803,44 @@ Do not include filler or meta-commentary."""
 
             # 2b. Extract loops from full session transcript (best-effort)
             try:
-                if persona_id:
-                    full_messages = await self._get_full_transcript_messages(
-                        tenant_id=tenant_id,
-                        session_id=session_id,
-                        user_id=user_id,
-                        buffer=buffer
+                # Loops are user-scoped; store under canonical default persona key.
+                effective_persona_id = DEFAULT_LOOP_PERSONA_ID
+                full_messages = await self._get_full_transcript_messages(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    user_id=user_id,
+                    buffer=buffer
+                )
+                if full_messages:
+                    last_user_text = next(
+                        (m.get("text") for m in reversed(full_messages) if m.get("role") == "user" and m.get("text")),
+                        None
                     )
-                    if full_messages:
-                        last_user_text = next(
-                            (m.get("text") for m in reversed(full_messages) if m.get("role") == "user" and m.get("text")),
-                            None
+                    if not last_user_text:
+                        last_user_text = full_messages[-1].get("text") if full_messages[-1].get("text") else ""
+
+                    ts_values = [self._parse_ts(m.get("timestamp")) for m in full_messages]
+                    ts_values = [t for t in ts_values if t]
+                    start_ts = min(ts_values) if ts_values else None
+                    end_ts = max(ts_values) if ts_values else ended_at
+
+                    provenance = {
+                        "session_id": session_id,
+                        "start_ts": start_ts.isoformat() if start_ts else None,
+                        "end_ts": end_ts.isoformat() if end_ts else None
+                    }
+
+                    if last_user_text:
+                        await loops.extract_and_create_loops(
+                            tenant_id=tenant_id,
+                            user_id=user_id,
+                            persona_id=effective_persona_id,
+                            user_text=last_user_text,
+                            recent_turns=full_messages,
+                            source_turn_ts=end_ts or datetime.utcnow(),
+                            session_id=session_id,
+                            provenance=provenance
                         )
-                        if not last_user_text:
-                            last_user_text = full_messages[-1].get("text") if full_messages[-1].get("text") else ""
-
-                        ts_values = [self._parse_ts(m.get("timestamp")) for m in full_messages]
-                        ts_values = [t for t in ts_values if t]
-                        start_ts = min(ts_values) if ts_values else None
-                        end_ts = max(ts_values) if ts_values else ended_at
-
-                        provenance = {
-                            "session_id": session_id,
-                            "start_ts": start_ts.isoformat() if start_ts else None,
-                            "end_ts": end_ts.isoformat() if end_ts else None
-                        }
-
-                        if last_user_text:
-                            await loops.extract_and_create_loops(
-                                tenant_id=tenant_id,
-                                user_id=user_id,
-                                persona_id=persona_id,
-                                user_text=last_user_text,
-                                recent_turns=full_messages,
-                                source_turn_ts=end_ts or datetime.utcnow(),
-                                session_id=session_id,
-                                provenance=provenance
-                            )
-                else:
-                    logger.info(f"Skipping loop extraction (missing persona_id) for session {session_id}")
             except Exception as e:
                 logger.error(f"Loop extraction on session close failed: {e}")
 
@@ -1224,15 +1852,12 @@ Do not include filler or meta-commentary."""
                     user_id=user_id,
                     buffer=buffer
                 )
-                transcript = "\n".join(
-                    [f"{m.get('role')}: {m.get('text')}" for m in (full_messages or []) if m.get("text")]
-                )
-                recaps = await self._summarize_session_close(
-                    transcript=transcript,
+                recaps = await self.summarize_session_messages_with_quality(
+                    messages=full_messages or [],
                     reference_time=ended_at or datetime.utcnow()
                 )
-                summary_text = (recaps.get("summary") or "").strip()
-                bridge_text = (recaps.get("bridge") or "").strip()
+                summary_text = (recaps.get("summary_text") or "").strip()
+                bridge_text = (recaps.get("bridge_text") or "").strip()
                 if summary_text:
                     await graphiti_client.add_session_summary(
                         tenant_id=tenant_id,
@@ -1241,7 +1866,19 @@ Do not include filler or meta-commentary."""
                         summary_text=summary_text,
                         bridge_text=bridge_text,
                         reference_time=ended_at or datetime.utcnow(),
-                        episode_uuid=episode_uuid
+                        episode_uuid=episode_uuid,
+                        extra_attributes={
+                            "summary_quality_tier": recaps.get("summary_quality_tier"),
+                            "summary_source": recaps.get("summary_source"),
+                            "summary_facts": recaps.get("summary_facts"),
+                            "tone": recaps.get("tone"),
+                            "moment": recaps.get("moment"),
+                            "decisions": recaps.get("decisions") or [],
+                            "unresolved": recaps.get("unresolved") or [],
+                            "index_text": recaps.get("index_text") or "",
+                            "salience": recaps.get("salience") or "low",
+                        },
+                        replace_existing_session=True
                     )
             except Exception as e:
                 logger.error(f"Session summary creation failed: {e}")
@@ -1633,31 +2270,27 @@ async def close_session(
 
 async def summarize_session_messages(
     messages: List[Dict[str, Any]]
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     """Summarize a full session transcript into summary + bridge."""
     mgr = _manager
     if mgr is None:
         mgr = SessionManager(Database())
 
-    transcript = "\n".join(
-        [f"{m.get('role')}: {m.get('text')}" for m in (messages or []) if m.get("text")]
-    )
-    reference_time = datetime.utcnow()
-    for m in reversed(messages or []):
-        ts = m.get("timestamp")
-        if not ts:
-            continue
-        try:
-            reference_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            break
-        except Exception:
-            continue
-    recaps = await mgr._summarize_session_close(
-        transcript=transcript,
-        reference_time=reference_time
-    )
-    summary_text = (recaps.get("summary") or "").strip()
-    bridge_text = (recaps.get("bridge") or "").strip()
+    recaps = await mgr.summarize_session_messages_with_quality(messages or [])
+    summary_text = (recaps.get("summary_text") or "").strip()
+    bridge_text = (recaps.get("bridge_text") or "").strip()
     if not summary_text:
         logger.warning("Session recap returned empty summary (bridge_len=%s)", len(bridge_text))
-    return {"summary_text": summary_text, "bridge_text": bridge_text}
+    return {
+        "summary_text": summary_text,
+        "bridge_text": bridge_text,
+        "summary_facts": recaps.get("summary_facts"),
+        "tone": recaps.get("tone"),
+        "moment": recaps.get("moment"),
+        "decisions": recaps.get("decisions") or [],
+        "unresolved": recaps.get("unresolved") or [],
+        "index_text": recaps.get("index_text") or "",
+        "salience": recaps.get("salience") or "low",
+        "summary_quality_tier": recaps.get("summary_quality_tier", "deterministic_fallback"),
+        "summary_source": recaps.get("summary_source", "full_transcript")
+    }

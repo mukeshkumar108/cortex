@@ -57,30 +57,130 @@ On‑demand semantic memory lookup via Graphiti.
   "userId": "user_1",
   "query": "What are the user's current worries?",
   "limit": 10,
-  "referenceTime": "2026-02-03T18:35:00Z"
+  "referenceTime": "2026-02-03T18:35:00Z",
+  "includeContext": false
 }
 ```
+
+**Response (default `includeContext=false`)**
+```json
+{
+  "facts": [
+    "User felt stressed at the gym.",
+    "Launch was scheduled for Friday 9 AM."
+  ],
+  "factItems": [
+    {"text": "User felt stressed at the gym.", "relevance": null, "source": "graphiti"},
+    {"text": "Launch was scheduled for Friday 9 AM.", "relevance": null, "source": "graphiti"}
+  ],
+  "entities": [
+    {"summary": "stressed", "type": "MentalState", "uuid": "..."},
+    {"summary": "gym", "type": "Environment", "uuid": "..."}
+  ],
+  "metadata": {
+    "query": "What is the user stressed about?",
+    "responseMode": "recall",
+    "facts": 2,
+    "entities": 2,
+    "limit": 10
+  }
+}
+```
+
+Compatibility mode:
+- Set `includeContext=true` to include: `openLoops`, `commitments`, `contextAnchors`, `userStatedState`, `currentFocus`, `recallSheet`, `supplementalContext`.
+
+---
+
+### GET /memory/loops
+Prioritized procedural memory (active loops) from Postgres.
+
+**Query params**
+```
+tenantId=tenant_a&userId=user_1&limit=10&personaId=<optional>&domain=<optional>
+```
+Note: loops are user-scoped memory. `personaId` is compatibility-only and ignored for retrieval.
 
 **Response (example)**
 ```json
 {
-  "facts": [
-    {"text": "User is stressed at the gym.", "relevance": null, "source": "graphiti"},
-    {"text": "User is struggling with the blue-widget-glitch in Sophie and it is unresolved.", "relevance": null, "source": "graphiti"},
-    {"text": "User feels burnt out from testing.", "relevance": null, "source": "graphiti"}
-  ],
-  "entities": [
-    {"summary": "stressed", "type": "MentalState", "uuid": "..."},
-    {"summary": "gym", "type": "Environment", "uuid": "..."},
-    {"summary": "blue-widget-glitch", "type": "Tension", "uuid": "..."}
+  "items": [
+    {
+      "id": "uuid",
+      "type": "thread",
+      "text": "Complete portfolio refresh and model rollout",
+      "status": "active",
+      "salience": 5,
+      "timeHorizon": "ongoing",
+      "dueDate": null,
+      "lastSeenAt": "2026-02-18T14:49:19.144334+00:00",
+      "domain": "career",
+      "importance": 5,
+      "urgency": 3,
+      "tags": ["portfolio", "rollout"],
+      "personaId": null
+    }
   ],
   "metadata": {
-    "query": "What is the user stressed about?",
-    "facts": 3,
-    "entities": 3
+    "count": 1,
+    "limit": 10,
+    "sort": "priority_desc",
+    "domainFilter": null,
+    "personaId": null,
+    "scope": "user"
   }
 }
 ```
+
+---
+
+### GET /user/model
+Persistent synthesized user model for runtime continuity and discovery overlays.
+
+**Query params**
+```
+tenantId=tenant_a&userId=user_1
+```
+
+**Response (shape highlights)**
+```json
+{
+  "tenantId": "tenant_a",
+  "userId": "user_1",
+  "model": {
+    "north_star": {
+      "relationships": {"vision": null, "goal": null, "status": "unknown"},
+      "work": {"vision": "...", "goal": "...", "status": "active"},
+      "health": {"vision": null, "goal": "...", "status": "active"},
+      "spirituality": {"vision": null, "goal": null, "status": "unknown"},
+      "general": {"vision": null, "goal": "...", "status": "active"}
+    },
+    "current_focus": {"text": "...", "source": "inferred|user_stated", "confidence": 0.55},
+    "key_relationships": [],
+    "work_context": {"text": "...", "source": "inferred|user_stated", "confidence": 0.55},
+    "patterns": [],
+    "preferences": {"tone": "...", "avoid": [], "notes": []},
+    "health": null,
+    "spirituality": null
+  },
+  "completenessScore": {
+    "relationships": 0,
+    "work": 0,
+    "north_star": 0,
+    "health": 0,
+    "spirituality": 0,
+    "general": 0
+  },
+  "version": 0,
+  "exists": false,
+  "lastSource": "manual_update|auto_updater|null"
+}
+```
+
+Updater semantics:
+- `north_star.*.goal` may be inferred from loops/sessions (low confidence).
+- `north_star.*.vision` only updates from explicit user-stated signals (high confidence).
+- Domain status is tri-state: `active|inactive|unknown`.
 
 ---
 
@@ -131,7 +231,27 @@ Minimal start-brief with a short human bridge and durable items.
 
 **Query params**
 ```
-tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z
+tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z&sessionId=<optional>&personaId=<optional>&timezone=<IANA optional>
+```
+
+**Response (exact shape)**
+```json
+{
+  "timeOfDayLabel": "MORNING|AFTERNOON|EVENING|NIGHT|null",
+  "timeGapHuman": "string|null",
+  "bridgeText": "string|null",
+  "items": [
+    {
+      "kind": "loop|tension",
+      "text": "string",
+      "type": "string|null",
+      "timeHorizon": "string|null",
+      "dueDate": "ISO-8601 string|null",
+      "salience": "number|null",
+      "lastSeenAt": "ISO-8601 string|null"
+    }
+  ]
+}
 ```
 
 **Response (example)**
@@ -196,6 +316,7 @@ Write both user and assistant turns. This stores the session transcript only.
 Notes:
 - /ingest returns quickly after buffer write; background janitor runs later.
 - Session close (idle) sends **raw transcript** to Graphiti as one episode and stores a `SessionSummary` node.
+- `SessionSummary` generation uses the full transcript with fallback tiers (`llm_primary`, `llm_repair`, `deterministic_fallback`) so summary/bridge are always non-empty.
 
 ---
 
@@ -255,6 +376,10 @@ Use this if you keep working memory locally and only send full transcripts.
   "graphitiAdded": true
 }
 ```
+
+Notes:
+- `/session/ingest` writes a canonical SessionSummary per `(group_id, session_id)` (replace-on-reingest).
+- `bridge_text` from this SessionSummary is what `/session/startbrief` uses first.
 
 ---
 

@@ -48,6 +48,23 @@ class Settings(BaseSettings):
     outbox_drain_limit: int = 200
     outbox_drain_budget_seconds: float = 2.0
     outbox_drain_per_row_timeout_seconds: float = 8.0
+    user_model_updater_enabled: bool = True
+    user_model_updater_interval_seconds: int = 300
+    user_model_updater_lookback_hours: int = 24
+    user_model_updater_max_users: int = 100
+    user_model_low_confidence: float = 0.55
+    user_model_high_confidence: float = 0.9
+    loop_staleness_janitor_enabled: bool = True
+    loop_staleness_janitor_interval_seconds: int = 86400
+    daily_analysis_enabled: bool = True
+    daily_analysis_interval_seconds: int = 86400
+    daily_analysis_target_offset_days: int = 1
+    daily_analysis_max_users: int = 500
+    daily_analysis_max_turns: int = 160
+    daily_analysis_max_sessions: int = 12
+    daily_analysis_prompt_char_budget: int = 7000
+    daily_analysis_low_confidence_threshold: float = 0.6
+    session_bridge_ttl_minutes: int = 30
 
     # Identity cache
     identity_cache_ttl_hours: int = 6

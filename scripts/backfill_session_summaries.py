@@ -19,27 +19,11 @@ def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def _extract_recent_turns(messages: List[Dict[str, Any]], limit: int = 6) -> List[Dict[str, Any]]:
-    if not messages:
-        return []
-    recent = messages[-limit:]
-    cleaned = []
-    for msg in recent:
-        if not isinstance(msg, dict):
-            continue
-        cleaned.append({
-            "role": msg.get("role") or "user",
-            "text": msg.get("text") or "",
-            "timestamp": msg.get("timestamp")
-        })
-    return cleaned
-
-
 async def _summary_exists(driver: Any, group_id: str, session_id: str) -> bool:
     rows = await driver.execute_query(
         """
         MATCH (n:SessionSummary {group_id: $group_id})
-        WHERE n.attributes.session_id = $session_id
+        WHERE n.session_id = $session_id OR n.attributes.session_id = $session_id
         RETURN n.uuid AS uuid
         LIMIT 1
         """,
@@ -121,22 +105,18 @@ async def run(args: argparse.Namespace) -> int:
                 skipped += 1
                 continue
 
-        transcript = "\n".join(
-            [f"{m.get('role')}: {m.get('text')}" for m in (messages or []) if m.get("text")]
-        )
-
         reference_time = None
         if messages:
             reference_time = _parse_iso(messages[-1].get("timestamp"))
         if not reference_time:
             reference_time = row.get("updated_at") or row.get("created_at") or datetime.utcnow()
 
-        recaps = await session_mgr._summarize_session_close(
-            transcript=transcript,
+        recaps = await session_mgr.summarize_session_messages_with_quality(
+            messages=messages,
             reference_time=reference_time
         )
-        summary_text = (recaps.get("summary") or "").strip()
-        bridge_text = (recaps.get("bridge") or "").strip()
+        summary_text = (recaps.get("summary_text") or "").strip()
+        bridge_text = (recaps.get("bridge_text") or "").strip()
 
         if not summary_text:
             skipped += 1
@@ -153,7 +133,14 @@ async def run(args: argparse.Namespace) -> int:
             summary_text=summary_text,
             bridge_text=bridge_text,
             reference_time=reference_time,
-            episode_uuid=None
+            episode_uuid=None,
+            extra_attributes={
+                "summary_quality_tier": recaps.get("summary_quality_tier"),
+                "summary_source": recaps.get("summary_source"),
+                "backfilled_at": datetime.utcnow().isoformat(),
+                "backfill_version": "session_summary_v2"
+            },
+            replace_existing_session=args.force
         )
         created += 1
 

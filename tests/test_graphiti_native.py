@@ -172,6 +172,9 @@ async def test_add_session_summary_sets_summary_field(monkeypatch):
         return True
 
     monkeypatch.setattr(EntityNode, "save", _fake_save, raising=True)
+    async def _always_exists(**_kwargs):
+        return True
+    monkeypatch.setattr(gc, "_session_summary_exists", _always_exists, raising=True)
 
     resp = await gc.add_session_summary(
         tenant_id="t",
@@ -185,6 +188,48 @@ async def test_add_session_summary_sets_summary_field(monkeypatch):
     assert resp["success"] is True
     assert saved["summary"] == "User finished portfolio updates."
     assert "SessionSummary" in saved["labels"]
+
+
+@pytest.mark.asyncio
+async def test_add_session_summary_uses_index_text_for_summary_field(monkeypatch):
+    from src.graphiti_client import GraphitiClient
+
+    gc = GraphitiClient()
+    gc._initialized = True
+
+    class _FakeDriver:
+        pass
+
+    class _FakeClient:
+        driver = _FakeDriver()
+
+    gc.client = _FakeClient()
+
+    saved = {}
+
+    async def _fake_save(self, _driver):
+        saved["summary"] = getattr(self, "summary", None)
+        saved["attributes"] = getattr(self, "attributes", {})
+        return True
+
+    monkeypatch.setattr(EntityNode, "save", _fake_save, raising=True)
+    async def _always_exists(**_kwargs):
+        return True
+    monkeypatch.setattr(gc, "_session_summary_exists", _always_exists, raising=True)
+
+    resp = await gc.add_session_summary(
+        tenant_id="t",
+        user_id="u",
+        session_id="session-2",
+        summary_text="Display summary only.",
+        reference_time=datetime.utcnow(),
+        episode_uuid=None,
+        extra_attributes={"index_text": "Embedding content with decisions and loops."}
+    )
+
+    assert resp["success"] is True
+    assert saved["summary"] == "Embedding content with decisions and loops."
+    assert saved["attributes"]["index_text"] == "Embedding content with decisions and loops."
 
 
 @pytest.mark.asyncio
