@@ -12,8 +12,8 @@ Rolling summary is a compressor, not a memory:
 - Graphiti receives raw turns for full-fidelity long-term storage
 """
 
-from typing import Dict, Any, List, Optional, Tuple, Set
-from datetime import datetime, timedelta
+from typing import Dict, Any, List, Optional, Set, Callable, Awaitable
+from datetime import datetime, timedelta, date
 import hashlib
 import inspect
 import json
@@ -35,6 +35,17 @@ OUTBOX_BASE_BACKOFF_SECONDS = 5
 OUTBOX_MAX_BACKOFF_SECONDS = 300
 OUTBOX_CLAIM_HOLD_SECONDS = 30
 DEFAULT_LOOP_PERSONA_ID = "default"
+JOB_TYPE_TURN = "turn"
+JOB_TYPE_SESSION_RAW_EPISODE = "session_raw_episode"
+JOB_TYPE_POST_INGEST_HOOK = "post_ingest_hook"
+POST_INGEST_HOOK_SESSION_SUMMARY = "session_summary"
+POST_INGEST_HOOK_OPEN_LOOPS = "open_loops"
+POST_INGEST_HOOK_USER_MODEL_DELTA = "user_model_delta"
+POST_INGEST_HOOK_DAILY_ANALYSIS = "daily_analysis"
+SESSION_INGEST_GRAPHITI_MAX_MESSAGES = 400
+SESSION_INGEST_GRAPHITI_MAX_CHARS = 120000
+SESSION_INGEST_HOOK_MAX_MESSAGES = 200
+SESSION_INGEST_HOOK_MAX_CHARS = 60000
 
 
 class SessionManager:
@@ -255,6 +266,239 @@ class SessionManager:
             ts
         )
 
+    async def _enqueue_outbox_job(
+        self,
+        tenant_id: str,
+        user_id: str,
+        session_id: str,
+        *,
+        job_type: str,
+        payload: Dict[str, Any],
+        ts: datetime,
+        text: str,
+        dedupe_key: Optional[str] = None
+    ) -> None:
+        await self.db.execute(
+            """
+            INSERT INTO graphiti_outbox (
+                tenant_id, user_id, session_id, role, text, ts, status, attempts,
+                job_type, payload, dedupe_key
+            )
+            VALUES ($1, $2, $3, 'system', $4, $5, 'pending', 0, $6, $7::jsonb, $8)
+            ON CONFLICT (dedupe_key)
+            DO UPDATE
+            SET payload = EXCLUDED.payload,
+                status = CASE WHEN graphiti_outbox.status = 'sent' THEN graphiti_outbox.status ELSE 'pending' END,
+                attempts = CASE WHEN graphiti_outbox.status = 'sent' THEN graphiti_outbox.attempts ELSE 0 END,
+                last_error = CASE WHEN graphiti_outbox.status = 'sent' THEN graphiti_outbox.last_error ELSE NULL END,
+                next_attempt_at = CASE WHEN graphiti_outbox.status = 'sent' THEN graphiti_outbox.next_attempt_at ELSE NULL END,
+                sent_at = CASE WHEN graphiti_outbox.status = 'sent' THEN graphiti_outbox.sent_at ELSE NULL END
+            """,
+            tenant_id,
+            user_id,
+            session_id,
+            text[:2000],
+            ts,
+            job_type,
+            payload or {},
+            dedupe_key
+        )
+
+    async def enqueue_session_ingest(
+        self,
+        tenant_id: str,
+        user_id: str,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        started_at: Optional[str],
+        ended_at: Optional[str],
+    ) -> None:
+        messages_payload = messages or []
+        reference_time = self._parse_ts(ended_at)
+        if reference_time is None:
+            ts_values = [self._parse_ts((m or {}).get("timestamp")) for m in messages_payload if isinstance(m, dict)]
+            ts_values = [t for t in ts_values if t is not None]
+            reference_time = max(ts_values) if ts_values else datetime.utcnow()
+
+        payload = {
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "reference_time": reference_time.isoformat(),
+        }
+        dedupe_key = f"session_ingest_raw:{tenant_id}:{user_id}:{session_id}"
+
+        pool = await self.db.get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO session_transcript (tenant_id, session_id, user_id, messages, updated_at)
+                    VALUES ($1, $2, $3, $4::jsonb, NOW())
+                    ON CONFLICT (tenant_id, session_id)
+                    DO UPDATE SET messages = $4::jsonb, updated_at = NOW(), user_id = EXCLUDED.user_id
+                    """,
+                    tenant_id,
+                    session_id,
+                    user_id,
+                    messages_payload
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO graphiti_outbox (
+                        tenant_id, user_id, session_id, role, text, ts, status, attempts,
+                        job_type, payload, dedupe_key
+                    )
+                    VALUES ($1, $2, $3, 'system', $4, $5, 'pending', 0, $6, $7::jsonb, $8)
+                    ON CONFLICT (dedupe_key)
+                    DO UPDATE
+                    SET payload = EXCLUDED.payload,
+                        status = CASE WHEN graphiti_outbox.status = 'sent' THEN graphiti_outbox.status ELSE 'pending' END,
+                        attempts = CASE WHEN graphiti_outbox.status = 'sent' THEN graphiti_outbox.attempts ELSE 0 END,
+                        last_error = CASE WHEN graphiti_outbox.status = 'sent' THEN graphiti_outbox.last_error ELSE NULL END,
+                        next_attempt_at = CASE WHEN graphiti_outbox.status = 'sent' THEN graphiti_outbox.next_attempt_at ELSE NULL END,
+                        sent_at = CASE WHEN graphiti_outbox.status = 'sent' THEN graphiti_outbox.sent_at ELSE NULL END
+                    """,
+                    tenant_id,
+                    user_id,
+                    session_id,
+                    f"session_raw_episode:{session_id}",
+                    reference_time,
+                    JOB_TYPE_SESSION_RAW_EPISODE,
+                    payload,
+                    dedupe_key
+                )
+
+    async def _has_session_ingest_job(
+        self,
+        tenant_id: str,
+        user_id: str,
+        session_id: str
+    ) -> bool:
+        dedupe_key = f"session_ingest_raw:{tenant_id}:{user_id}:{session_id}"
+        row = await self.db.fetchone(
+            """
+            SELECT 1
+            FROM graphiti_outbox
+            WHERE tenant_id = $1
+              AND user_id = $2
+              AND session_id = $3
+              AND (
+                dedupe_key = $4
+                OR (
+                  job_type = $5
+                  AND status IN ('pending', 'sent')
+                )
+              )
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            tenant_id,
+            user_id,
+            session_id,
+            dedupe_key,
+            JOB_TYPE_SESSION_RAW_EPISODE
+        )
+        return bool(row)
+
+    @staticmethod
+    def _error_status_code(value: Any) -> Optional[int]:
+        raw = None
+        if isinstance(value, dict):
+            raw = value.get("status_code") if value.get("status_code") is not None else value.get("status")
+        else:
+            raw = getattr(value, "status_code", None)
+            if raw is None:
+                raw = getattr(value, "status", None)
+        try:
+            if raw is None:
+                return None
+            return int(raw)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _looks_permanent_error_text(error_text: str) -> bool:
+        lower = (error_text or "").lower()
+        if not lower:
+            return False
+        permanent_markers = (
+            "validation",
+            "schema",
+            "invalid",
+            "malformed",
+            "bad request",
+            "missing required",
+            "unsupported",
+        )
+        return any(marker in lower for marker in permanent_markers)
+
+    @classmethod
+    def _raise_for_graphiti_response_failure(
+        cls,
+        response: Any,
+        context: str
+    ) -> None:
+        status = cls._error_status_code(response)
+        error_text = ""
+        if isinstance(response, dict):
+            error_text = str(response.get("error") or response.get("detail") or "")
+        if status is not None and 400 <= status < 500:
+            raise TypeError(f"{context} failed permanently status={status} error={error_text}")
+        if cls._looks_permanent_error_text(error_text):
+            raise TypeError(f"{context} failed permanently error={error_text}")
+        raise RuntimeError(f"{context} failed transiently status={status} error={error_text}")
+
+    @staticmethod
+    def _cap_messages_for_processing(
+        messages: List[Dict[str, Any]],
+        max_messages: int,
+        max_chars: int
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(messages, list):
+            return []
+        capped_by_count = messages[-max_messages:] if max_messages > 0 else messages[:]
+        out: List[Dict[str, Any]] = []
+        chars = 0
+        for msg in capped_by_count:
+            if not isinstance(msg, dict):
+                continue
+            text = str(msg.get("text") or "")
+            if not text:
+                continue
+            projected = chars + len(text)
+            if projected > max_chars:
+                break
+            out.append(msg)
+            chars = projected
+        return out
+
+    async def _load_session_transcript_messages(
+        self,
+        tenant_id: str,
+        session_id: str
+    ) -> List[Dict[str, Any]]:
+        row = await self.db.fetchone(
+            """
+            SELECT messages
+            FROM session_transcript
+            WHERE tenant_id = $1 AND session_id = $2
+            """,
+            tenant_id,
+            session_id
+        )
+        messages = row.get("messages") if row else []
+        if isinstance(messages, str):
+            try:
+                messages = json.loads(messages)
+            except Exception:
+                messages = []
+        if not isinstance(messages, list):
+            return []
+        return [m for m in messages if isinstance(m, dict)]
+
     @staticmethod
     def _parse_ts(value: Any) -> Optional[datetime]:
         if not value:
@@ -316,8 +560,9 @@ class SessionManager:
             FROM graphiti_outbox
             WHERE tenant_id = $1 AND session_id = $2 AND user_id = $3
               AND status = 'pending'
+              AND job_type = $4
         """
-        return int(await self.db.fetchval(query, tenant_id, session_id, user_id) or 0)
+        return int(await self.db.fetchval(query, tenant_id, session_id, user_id, JOB_TYPE_TURN) or 0)
 
     async def get_last_janitor_run_at(
         self,
@@ -505,48 +750,89 @@ class SessionManager:
             FROM graphiti_outbox
             WHERE tenant_id = $1 AND session_id = $2 AND user_id = $3
               AND status = 'pending'
+              AND job_type = $5
               AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
             ORDER BY id ASC
             LIMIT $4
         """
-        return await self.db.fetch(query, tenant_id, session_id, user_id, limit)
+        return await self.db.fetch(query, tenant_id, session_id, user_id, limit, JOB_TYPE_TURN)
 
     async def _claim_pending_outbox(
         self,
         limit: int,
-        tenant_id: Optional[str] = None
+        tenant_id: Optional[str] = None,
+        job_types: Optional[List[str]] = None
     ) -> List[Dict[str, Any]]:
+        normalized_job_types = [
+            str(value).strip().lower()
+            for value in (job_types or [])
+            if str(value).strip()
+        ]
         pool = await self.db.get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
                 if tenant_id:
-                    rows = await conn.fetch(
-                        """
-                        SELECT id, tenant_id, user_id, session_id, role, text, ts, attempts, folded_at
-                        FROM graphiti_outbox
-                        WHERE status = 'pending'
-                          AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
-                          AND tenant_id = $1
-                        ORDER BY id ASC
-                        LIMIT $2
-                        FOR UPDATE SKIP LOCKED
-                        """,
-                        tenant_id,
-                        limit
-                    )
+                    if normalized_job_types:
+                        rows = await conn.fetch(
+                            """
+                            SELECT id, tenant_id, user_id, session_id, role, text, ts, attempts, folded_at, job_type, payload, dedupe_key
+                            FROM graphiti_outbox
+                            WHERE status = 'pending'
+                              AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+                              AND tenant_id = $1
+                              AND LOWER(COALESCE(job_type, '')) = ANY($2::text[])
+                            ORDER BY id ASC
+                            LIMIT $3
+                            FOR UPDATE SKIP LOCKED
+                            """,
+                            tenant_id,
+                            normalized_job_types,
+                            limit
+                        )
+                    else:
+                        rows = await conn.fetch(
+                            """
+                            SELECT id, tenant_id, user_id, session_id, role, text, ts, attempts, folded_at, job_type, payload, dedupe_key
+                            FROM graphiti_outbox
+                            WHERE status = 'pending'
+                              AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+                              AND tenant_id = $1
+                            ORDER BY id ASC
+                            LIMIT $2
+                            FOR UPDATE SKIP LOCKED
+                            """,
+                            tenant_id,
+                            limit
+                        )
                 else:
-                    rows = await conn.fetch(
-                        """
-                        SELECT id, tenant_id, user_id, session_id, role, text, ts, attempts, folded_at
-                        FROM graphiti_outbox
-                        WHERE status = 'pending'
-                          AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
-                        ORDER BY id ASC
-                        LIMIT $1
-                        FOR UPDATE SKIP LOCKED
-                        """,
-                        limit
-                    )
+                    if normalized_job_types:
+                        rows = await conn.fetch(
+                            """
+                            SELECT id, tenant_id, user_id, session_id, role, text, ts, attempts, folded_at, job_type, payload, dedupe_key
+                            FROM graphiti_outbox
+                            WHERE status = 'pending'
+                              AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+                              AND LOWER(COALESCE(job_type, '')) = ANY($1::text[])
+                            ORDER BY id ASC
+                            LIMIT $2
+                            FOR UPDATE SKIP LOCKED
+                            """,
+                            normalized_job_types,
+                            limit
+                        )
+                    else:
+                        rows = await conn.fetch(
+                            """
+                            SELECT id, tenant_id, user_id, session_id, role, text, ts, attempts, folded_at, job_type, payload, dedupe_key
+                            FROM graphiti_outbox
+                            WHERE status = 'pending'
+                              AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+                            ORDER BY id ASC
+                            LIMIT $1
+                            FOR UPDATE SKIP LOCKED
+                            """,
+                            limit
+                        )
 
                 if not rows:
                     return []
@@ -644,16 +930,305 @@ class SessionManager:
         """
         await self.db.execute(query, outbox_id, error[:500])
 
+    @staticmethod
+    def _parse_payload_reference_time(payload: Dict[str, Any]) -> datetime:
+        raw = payload.get("reference_time") if isinstance(payload, dict) else None
+        parsed = SessionManager._parse_ts(raw)
+        return parsed or datetime.utcnow()
+
+    @staticmethod
+    def _is_success_response(response: Any) -> bool:
+        if isinstance(response, dict):
+            if response.get("success") is False:
+                return False
+            status = response.get("status_code")
+            try:
+                if status is not None and int(status) >= 400:
+                    return False
+            except Exception:
+                pass
+        return True
+
+    async def _enqueue_post_ingest_hook_jobs(
+        self,
+        tenant_id: str,
+        user_id: str,
+        session_id: str,
+        reference_time: datetime,
+        episode_uuid: Optional[str]
+    ) -> None:
+        base_payload = {
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "reference_time": reference_time.isoformat(),
+            "episode_uuid": episode_uuid,
+        }
+
+        await self._enqueue_outbox_job(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            job_type=JOB_TYPE_POST_INGEST_HOOK,
+            payload={**base_payload, "hook": POST_INGEST_HOOK_SESSION_SUMMARY},
+            ts=reference_time,
+            text=f"{JOB_TYPE_POST_INGEST_HOOK}:{POST_INGEST_HOOK_SESSION_SUMMARY}",
+            dedupe_key=f"session_hook_summary:{tenant_id}:{user_id}:{session_id}"
+        )
+        await self._enqueue_outbox_job(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            job_type=JOB_TYPE_POST_INGEST_HOOK,
+            payload={**base_payload, "hook": POST_INGEST_HOOK_OPEN_LOOPS},
+            ts=reference_time,
+            text=f"{JOB_TYPE_POST_INGEST_HOOK}:{POST_INGEST_HOOK_OPEN_LOOPS}",
+            dedupe_key=f"session_hook_loops:{tenant_id}:{user_id}:{session_id}"
+        )
+
+    async def _handle_session_raw_episode_job(self, row: Dict[str, Any], graphiti_client) -> None:
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        messages_full = await self._load_session_transcript_messages(
+            tenant_id=row["tenant_id"],
+            session_id=row["session_id"]
+        )
+        messages = self._cap_messages_for_processing(
+            messages_full,
+            max_messages=SESSION_INGEST_GRAPHITI_MAX_MESSAGES,
+            max_chars=SESSION_INGEST_GRAPHITI_MAX_CHARS
+        )
+        if not messages:
+            raise TypeError("validation error: missing transcript messages for session raw episode")
+        if len(messages) < len(messages_full):
+            logger.warning(
+                "session_raw_episode payload capped tenant=%s user=%s session=%s full_messages=%s capped_messages=%s",
+                row["tenant_id"],
+                row["user_id"],
+                row["session_id"],
+                len(messages_full),
+                len(messages),
+            )
+        reference_time = self._parse_payload_reference_time(payload)
+        episode_name = f"session_raw_{row['session_id']}"
+        response = await graphiti_client.add_session_episode(
+            tenant_id=row["tenant_id"],
+            user_id=row["user_id"],
+            messages=messages,
+            reference_time=reference_time,
+            episode_name=episode_name,
+            metadata={
+                "session_id": row["session_id"],
+                "started_at": payload.get("started_at"),
+                "ended_at": payload.get("ended_at"),
+                "episode_type": "session_raw",
+            }
+        )
+        if not self._is_success_response(response):
+            self._raise_for_graphiti_response_failure(response, context="session_raw_episode")
+        try:
+            await self._infer_habit_daily_log_from_episode(
+                tenant_id=row["tenant_id"],
+                user_id=row["user_id"],
+                messages=messages,
+            )
+        except Exception as e:
+            logger.warning(
+                "habit daily log inference soft-failed tenant=%s user=%s session=%s err=%s",
+                row["tenant_id"],
+                row["user_id"],
+                row["session_id"],
+                e,
+            )
+        episode_uuid = response.get("episode_uuid") if isinstance(response, dict) else None
+        await self._enqueue_post_ingest_hook_jobs(
+            tenant_id=row["tenant_id"],
+            user_id=row["user_id"],
+            session_id=row["session_id"],
+            reference_time=reference_time,
+            episode_uuid=episode_uuid
+        )
+
+    async def _handle_post_ingest_hook_job(self, row: Dict[str, Any]) -> None:
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        hook_name = str(payload.get("hook") or "").strip()
+        if not hook_name:
+            raise TypeError("validation error: missing hook name")
+        if _post_ingest_hook_executor is None:
+            raise RuntimeError("post_ingest_hook_executor_unavailable")
+        ok = await _post_ingest_hook_executor(hook_name, payload)
+        if ok is False:
+            raise RuntimeError(f"post_ingest_hook_failed:{hook_name}")
+
+    @staticmethod
+    def _parse_json_object_response(raw: Any) -> Optional[Dict[str, Any]]:
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            return raw
+        if not isinstance(raw, str):
+            raw = str(raw)
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            candidate = text[start:end + 1]
+            try:
+                return json.loads(candidate)
+            except Exception:
+                return None
+        return None
+
+    async def _upsert_habit_daily_log_row(
+        self,
+        *,
+        user_id: str,
+        habit_id: str,
+        log_date: date,
+        completed: bool,
+        nudged: bool,
+        acknowledged: bool,
+        user_response: Optional[str],
+        inferred_from: Optional[str],
+    ) -> None:
+        await self.db.execute(
+            """
+            INSERT INTO habit_daily_log (
+                user_id, habit_id, date, completed, nudged, acknowledged, user_response, inferred_from, created_at
+            )
+            VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, NOW())
+            ON CONFLICT (habit_id, date)
+            DO UPDATE SET
+                completed = (habit_daily_log.completed OR EXCLUDED.completed),
+                nudged = (habit_daily_log.nudged OR EXCLUDED.nudged),
+                acknowledged = (habit_daily_log.acknowledged OR EXCLUDED.acknowledged),
+                user_response = COALESCE(EXCLUDED.user_response, habit_daily_log.user_response),
+                inferred_from = COALESCE(EXCLUDED.inferred_from, habit_daily_log.inferred_from)
+            """,
+            user_id,
+            habit_id,
+            log_date,
+            completed,
+            nudged,
+            acknowledged,
+            user_response,
+            inferred_from,
+        )
+
+    async def _infer_habit_daily_log_from_episode(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        if not messages:
+            return
+        active_habits = await self.db.fetch(
+            """
+            SELECT id::text AS id, text, COALESCE(hint, '') AS hint
+            FROM loops
+            WHERE tenant_id = $1
+              AND user_id = $2
+              AND type = 'habit'
+              AND status = 'active'
+            ORDER BY CASE WHEN time_horizon = 'ongoing' THEN 0 ELSE 1 END, COALESCE(last_seen_at, updated_at) DESC
+            """,
+            tenant_id,
+            user_id,
+        )
+        if not active_habits:
+            return
+
+        transcript = self._messages_to_transcript(messages)
+        if not transcript:
+            return
+        habits_payload = [
+            {
+                "habit_id": str(h.get("id") or ""),
+                "habit_text": str(h.get("text") or ""),
+                "hint": str(h.get("hint") or ""),
+            }
+            for h in active_habits
+            if str(h.get("id") or "").strip() and str(h.get("text") or "").strip()
+        ]
+        if not habits_payload:
+            return
+
+        prompt = (
+            "You are classifying habit progress from a conversation transcript.\n"
+            "For each habit, decide status as one of: completed, later, dismissed, unclear.\n"
+            "Also decide nudged=true if the assistant explicitly nudged/reminded/discussed that habit in the transcript; else false.\n"
+            "Also decide acknowledged=true only when the assistant explicitly acknowledges or praises the user's completed habit in the transcript; else false.\n"
+            "Return JSON only in this schema:\n"
+            "{\"habits\":[{\"habit_id\":\"...\",\"status\":\"completed|later|dismissed|unclear\",\"nudged\":true|false,\"acknowledged\":true|false}]}\n\n"
+            f"HABITS_JSON:\n{json.dumps(habits_payload, ensure_ascii=True)}\n\n"
+            f"TRANSCRIPT:\n{transcript}\n"
+        )
+        raw = await self.llm_client._call_llm(
+            prompt=prompt,
+            max_tokens=600,
+            temperature=0.0,
+            task="loops",
+        )
+        parsed = self._parse_json_object_response(raw)
+        if not isinstance(parsed, dict):
+            return
+        rows = parsed.get("habits")
+        if not isinstance(rows, list):
+            return
+
+        active_habit_ids = {str(h.get("id") or "").strip() for h in active_habits}
+        log_date = datetime.utcnow().date()
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            habit_id = str(item.get("habit_id") or "").strip()
+            if not habit_id or habit_id not in active_habit_ids:
+                continue
+            status = str(item.get("status") or "").strip().lower()
+            nudged = bool(item.get("nudged"))
+            completed = status == "completed"
+            acknowledged = bool(item.get("acknowledged")) and completed
+            user_response: Optional[str] = None
+            if status == "later":
+                user_response = "later"
+            elif status == "dismissed":
+                user_response = "dismissed"
+            inferred_from = "transcript mention" if completed else None
+            if not completed and not user_response and not nudged and not acknowledged:
+                continue
+            await self._upsert_habit_daily_log_row(
+                user_id=user_id,
+                habit_id=habit_id,
+                log_date=log_date,
+                completed=completed,
+                nudged=nudged,
+                acknowledged=acknowledged,
+                user_response=user_response,
+                inferred_from=inferred_from,
+            )
+
     async def drain_outbox(
         self,
         graphiti_client,
         limit: int = 200,
         tenant_id: Optional[str] = None,
+        job_types: Optional[List[str]] = None,
         budget_seconds: float = 2.0,
         per_row_timeout_seconds: float = 8.0
     ) -> Dict[str, int]:
         start = datetime.utcnow()
-        claimed = await self._claim_pending_outbox(limit=limit, tenant_id=tenant_id)
+        claimed = await self._claim_pending_outbox(
+            limit=limit,
+            tenant_id=tenant_id,
+            job_types=job_types
+        )
         counts = {"claimed": len(claimed), "sent": 0, "failed": 0, "pending": 0}
         if not claimed:
             return counts
@@ -664,78 +1239,110 @@ class SessionManager:
             elapsed = (datetime.utcnow() - start).total_seconds()
             if elapsed >= budget_seconds:
                 break
-            key = (row["tenant_id"], row["session_id"], row["user_id"])
-            if key not in summary_cache:
-                buffer = await self.get_or_create_buffer(
-                    row["tenant_id"],
-                    row["session_id"],
-                    row["user_id"]
-                )
-                summary_cache[key] = buffer.get("rolling_summary", "")
+            job_type = (row.get("job_type") or JOB_TYPE_TURN).strip().lower()
 
-            if row.get("folded_at") is None:
-                turn = {
-                    "role": row["role"],
-                    "text": row["text"],
-                    "timestamp": row["ts"].isoformat()
-                }
+            if job_type == JOB_TYPE_TURN:
+                key = (row["tenant_id"], row["session_id"], row["user_id"])
+                if key not in summary_cache:
+                    buffer = await self.get_or_create_buffer(
+                        row["tenant_id"],
+                        row["session_id"],
+                        row["user_id"]
+                    )
+                    summary_cache[key] = buffer.get("rolling_summary", "")
+
+                if row.get("folded_at") is None:
+                    turn = {
+                        "role": row["role"],
+                        "text": row["text"],
+                        "timestamp": row["ts"].isoformat()
+                    }
+                    try:
+                        new_summary = await asyncio.wait_for(
+                            self._fold_into_summary(summary_cache[key], turn),
+                            timeout=per_row_timeout_seconds
+                        )
+                        await self._update_rolling_summary(
+                            row["tenant_id"],
+                            row["session_id"],
+                            new_summary
+                        )
+                        await self._append_transcript_turn(
+                            row["tenant_id"],
+                            row["session_id"],
+                            row["user_id"],
+                            turn
+                        )
+                        await self._mark_outbox_folded(row["id"])
+                        summary_cache[key] = new_summary
+                    except asyncio.TimeoutError as e:
+                        await self._mark_outbox_failed(row["id"], f"fold_timeout: {e}")
+                        counts["pending"] += 1
+                        continue
+                    except Exception as e:
+                        await self._mark_outbox_failed(row["id"], str(e))
+                        counts["pending"] += 1
+                        continue
+
                 try:
-                    new_summary = await asyncio.wait_for(
-                        self._fold_into_summary(summary_cache[key], turn),
-                        timeout=per_row_timeout_seconds
-                    )
-                    await self._update_rolling_summary(
-                        row["tenant_id"],
-                        row["session_id"],
-                        new_summary
-                    )
-                    await self._append_transcript_turn(
-                        row["tenant_id"],
-                        row["session_id"],
-                        row["user_id"],
-                        turn
-                    )
-                    await self._mark_outbox_folded(row["id"])
-                    summary_cache[key] = new_summary
-                except asyncio.TimeoutError as e:
-                    await self._mark_outbox_failed(row["id"], f"fold_timeout: {e}")
-                    counts["pending"] += 1
-                    continue
-                except Exception as e:
-                    await self._mark_outbox_failed(row["id"], str(e))
-                    counts["pending"] += 1
-                    continue
-
-            try:
-                if self.settings.graphiti_per_turn:
-                    episode_name = self._build_episode_name(
-                        tenant_id=row["tenant_id"],
-                        user_id=row["user_id"],
-                        session_id=row["session_id"],
-                        role=row["role"],
-                        ts=row["ts"],
-                        text=row["text"]
-                    )
-                    await asyncio.wait_for(
-                        self._call_add_episode(
-                            graphiti_client,
+                    if self.settings.graphiti_per_turn:
+                        episode_name = self._build_episode_name(
                             tenant_id=row["tenant_id"],
                             user_id=row["user_id"],
-                            text=row["text"],
-                            timestamp=row["ts"],
+                            session_id=row["session_id"],
                             role=row["role"],
-                            metadata={
-                                "session_id": row["session_id"],
-                                "evicted_from_buffer": True
-                            },
-                            episode_name=episode_name
-                        ),
+                            ts=row["ts"],
+                            text=row["text"]
+                        )
+                        response = await asyncio.wait_for(
+                            self._call_add_episode(
+                                graphiti_client,
+                                tenant_id=row["tenant_id"],
+                                user_id=row["user_id"],
+                                text=row["text"],
+                                timestamp=row["ts"],
+                                role=row["role"],
+                                metadata={
+                                    "session_id": row["session_id"],
+                                    "evicted_from_buffer": True
+                                },
+                                episode_name=episode_name
+                            ),
+                            timeout=per_row_timeout_seconds
+                        )
+                        if not self._is_success_response(response):
+                            self._raise_for_graphiti_response_failure(response, context="per_turn_episode")
+                    await self._mark_outbox_sent(row["id"])
+                    counts["sent"] += 1
+                except asyncio.TimeoutError as e:
+                    await self._mark_outbox_failed(row["id"], f"send_timeout: {e}")
+                    counts["pending"] += 1
+                except Exception as e:
+                    if self._is_permanent_outbox_error(e):
+                        await self._mark_outbox_dead_letter(row["id"], str(e))
+                        counts["failed"] += 1
+                    else:
+                        await self._mark_outbox_failed(row["id"], str(e))
+                        counts["pending"] += 1
+                continue
+
+            try:
+                if job_type == JOB_TYPE_SESSION_RAW_EPISODE:
+                    await asyncio.wait_for(
+                        self._handle_session_raw_episode_job(row, graphiti_client),
                         timeout=per_row_timeout_seconds
                     )
+                elif job_type == JOB_TYPE_POST_INGEST_HOOK:
+                    await asyncio.wait_for(
+                        self._handle_post_ingest_hook_job(row),
+                        timeout=per_row_timeout_seconds
+                    )
+                else:
+                    raise TypeError(f"validation error: unknown outbox job_type {job_type}")
                 await self._mark_outbox_sent(row["id"])
                 counts["sent"] += 1
             except asyncio.TimeoutError as e:
-                await self._mark_outbox_failed(row["id"], f"send_timeout: {e}")
+                await self._mark_outbox_failed(row["id"], f"job_timeout: {e}")
                 counts["pending"] += 1
             except Exception as e:
                 if self._is_permanent_outbox_error(e):
@@ -850,7 +1457,7 @@ Do not include filler or meta-commentary."""
             f"- Convert relative dates (like \"tomorrow\") into absolute dates based on the current date ({date_str}).\n"
             "- Use this exact structure:\n"
             "  SUMMARY: 1-2 sentences (what happened, session arc, factual)\n"
-            "  TONE: 1 sentence (emotional state of the user during this session)\n"
+            "  TONE: 1 sentence — what happened in this conversation and how it resolved. Facts only. No mood inference or emotional labelling.\n"
             "  DECISIONS: bullet list only if explicit decisions/commitments were made; otherwise empty\n"
             "  UNRESOLVED: bullet list only if something significant was left open; otherwise empty\n"
             "  MOMENT: 1 sentence for the single most significant thing said/happened, if anything; omit if routine session\n"
@@ -1772,133 +2379,115 @@ Do not include filler or meta-commentary."""
         persona_id: Optional[str] = None
     ) -> bool:
         """
-        Close session: enqueue remaining raw turns to outbox and mark closed.
-        Graphiti-native: send raw transcript as a single episode; no local semantic summary.
+        Close session in enqueue-only mode.
+        Canonical extraction path is /session/ingest -> outbox drain.
         """
         try:
-            buffer = await self.get_or_create_buffer(tenant_id, session_id, user_id)
-
-            # 1. Enqueue remaining raw turns to outbox
-            for turn in buffer["messages"]:
-                await self._insert_outbox(
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    session_id=session_id,
-                    turn=turn
-                )
-
-            logger.info(f"Enqueued {len(buffer['messages'])} remaining turns on session close")
-
-            # 2. Send raw transcript episode to Graphiti (best-effort)
-            started_at = buffer.get("created_at")
-            ended_at = datetime.utcnow()
-            episode_uuid = await self._send_raw_transcript_episode(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                user_id=user_id,
-                graphiti_client=graphiti_client,
-                started_at=started_at,
-                ended_at=ended_at
+            buffer_row = await self.db.fetchone(
+                """
+                SELECT messages, created_at
+                FROM session_buffer
+                WHERE tenant_id = $1 AND session_id = $2 AND user_id = $3
+                """,
+                tenant_id,
+                session_id,
+                user_id
             )
+            buffer_messages = (buffer_row or {}).get("messages") or []
+            if not isinstance(buffer_messages, list):
+                buffer_messages = []
 
-            # 2b. Extract loops from full session transcript (best-effort)
-            try:
-                # Loops are user-scoped; store under canonical default persona key.
-                effective_persona_id = DEFAULT_LOOP_PERSONA_ID
-                full_messages = await self._get_full_transcript_messages(
-                    tenant_id=tenant_id,
-                    session_id=session_id,
-                    user_id=user_id,
-                    buffer=buffer
-                )
-                if full_messages:
-                    last_user_text = next(
-                        (m.get("text") for m in reversed(full_messages) if m.get("role") == "user" and m.get("text")),
-                        None
-                    )
-                    if not last_user_text:
-                        last_user_text = full_messages[-1].get("text") if full_messages[-1].get("text") else ""
-
-                    ts_values = [self._parse_ts(m.get("timestamp")) for m in full_messages]
-                    ts_values = [t for t in ts_values if t]
-                    start_ts = min(ts_values) if ts_values else None
-                    end_ts = max(ts_values) if ts_values else ended_at
-
-                    provenance = {
-                        "session_id": session_id,
-                        "start_ts": start_ts.isoformat() if start_ts else None,
-                        "end_ts": end_ts.isoformat() if end_ts else None
-                    }
-
-                    if last_user_text:
-                        await loops.extract_and_create_loops(
-                            tenant_id=tenant_id,
-                            user_id=user_id,
-                            persona_id=effective_persona_id,
-                            user_text=last_user_text,
-                            recent_turns=full_messages,
-                            source_turn_ts=end_ts or datetime.utcnow(),
-                            session_id=session_id,
-                            provenance=provenance
-                        )
-            except Exception as e:
-                logger.error(f"Loop extraction on session close failed: {e}")
-
-            # 2c. Create SessionSummary node in Graphiti (best-effort)
-            try:
-                full_messages = await self._get_full_transcript_messages(
-                    tenant_id=tenant_id,
-                    session_id=session_id,
-                    user_id=user_id,
-                    buffer=buffer
-                )
-                recaps = await self.summarize_session_messages_with_quality(
-                    messages=full_messages or [],
-                    reference_time=ended_at or datetime.utcnow()
-                )
-                summary_text = (recaps.get("summary_text") or "").strip()
-                bridge_text = (recaps.get("bridge_text") or "").strip()
-                if summary_text:
-                    await graphiti_client.add_session_summary(
-                        tenant_id=tenant_id,
-                        user_id=user_id,
-                        session_id=session_id,
-                        summary_text=summary_text,
-                        bridge_text=bridge_text,
-                        reference_time=ended_at or datetime.utcnow(),
-                        episode_uuid=episode_uuid,
-                        extra_attributes={
-                            "summary_quality_tier": recaps.get("summary_quality_tier"),
-                            "summary_source": recaps.get("summary_source"),
-                            "summary_facts": recaps.get("summary_facts"),
-                            "tone": recaps.get("tone"),
-                            "moment": recaps.get("moment"),
-                            "decisions": recaps.get("decisions") or [],
-                            "unresolved": recaps.get("unresolved") or [],
-                            "index_text": recaps.get("index_text") or "",
-                            "salience": recaps.get("salience") or "low",
-                        },
-                        replace_existing_session=True
-                    )
-            except Exception as e:
-                logger.error(f"Session summary creation failed: {e}")
-
-            # 3. Mark session closed and clear messages
-            query = """
-                UPDATE session_buffer
-                SET closed_at = NOW(),
-                    messages = $1,
-                    updated_at = NOW()
-                WHERE tenant_id = $2 AND session_id = $3
-            """
-            await self.db.execute(
-                query,
-                [],
+            transcript_row = await self.db.fetchone(
+                """
+                SELECT messages
+                FROM session_transcript
+                WHERE tenant_id = $1 AND session_id = $2
+                """,
                 tenant_id,
                 session_id
             )
+            transcript_messages = (transcript_row or {}).get("messages") or []
+            if isinstance(transcript_messages, str):
+                try:
+                    transcript_messages = json.loads(transcript_messages)
+                except Exception:
+                    transcript_messages = []
+            if not isinstance(transcript_messages, list):
+                transcript_messages = []
 
-            logger.info(f"Closed session {session_id}")
+            full_messages: List[Dict[str, Any]] = []
+            full_messages.extend(transcript_messages)
+            full_messages.extend(buffer_messages)
+
+            has_ingest_job = await self._has_session_ingest_job(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=session_id
+            )
+
+            if not has_ingest_job and full_messages:
+                ts_values = [
+                    self._parse_ts((m or {}).get("timestamp"))
+                    for m in full_messages
+                    if isinstance(m, dict)
+                ]
+                ts_values = [t for t in ts_values if t is not None]
+                started_dt = min(ts_values) if ts_values else (buffer_row or {}).get("created_at")
+                ended_dt = max(ts_values) if ts_values else datetime.utcnow()
+                await self.enqueue_session_ingest(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    messages=full_messages,
+                    started_at=started_dt.isoformat() if started_dt else None,
+                    ended_at=ended_dt.isoformat() if ended_dt else None,
+                )
+                logger.info(
+                    "session close enqueued ingest tenant=%s user=%s session=%s messages=%s",
+                    tenant_id,
+                    user_id,
+                    session_id,
+                    len(full_messages),
+                )
+            elif has_ingest_job:
+                logger.info(
+                    "session close detected existing ingest job tenant=%s user=%s session=%s",
+                    tenant_id,
+                    user_id,
+                    session_id,
+                )
+            else:
+                logger.info(
+                    "session close found no transcript content tenant=%s user=%s session=%s",
+                    tenant_id,
+                    user_id,
+                    session_id,
+                )
+
+            query = """
+                UPDATE session_buffer
+                SET closed_at = COALESCE(closed_at, NOW()),
+                    messages = $1,
+                    updated_at = NOW()
+                WHERE tenant_id = $2 AND session_id = $3 AND user_id = $4
+            """
+            updated = await self.db.execute(
+                query,
+                [],
+                tenant_id,
+                session_id,
+                user_id
+            )
+
+            if updated == "UPDATE 0":
+                logger.info(
+                    "session close no session_buffer row to mark closed tenant=%s user=%s session=%s",
+                    tenant_id,
+                    user_id,
+                    session_id,
+                )
+            else:
+                logger.info(f"Closed session {session_id}")
             return True
 
         except Exception as e:
@@ -2050,12 +2639,20 @@ Do not include filler or meta-commentary."""
 
 # Module-level singleton
 _manager: Optional[SessionManager] = None
+_post_ingest_hook_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[bool]]] = None
 
 
 def init_session_manager(db: Database):
     """Initialize the session manager"""
     global _manager
     _manager = SessionManager(db)
+
+
+def set_post_ingest_hook_executor(
+    executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[bool]]]
+) -> None:
+    global _post_ingest_hook_executor
+    _post_ingest_hook_executor = executor
 
 
 async def idle_close_loop(
@@ -2134,6 +2731,26 @@ async def add_turn(
     return await _manager.add_turn(tenant_id, session_id, user_id, role, text, timestamp)
 
 
+async def enqueue_session_ingest(
+    tenant_id: str,
+    session_id: str,
+    user_id: str,
+    messages: List[Dict[str, Any]],
+    started_at: Optional[str],
+    ended_at: Optional[str]
+) -> None:
+    if _manager is None:
+        raise RuntimeError("SessionManager not initialized")
+    await _manager.enqueue_session_ingest(
+        tenant_id=tenant_id,
+        session_id=session_id,
+        user_id=user_id,
+        messages=messages,
+        started_at=started_at,
+        ended_at=ended_at,
+    )
+
+
 async def janitor_process(
     tenant_id: str,
     session_id: str,
@@ -2179,6 +2796,7 @@ async def drain_outbox(
     graphiti_client,
     limit: int = 200,
     tenant_id: Optional[str] = None,
+    job_types: Optional[List[str]] = None,
     budget_seconds: float = 2.0,
     per_row_timeout_seconds: float = 8.0
 ) -> Dict[str, int]:
@@ -2189,6 +2807,7 @@ async def drain_outbox(
         graphiti_client,
         limit=limit,
         tenant_id=tenant_id,
+        job_types=job_types,
         budget_seconds=budget_seconds,
         per_row_timeout_seconds=per_row_timeout_seconds
     )

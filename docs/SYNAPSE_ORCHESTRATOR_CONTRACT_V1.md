@@ -237,33 +237,71 @@ tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z&sessionId=<optional>&pe
 **Response (exact shape)**
 ```json
 {
-  "timeOfDayLabel": "MORNING|AFTERNOON|EVENING|NIGHT|null",
-  "timeGapHuman": "string|null",
-  "bridgeText": "string|null",
-  "items": [
-    {
-      "kind": "loop|tension",
-      "text": "string",
-      "type": "string|null",
-      "timeHorizon": "string|null",
-      "dueDate": "ISO-8601 string|null",
-      "salience": "number|null",
-      "lastSeenAt": "ISO-8601 string|null"
+  "handover_text": "string",
+  "handover_depth": "continuation|yesterday|weekly",
+  "time_context": {
+    "local_time": "HH:MM",
+    "time_of_day": "MORNING|AFTERNOON|EVENING|NIGHT",
+    "gap_minutes": 0,
+    "sessions_today": 0,
+    "first_session_today": true
+  },
+  "resume": {
+    "use_bridge": false,
+    "bridge_text": "string|null"
+  },
+  "ops_context": {
+    "top_loops_today": [],
+    "waiting_on": [],
+    "user_model_hints": [],
+    "yesterday_themes": [],
+    "steering_note": "string|null"
+  },
+  "evidence": {
+    "session_summary_ids_used": [],
+    "session_summary_ids_fetched": [],
+    "summary_fetch_count": 0,
+    "summary_used_count": 0,
+    "summary_content_quality": "ok|none_fetched|empty_after_normalization",
+    "fallback_used": false,
+    "fallback_success": false,
+    "daily_analysis_date_used": "YYYY-MM-DD|null",
+    "freshness": {
+      "has_pending_session_ingest_jobs": false,
+      "pending_raw_episode_jobs": 0,
+      "pending_post_ingest_hook_jobs": 0,
+      "oldest_pending_age_seconds": 0,
+      "latest_pending_session_id": "string|null"
     }
-  ]
+  }
 }
 ```
 
 **Response (example)**
 ```json
 {
-  "timeOfDayLabel": "AFTERNOON",
-  "timeGapHuman": "8 hours since last spoke",
-  "bridgeText": "Last time you spoke, you were focused on the portfolio refresh.",
-  "items": [
-    {"kind": "loop", "type": "thread", "text": "Finish portfolio site", "timeHorizon": "this_week", "salience": 4, "lastSeenAt": "2026-02-06T10:15:00Z"},
-    {"kind": "tension", "text": "Flaky tests in release pipeline"}
-  ]
+  "handover_text": "It is evening, and your most recent thread is still active around the portfolio refresh and one unresolved blocker in test stability.",
+  "handover_depth": "continuation",
+  "time_context": {"local_time": "18:35", "time_of_day": "EVENING", "gap_minutes": 480, "sessions_today": 1, "first_session_today": false},
+  "resume": {"use_bridge": true, "bridge_text": "Continue from the portfolio refresh thread and resolve the remaining test blocker first."},
+  "ops_context": {
+    "top_loops_today": [{"kind": "loop", "text": "Finish portfolio site"}],
+    "waiting_on": [],
+    "user_model_hints": [],
+    "yesterday_themes": [],
+    "steering_note": null
+  },
+  "evidence": {
+    "session_summary_ids_used": ["session-abc"],
+    "session_summary_ids_fetched": ["session-abc"],
+    "summary_fetch_count": 1,
+    "summary_used_count": 1,
+    "summary_content_quality": "ok",
+    "fallback_used": false,
+    "fallback_success": false,
+    "daily_analysis_date_used": "2026-02-05",
+    "freshness": {"has_pending_session_ingest_jobs": false, "pending_raw_episode_jobs": 0, "pending_post_ingest_hook_jobs": 0, "oldest_pending_age_seconds": null, "latest_pending_session_id": null}
+  }
 }
 ```
 
@@ -315,13 +353,13 @@ Write both user and assistant turns. This stores the session transcript only.
 
 Notes:
 - /ingest returns quickly after buffer write; background janitor runs later.
-- Session close (idle) sends **raw transcript** to Graphiti as one episode and stores a `SessionSummary` node.
-- `SessionSummary` generation uses the full transcript with fallback tiers (`llm_primary`, `llm_repair`, `deterministic_fallback`) so summary/bridge are always non-empty.
+- Canonical session finalization is `/session/ingest` (durable transcript upsert + outbox enqueue).
+- `/session/close` is legacy/admin-safe and enqueue-only: it may mark buffer closed and enqueue ingest when needed.
 
 ---
 
 ### POST /session/close
-Public close endpoint to flush raw transcript to Graphiti.
+Legacy/admin-safe close endpoint (enqueue-only).
 
 **Request**
 ```json
@@ -343,9 +381,8 @@ Public close endpoint to flush raw transcript to Graphiti.
 
 Notes:
 - If `sessionId` is omitted, Synapse closes the most recent open session for the user.
-- On close, Synapse sends the raw transcript to Graphiti, stores a `SessionSummary` node in Graphiti,
-  and performs best‑effort loop extraction (commitments/decisions/frictions/habits/threads) into Postgres
-  with provenance metadata.
+- `/session/close` does not execute heavy Graphiti/summary/loop work inline.
+- If no existing `session_raw_episode` ingest job exists for the session, it enqueues one via the same durable path as `/session/ingest`.
 
 ---
 
@@ -373,13 +410,17 @@ Use this if you keep working memory locally and only send full transcripts.
 {
   "status": "ingested",
   "sessionId": "session-abc",
-  "graphitiAdded": true
+  "graphitiAdded": false
 }
 ```
 
 Notes:
-- `/session/ingest` writes a canonical SessionSummary per `(group_id, session_id)` (replace-on-reingest).
-- `bridge_text` from this SessionSummary is what `/session/startbrief` uses first.
+- `/session/ingest` durably upserts `session_transcript` and enqueues outbox jobs.
+- Outbox jobs are typed:
+  - `session_raw_episode`: writes raw transcript episode to Graphiti.
+  - `post_ingest_hook` with `hook=session_summary|open_loops`.
+- Graphiti/session-summary work is async via outbox drain, with retries/backoff and dead-letter on permanent errors.
+- `/session/startbrief` exposes ingest freshness in `evidence.freshness` so orchestration can explain brief lag.
 
 ---
 
@@ -393,7 +434,7 @@ Notes:
 3) **On demand memory**: call `/memory/query` with targeted questions.
 4) LLM responds to user.
 5) Call `/ingest` for the user turn and the assistant turn **or** use `/session/ingest` at end of session.
-6) If user is inactive for 15 minutes, call `/session/close`.
+6) Canonical finalization: call `/session/ingest`. `/session/close` remains legacy/admin-safe and enqueue-only.
 
 ---
 
@@ -403,6 +444,7 @@ All require header `X-Internal-Token` = `INTERNAL_TOKEN`.
 - `GET /internal/debug/session?tenantId&userId&sessionId`
 - `GET /internal/debug/user?tenantId&userId`
 - `GET /internal/debug/outbox?tenantId&limit=50`
+- `GET /internal/debug/session_ingest_status?tenant_id&user_id&session_id`
 - `POST /internal/debug/close_session?tenantId&userId&sessionId`
 - `POST /internal/debug/close_user_sessions?tenantId&userId&limit=20`
 - `POST /internal/debug/emit_raw_episode?tenantId&userId&sessionId`

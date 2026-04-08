@@ -5,15 +5,15 @@ A FastAPI memory service with a sliding‑window session buffer and Graphiti‑n
 ## What it does (short)
 - **/ingest**: writes turns to Postgres (rolling summary + last 12 messages). Never blocks.
 - **/brief**: minimal session seed (time + working memory + rolling summary).
-- **/session/startbrief**: minimal start bridge (bridgeText + up to 5 durable items). Optional `sessionId`, `personaId`, `timezone`.
+- **/session/startbrief**: structured start brief (`handover_text`, `handover_depth`, `time_context`, `resume`, `ops_context`, `evidence`). Optional `sessionId`, `personaId`, `timezone`.
 - **/session/brief**: Graphiti‑native start brief (structured briefContext + facts/openLoops/commitments + currentFocus).
 - **/memory/query**: on‑demand Graphiti semantic recall (clean facts/entities payload by default).
 - **/memory/loops**: prioritized procedural loops (active + needs_review commitments/threads/habits/frictions/decisions; stale hidden).
 - **/user/model**: persistent structured user model with domain completeness scores.
 - **/analysis/daily**: nightly user-level synthesis (themes + Sophie behavior scores + steering note).
-- **/session/close**: flushes raw transcript to Graphiti, stores a SessionSummary node, and extracts procedural loops (best‑effort).
-- **/session/ingest**: send a full session transcript in one call.
-- **Outbox**: reliable delivery of evicted turns; raw transcript is sent to Graphiti on session close.
+- **/session/close**: legacy/admin-safe finalize endpoint; enqueue-only (idempotent) and marks `session_buffer.closed_at` when present.
+- **/session/ingest**: durably upsert full transcript + enqueue internal outbox jobs (`session_raw_episode` then post-ingest hooks).
+- **Outbox**: reliable delivery of evicted turns and session ingest jobs.
 - **SessionSummary quality**: summaries are generated from full transcript with fallback tiers so `summary_text` and `bridge_text` are always non-empty.
 
 ## Quickstart
@@ -36,6 +36,7 @@ curl -s http://localhost:8000/health
 3) LLM responds
 4) `/ingest` user turn
 5) `/ingest` assistant turn
+6) Canonical finalization: call `/session/ingest`; `/session/close` is legacy/admin-safe and enqueue-only.
 
 ## Quick API examples
 **POST /brief**
@@ -62,20 +63,43 @@ curl -s "http://localhost:8000/session/startbrief?tenantId=tenant_a&userId=user_
 Exact response payload shape:
 ```json
 {
-  "timeOfDayLabel": "MORNING|AFTERNOON|EVENING|NIGHT|null",
-  "timeGapHuman": "string|null",
-  "bridgeText": "string|null",
-  "items": [
-    {
-      "kind": "loop|tension",
-      "text": "string",
-      "type": "string|null",
-      "timeHorizon": "string|null",
-      "dueDate": "ISO-8601 string|null",
-      "salience": "number|null",
-      "lastSeenAt": "ISO-8601 string|null"
+  "handover_text": "string",
+  "handover_depth": "continuation|yesterday|weekly",
+  "time_context": {
+    "local_time": "HH:MM",
+    "time_of_day": "MORNING|AFTERNOON|EVENING|NIGHT",
+    "gap_minutes": 0,
+    "sessions_today": 0,
+    "first_session_today": true
+  },
+  "resume": {
+    "use_bridge": false,
+    "bridge_text": "string|null"
+  },
+  "ops_context": {
+    "top_loops_today": [],
+    "waiting_on": [],
+    "user_model_hints": [],
+    "yesterday_themes": [],
+    "steering_note": "string|null"
+  },
+  "evidence": {
+    "session_summary_ids_used": [],
+    "session_summary_ids_fetched": [],
+    "summary_fetch_count": 0,
+    "summary_used_count": 0,
+    "summary_content_quality": "ok|none_fetched|empty_after_normalization",
+    "fallback_used": false,
+    "fallback_success": false,
+    "daily_analysis_date_used": "YYYY-MM-DD|null",
+    "freshness": {
+      "has_pending_session_ingest_jobs": false,
+      "pending_raw_episode_jobs": 0,
+      "pending_post_ingest_hook_jobs": 0,
+      "oldest_pending_age_seconds": 0,
+      "latest_pending_session_id": "string|null"
     }
-  ]
+  }
 }
 ```
 
@@ -221,11 +245,21 @@ Docs:
 - `AUDIT_MEMORY_V1.md`
 - `DECISIONS.md`
 
+Memory surface audit (cross-check `default` and `sophie-prod` for one user/fact):
+```bash
+python3 scripts/audit_memory_surfaces.py \
+  --base-url http://localhost:8000 \
+  --user-id <user_id> \
+  --needle "kidney stones" \
+  --tenant default --tenant sophie-prod
+```
+
 ## Key concepts
 - **Session buffer**: Postgres keeps rolling summary + last 12 messages (6 user+assistant turns).
 - **Outbox**: evicted turns are queued; retries are backoff‑controlled.
-- **Graphiti**: semantic memory (episodes/facts/entities + SessionSummary nodes). Receives raw session transcripts on close.
-- **Loops**: procedural memory (commitments/decisions/frictions/habits/threads) extracted on session close into Postgres.
+- **Session ingest outbox jobs**: `session_raw_episode` (Graphiti raw episode), then `post_ingest_hook` jobs (`session_summary`, `open_loops`).
+- **Graphiti**: semantic memory (episodes/facts/entities + SessionSummary nodes). Receives raw session transcripts from outbox drain.
+- **Loops**: procedural memory (commitments/decisions/frictions/habits/threads) extracted by `post_ingest_hook` jobs into Postgres.
 
 ## Configuration (important)
 Environment flags (see `src/config.py`):
@@ -250,11 +284,11 @@ OUTBOX_DRAIN_ENABLED=true
 - **Graphiti recall is not automatic**: call `/memory/query` to retrieve facts/entities.
 - **/memory/query defaults to clean recall**: include only `facts`, `factItems`, `entities`, `metadata` unless `includeContext=true`.
 - **/session/brief is Graphiti‑native**: facts are filtered for quality (no single-token/vague fragments), and narrativeSummary is derived from Graphiti episode summaries (de‑duplicated from facts).
-- **/session/startbrief is minimal**: short bridgeText (<=280 chars) + up to 5 durable items (loops first, then unresolved tensions).
+- **/session/startbrief is structured**: use `handover_text` and `ops_context.top_loops_today`; do not expect legacy `bridgeText/items` fields.
 - **SessionSummary node fields**: summary content is stored as top-level node props (`summary_text`, `bridge_text`, `session_id`, `summary_quality_tier`, `summary_source`) and also available via Graphiti node attributes.
 - **Outbox won’t drain** unless `/internal/drain` is called or `OUTBOX_DRAIN_ENABLED=true`.
-- **Session close** happens via idle close loop (config) or next ingest. Enable idle close for clean session summaries.
-- **Loop extraction** runs on session close (best‑effort) and does not affect /ingest latency.
+- **Session close** is legacy/admin-safe enqueue-only; canonical finalization is `/session/ingest`.
+- **Loop extraction** runs in outbox drain `post_ingest_hook` jobs (best‑effort) and does not affect `/session/ingest` latency.
 - **Loop staleness janitor** runs in background (daily by default) and marks old loops `stale`/`needs_review`.
 - **Graphiti LLM** uses OpenAI by default (via `OPENAI_API_KEY`) unless overridden by `GRAPHITI_LLM_*` settings.
 - **Noise filter**: very short messages may be marked `skipped`.
@@ -308,7 +342,8 @@ docker compose exec synapse python scripts/force_close_sessions.py \
 Require header `X-Internal-Token` = `INTERNAL_TOKEN`.
 - `/internal/debug/session?tenantId&userId&sessionId`
 - `/internal/debug/user?tenantId&userId`
-- `/internal/debug/outbox?tenantId&limit=50`
+- `/internal/debug/outbox?tenantId&limit=50` (includes `job_type`, `dedupe_key`, retry fields, and payload summary)
+- `/internal/debug/session_ingest_status?tenant_id&user_id&session_id`
 - `/internal/debug/loops?tenantId&userId&format=csv`
 - `/internal/debug/session?tenantId&userId&sessionId`
 - `/internal/debug/nudges?tenantId&userId`

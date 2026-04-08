@@ -1,0 +1,2 @@
+ALTER TABLE habit_daily_log
+    ADD COLUMN IF NOT EXISTS acknowledged BOOLEAN NOT NULL DEFAULT FALSE;

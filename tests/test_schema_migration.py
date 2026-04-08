@@ -47,6 +47,9 @@ async def test_schema_migration():
         outbox_col_names = {row["column_name"] for row in outbox_cols}
         assert "folded_at" in outbox_col_names
         assert "next_attempt_at" in outbox_col_names
+        assert "job_type" in outbox_col_names
+        assert "payload" in outbox_col_names
+        assert "dedupe_key" in outbox_col_names
 
         constraint = await conn.fetchval(
             """
@@ -67,6 +70,16 @@ async def test_schema_migration():
             """
         )
         assert outbox_constraint == "graphiti_outbox_pending_attempts_next_attempt"
+
+        dedupe_constraint = await conn.fetchval(
+            """
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid = 'graphiti_outbox'::regclass
+              AND conname = 'graphiti_outbox_dedupe_key_unique'
+            """
+        )
+        assert dedupe_constraint == "graphiti_outbox_dedupe_key_unique"
     finally:
         await conn.close()
 

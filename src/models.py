@@ -47,6 +47,7 @@ class Fact(BaseModel):
     text: str
     relevance: Optional[float] = None
     source: Optional[str] = None
+    relevance_tier: Optional[str] = None
 
 
 class Entity(BaseModel):
@@ -116,6 +117,7 @@ class MemoryQueryRequest(BaseModel):
     limit: Optional[int] = 10
     referenceTime: Optional[str] = None
     includeContext: Optional[bool] = False
+    focusQuery: Optional[str] = None
 
 
 class MemoryQueryResponse(BaseModel):
@@ -180,13 +182,21 @@ class SessionStartBriefItem(BaseModel):
     lastSeenAt: Optional[str] = None
 
 
+class SessionStartBriefEntityProfile(BaseModel):
+    name: str
+    profile_text: str
+    facts: List[str] = []
+
+
 class SessionStartBriefResponse(BaseModel):
     handover_text: str
+    narrative: Optional[str] = None
     handover_depth: str
     time_context: Dict[str, Any] = {}
     resume: Dict[str, Any] = {}
     ops_context: Dict[str, Any] = {}
     evidence: Dict[str, Any] = {}
+    entity_profiles: List[SessionStartBriefEntityProfile] = []
 
 
 class SessionCloseRequest(BaseModel):
@@ -249,3 +259,24 @@ class DailyAnalysisResponse(BaseModel):
     createdAt: Optional[str] = None
     updatedAt: Optional[str] = None
     metadata: Dict[str, Any] = {}
+
+
+class HabitDailyLogUpsertRequest(BaseModel):
+    tenantId: str
+    userId: str
+    habitId: str
+    completed: Optional[bool] = None
+    nudged: Optional[bool] = None
+    userResponse: Optional[str] = None
+    inferredFrom: Optional[str] = None
+
+
+class HabitDailyLogUpsertResponse(BaseModel):
+    status: str
+    userId: str
+    habitId: str
+    date: str
+    completed: bool
+    nudged: bool
+    userResponse: Optional[str] = None
+    inferredFrom: Optional[str] = None

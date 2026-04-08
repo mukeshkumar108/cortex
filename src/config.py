@@ -24,7 +24,7 @@ class Settings(BaseSettings):
 
     # OpenRouter (for LLM calls)
     openrouter_api_key: Optional[str] = None  # Falls back to openai_api_key
-    openrouter_model: str = "anthropic/claude-3.5-haiku"
+    openrouter_model: str = "xiaomi/mimo-v2-flash"
     llm_timeout: int = 10  # seconds
     openrouter_model_summary: str = "amazon/nova-micro-v1"
     openrouter_model_loops: str = "xiaomi/mimo-v2-flash"
@@ -54,6 +54,14 @@ class Settings(BaseSettings):
     user_model_updater_max_users: int = 100
     user_model_low_confidence: float = 0.55
     user_model_high_confidence: float = 0.9
+    user_model_enrichment_enabled: bool = True
+    user_model_enrichment_interval_seconds: int = 900
+    user_model_enrichment_daily_lookback_hours: int = 24
+    user_model_enrichment_weekly_lookback_days: int = 7
+    user_model_enrichment_max_users: int = 100
+    user_model_enrichment_min_confidence: float = 0.72
+    user_model_enrichment_retry_backoff_seconds: int = 900
+    user_model_enrichment_retry_max_seconds: int = 86400
     loop_staleness_janitor_enabled: bool = True
     loop_staleness_janitor_interval_seconds: int = 86400
     daily_analysis_enabled: bool = True

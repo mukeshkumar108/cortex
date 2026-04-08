@@ -8,3 +8,5 @@ __pycache__/
 logs/
 backups/
 data/
+tmp_*
+*.local.json

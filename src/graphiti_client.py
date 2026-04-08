@@ -96,7 +96,9 @@ NARRATIVE_EXTRACTION_INSTRUCTIONS = (
     "'My priority this week is X', 'Today I need to X', 'Right now I'm trying to X'). "
     "Do not infer focus from complaints, lists of tasks, or implied goals. Do not treat emotions as focus. "
     "Keep focus concise (<= 80 chars), neutral, and user-phrased. "
-    "Capture environment as concrete context details (location/noise/weather) and keep phrasing neutral. "
+    "Capture environment as concrete context details (location/noise/weather) only when they add meaningful context to a memory or event. "
+    "Tag environment facts with a valid_at timestamp matching the episode time so they expire naturally. "
+    "Do not capture environment as standalone facts disconnected from a meaningful moment. "
     "Continue extracting generic entities (names, places, projects). Optionally store one concrete Observation detail."
 )
 
@@ -183,30 +185,129 @@ class GraphitiClient:
     def get_session_summary_write_metrics(self) -> Dict[str, int]:
         return dict(self._metrics)
 
+    @staticmethod
+    def _failure_response(reason: str, error: Optional[Exception] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"success": False, "reason": reason}
+        if error is not None:
+            payload["error"] = str(error)
+            status = getattr(error, "status_code", None)
+            if status is None:
+                status = getattr(error, "status", None)
+            if status is not None:
+                try:
+                    payload["status_code"] = int(status)
+                except Exception:
+                    pass
+        return payload
+
     async def _session_summary_exists(self, driver: Any, group_id: str, session_id: str) -> bool:
         try:
             rows = await driver.execute_query(
                 """
                 MATCH (n:SessionSummary {group_id: $group_id, session_id: $session_id})
-                RETURN count(n) AS count
+                RETURN properties(n) AS props
+                LIMIT 1
                 """,
                 group_id=group_id,
                 session_id=session_id
             )
-            count = 0
-            if rows and isinstance(rows, list):
-                first = rows[0]
-                if isinstance(first, dict):
-                    value = first.get("count")
-                    if isinstance(value, dict):
-                        value = value.get("count")
-                    count = int(value or 0)
-                elif isinstance(first, (list, tuple)) and first:
-                    count = int(first[0] or 0)
-            return count > 0
+            for row in rows or []:
+                for node in extract_node_dicts(row, required_keys=("uuid",)):
+                    if node.get("uuid"):
+                        return True
+            return False
         except Exception as e:
             logger.warning("SessionSummary verify query failed session_id=%s error=%s", session_id, e)
             return False
+
+    async def _session_summary_uuid_exists(self, driver: Any, group_id: str, summary_uuid: str) -> bool:
+        try:
+            rows = await driver.execute_query(
+                """
+                MATCH (n:SessionSummary {group_id: $group_id, uuid: $summary_uuid})
+                RETURN properties(n) AS props
+                LIMIT 1
+                """,
+                group_id=group_id,
+                summary_uuid=summary_uuid,
+            )
+            for row in rows or []:
+                for node in extract_node_dicts(row, required_keys=("uuid",)):
+                    if str(node.get("uuid") or "") == str(summary_uuid):
+                        return True
+            return False
+        except Exception as e:
+            logger.warning(
+                "SessionSummary uuid verify query failed summary_uuid=%s error=%s",
+                summary_uuid,
+                e,
+            )
+            return False
+
+    async def _get_session_summary_uuids(self, driver: Any, group_id: str, session_id: str) -> List[str]:
+        try:
+            rows = await driver.execute_query(
+                """
+                MATCH (n:SessionSummary {group_id: $group_id, session_id: $session_id})
+                RETURN properties(n) AS props
+                """,
+                group_id=group_id,
+                session_id=session_id,
+            )
+            uuids: List[str] = []
+            seen = set()
+            for row in rows or []:
+                for node in extract_node_dicts(row, required_keys=("uuid",)):
+                    uuid = str(node.get("uuid") or "").strip()
+                    if not uuid or uuid in seen:
+                        continue
+                    seen.add(uuid)
+                    uuids.append(uuid)
+            return uuids
+        except Exception as e:
+            logger.warning(
+                "Failed to list existing SessionSummary uuids session_id=%s error=%s",
+                session_id,
+                e,
+            )
+            return []
+
+    async def _delete_session_summary_uuids(
+        self,
+        driver: Any,
+        group_id: str,
+        uuids: List[str],
+        *,
+        session_id: str
+    ) -> None:
+        targets = [str(x).strip() for x in (uuids or []) if str(x).strip()]
+        if not targets:
+            return
+        removed = 0
+        for summary_uuid in targets:
+            try:
+                await driver.execute_query(
+                    """
+                    MATCH (n:SessionSummary {group_id: $group_id, uuid: $summary_uuid})
+                    DETACH DELETE n
+                    """,
+                    group_id=group_id,
+                    summary_uuid=summary_uuid,
+                )
+                removed += 1
+            except Exception as e:
+                logger.warning(
+                    "SessionSummary cleanup delete failed session_id=%s uuid=%s error=%s",
+                    session_id,
+                    summary_uuid,
+                    e,
+                )
+        if removed:
+            logger.info(
+                "SessionSummary cleanup removed %s stale node(s) session_id=%s",
+                removed,
+                session_id,
+            )
 
     async def initialize(self):
         """Initialize Graphiti with FalkorDB connection"""
@@ -329,7 +430,7 @@ class GraphitiClient:
             await self.initialize()
         if not self._initialized or self.client is None:
             logger.warning("Graphiti client unavailable; skipping add_episode")
-            return {"success": False}
+            return self._failure_response("graphiti_client_unavailable")
 
         try:
             composite_user_id = self._make_composite_user_id(tenant_id, user_id)
@@ -364,7 +465,7 @@ class GraphitiClient:
 
         except Exception as e:
             logger.error(f"Failed to add episode: {e}")
-            return {"success": False}
+            return self._failure_response("add_episode_exception", e)
 
     async def add_session_episode(
         self,
@@ -405,27 +506,22 @@ class GraphitiClient:
         if not self._initialized or self.client is None:
             self._inc_metric("session_summary_failed")
             logger.warning("Graphiti client unavailable; skipping add_session_summary")
-            return {"success": False}
+            return self._failure_response("graphiti_client_unavailable")
 
         driver = self._group_driver(tenant_id, user_id)
         if not driver:
             self._inc_metric("session_summary_failed")
             logger.warning("Graphiti driver unavailable; skipping add_session_summary")
-            return {"success": False}
+            return self._failure_response("graphiti_driver_unavailable")
 
         composite_user_id = self._make_composite_user_id(tenant_id, user_id)
+        stale_uuids: List[str] = []
         if replace_existing_session:
-            try:
-                await driver.execute_query(
-                    """
-                    MATCH (n:SessionSummary {group_id: $group_id, session_id: $session_id})
-                    DETACH DELETE n
-                    """,
-                    group_id=composite_user_id,
-                    session_id=session_id
-                )
-            except Exception as e:
-                logger.warning(f"Failed to remove existing SessionSummary for session {session_id}: {e}")
+            stale_uuids = await self._get_session_summary_uuids(
+                driver=driver,
+                group_id=composite_user_id,
+                session_id=session_id,
+            )
 
         name = f"session_summary_{session_id}_{int(reference_time.timestamp())}"
         attributes: Dict[str, Any] = {
@@ -457,31 +553,22 @@ class GraphitiClient:
         except Exception as e:
             self._inc_metric("session_summary_failed")
             logger.error(f"Failed to save SessionSummary node: {e}")
-            return {"success": False}
+            return self._failure_response("session_summary_save_exception", e)
 
-        verified = await self._session_summary_exists(
+        initial_uuid = str(node.uuid)
+        verified = await self._session_summary_uuid_exists(
             driver=driver,
             group_id=composite_user_id,
-            session_id=session_id
+            summary_uuid=str(node.uuid),
         )
         if not verified:
             logger.warning(
-                "SessionSummary verify miss; retrying once session_id=%s group_id=%s",
+                "SessionSummary verify miss by uuid; retrying once session_id=%s group_id=%s uuid=%s",
                 session_id,
-                composite_user_id
+                composite_user_id,
+                node.uuid,
             )
             await asyncio.sleep(0.25)
-            try:
-                await driver.execute_query(
-                    """
-                    MATCH (n:SessionSummary {group_id: $group_id, session_id: $session_id})
-                    DETACH DELETE n
-                    """,
-                    group_id=composite_user_id,
-                    session_id=session_id
-                )
-            except Exception as e:
-                logger.warning("Retry cleanup failed for SessionSummary session_id=%s error=%s", session_id, e)
 
             retry_name = f"{name}_retry"
             retry_node = EntityNode(
@@ -505,13 +592,20 @@ class GraphitiClient:
             except Exception as e:
                 self._inc_metric("session_summary_failed")
                 logger.error("SessionSummary retry save failed session_id=%s error=%s", session_id, e)
-                return {"success": False}
+                return self._failure_response("session_summary_retry_save_exception", e)
 
-            verified = await self._session_summary_exists(
+            verified = await self._session_summary_uuid_exists(
                 driver=driver,
                 group_id=composite_user_id,
-                session_id=session_id
+                summary_uuid=str(node.uuid),
             )
+            if verified and initial_uuid and initial_uuid != str(node.uuid):
+                await self._delete_session_summary_uuids(
+                    driver=driver,
+                    group_id=composite_user_id,
+                    uuids=[initial_uuid],
+                    session_id=session_id,
+                )
 
         if not verified:
             self._inc_metric("session_summary_failed")
@@ -521,6 +615,18 @@ class GraphitiClient:
                 composite_user_id
             )
             return {"success": False, "reason": "write_verify_failed"}
+
+        if replace_existing_session and stale_uuids:
+            stale_candidates = [
+                uuid for uuid in stale_uuids
+                if uuid and uuid != str(node.uuid)
+            ]
+            await self._delete_session_summary_uuids(
+                driver=driver,
+                group_id=composite_user_id,
+                uuids=stale_candidates,
+                session_id=session_id,
+            )
 
         self._inc_metric("session_summary_verified")
 
@@ -571,6 +677,7 @@ class GraphitiClient:
 
         try:
             composite_user_id = self._make_composite_user_id(tenant_id, user_id)
+            scoped_driver = self._group_driver(tenant_id, user_id)
 
             # Search for relevant facts (edges)
             search_fn = self.client.search
@@ -584,6 +691,8 @@ class GraphitiClient:
                 kwargs["rerank"] = True
             if reference_time and "reference_time" in params:
                 kwargs["reference_time"] = reference_time
+            if scoped_driver is not None and "driver" in params:
+                kwargs["driver"] = scoped_driver
             if query_hint:
                 if "query_hint" in params:
                     kwargs["query_hint"] = query_hint
@@ -614,7 +723,9 @@ class GraphitiClient:
                 facts.append({
                     "text": fact_text,
                     "relevance": result.score if hasattr(result, 'score') else None,
-                    "source": "graphiti"
+                    "source": "graphiti",
+                    "valid_at": getattr(result, "valid_at", None),
+                    "invalid_at": getattr(result, "invalid_at", None),
                 })
 
             logger.info(f"search_facts returned {len(facts)} results for query: {query}")
@@ -650,26 +761,55 @@ class GraphitiClient:
 
         try:
             composite_user_id = self._make_composite_user_id(tenant_id, user_id)
+            scoped_driver = self._group_driver(tenant_id, user_id)
 
             # Prefer node-only search when available
-            search_method = getattr(self.client, "_search", None)
+            search_method = getattr(self.client, "search_", None)
             if callable(search_method):
                 try:
                     from graphiti_core.search.search_config_recipes import NODE_HYBRID_SEARCH_RRF
                     config = NODE_HYBRID_SEARCH_RRF.model_copy(deep=True)
                     config.limit = limit * 2
+                    method_params = inspect.signature(search_method).parameters
+                    search_kwargs: Dict[str, Any] = {
+                        "query": query,
+                        "config": config,
+                        "group_ids": [composite_user_id],
+                        "search_filter": search_filter,
+                    }
+                    if reference_time and "reference_time" in method_params:
+                        search_kwargs["reference_time"] = reference_time
+                    if query_hint:
+                        if "query_hint" in method_params:
+                            search_kwargs["query_hint"] = query_hint
+                        elif "context" in method_params:
+                            search_kwargs["context"] = query_hint
+                    if scoped_driver is not None and "driver" in method_params:
+                        search_kwargs["driver"] = scoped_driver
                     results = await search_method(
-                        query=query,
-                        config=config,
-                        group_ids=[composite_user_id],
-                        search_filter=search_filter
+                        **search_kwargs
                     )
                     results = getattr(results, "nodes", [])
                 except Exception:
+                    generic_params = inspect.signature(self.client.search).parameters
+                    generic_kwargs: Dict[str, Any] = {
+                        "query": query,
+                        "group_ids": [composite_user_id],
+                        "num_results": limit * 2,
+                    }
+                    if "rerank" in generic_params:
+                        generic_kwargs["rerank"] = True
+                    if reference_time and "reference_time" in generic_params:
+                        generic_kwargs["reference_time"] = reference_time
+                    if query_hint:
+                        if "query_hint" in generic_params:
+                            generic_kwargs["query_hint"] = query_hint
+                        elif "context" in generic_params:
+                            generic_kwargs["context"] = query_hint
+                    if scoped_driver is not None and "driver" in generic_params:
+                        generic_kwargs["driver"] = scoped_driver
                     results = await self.client.search(
-                        query=query,
-                        group_ids=[composite_user_id],
-                        num_results=limit * 2
+                        **generic_kwargs
                     )
             else:
                 # Fallback to generic search
@@ -684,6 +824,8 @@ class GraphitiClient:
                     kwargs["rerank"] = True
                 if reference_time and "reference_time" in params:
                     kwargs["reference_time"] = reference_time
+                if scoped_driver is not None and "driver" in params:
+                    kwargs["driver"] = scoped_driver
                 if query_hint:
                     if "query_hint" in params:
                         kwargs["query_hint"] = query_hint
@@ -739,6 +881,10 @@ class GraphitiClient:
                     entity_data["attributes"] = result.attributes
                 elif hasattr(result, 'metadata'):
                     entity_data["attributes"] = result.metadata
+                if hasattr(result, 'labels'):
+                    labels = getattr(result, 'labels', None)
+                    if isinstance(labels, list):
+                        entity_data["labels"] = labels
 
                 # Best-effort timestamps for recency selection
                 if hasattr(result, 'created_at'):
@@ -922,16 +1068,7 @@ class GraphitiClient:
             rows = await driver.execute_query(
                 """
                 MATCH (n:SessionSummary {group_id: $group_id})
-                RETURN n.name AS name,
-                       n.summary AS summary,
-                       n.summary_text AS summary_text,
-                       n.bridge_text AS bridge_text,
-                       n.session_id AS session_id,
-                       n.reference_time AS reference_time,
-                       n.created_at AS created_at,
-                       n.uuid AS uuid,
-                       n.group_id AS group_id,
-                       n.attributes AS attributes
+                RETURN properties(n) AS props
                 ORDER BY n.created_at DESC
                 LIMIT 1
                 """,
@@ -939,41 +1076,16 @@ class GraphitiClient:
             )
             if not rows:
                 return None
-            node = pick_first_node(rows, required_keys=("name",))
-            if node:
-                attributes = node.get("attributes") or {}
-                summary_text = node.get("summary_text")
-                if not summary_text and isinstance(attributes, dict):
-                    summary_text = attributes.get("summary_text")
-                bridge_text = node.get("bridge_text")
-                if not bridge_text and isinstance(attributes, dict):
-                    bridge_text = attributes.get("bridge_text")
-                return {
-                    "name": node.get("name"),
-                    "summary": node.get("summary"),
-                    "summary_text": summary_text,
-                    "bridge_text": bridge_text,
-                    "session_id": node.get("session_id"),
-                    "reference_time": node.get("reference_time"),
-                    "created_at": node.get("created_at"),
-                    "uuid": node.get("uuid"),
-                    "group_id": node.get("group_id"),
-                    "attributes": node.get("attributes") or {}
-                }
-            row = rows[0]
-            if isinstance(row, (list, tuple)):
-                return {
-                    "name": row[0] if len(row) > 0 else None,
-                    "summary": row[1] if len(row) > 1 else None,
-                    "summary_text": row[2] if len(row) > 2 else None,
-                    "bridge_text": row[3] if len(row) > 3 else None,
-                    "session_id": row[4] if len(row) > 4 else None,
-                    "reference_time": row[5] if len(row) > 5 else None,
-                    "created_at": row[6] if len(row) > 6 else None,
-                    "uuid": row[7] if len(row) > 7 else None,
-                    "group_id": row[8] if len(row) > 8 else None,
-                    "attributes": row[9] if len(row) > 9 else {}
-                }
+            for row in rows or []:
+                for node in extract_node_dicts(row, required_keys=("uuid",)):
+                    normalized = self._normalize_session_summary_props(node)
+                    if normalized:
+                        return normalized
+            node = pick_first_node(rows)
+            if isinstance(node, dict):
+                normalized = self._normalize_session_summary_props(node)
+                if normalized:
+                    return normalized
             return None
         except Exception as e:
             logger.error(f"get_latest_session_summary_node failed: {e}")
@@ -1003,16 +1115,7 @@ class GraphitiClient:
             rows = await driver.execute_query(
                 """
                 MATCH (n:SessionSummary {group_id: $group_id})
-                RETURN n.name AS name,
-                       n.summary AS summary,
-                       n.summary_text AS summary_text,
-                       n.bridge_text AS bridge_text,
-                       n.session_id AS session_id,
-                       n.reference_time AS reference_time,
-                       n.created_at AS created_at,
-                       n.uuid AS uuid,
-                       n.group_id AS group_id,
-                       n.attributes AS attributes
+                RETURN properties(n) AS props
                 ORDER BY n.created_at DESC
                 LIMIT $limit
                 """,
@@ -1021,50 +1124,61 @@ class GraphitiClient:
             )
             out: List[Dict[str, Any]] = []
             for row in rows or []:
-                node = None
-                nodes = extract_node_dicts(row, required_keys=("name",))
-                if nodes:
-                    node = nodes[0]
-                if node:
-                    attributes = node.get("attributes") or {}
-                    summary_text = node.get("summary_text")
-                    if not summary_text and isinstance(attributes, dict):
-                        summary_text = attributes.get("summary_text")
-                    bridge_text = node.get("bridge_text")
-                    if not bridge_text and isinstance(attributes, dict):
-                        bridge_text = attributes.get("bridge_text")
-                    out.append({
-                        "name": node.get("name"),
-                        "summary": node.get("summary"),
-                        "summary_text": summary_text,
-                        "bridge_text": bridge_text,
-                        "session_id": node.get("session_id"),
-                        "reference_time": node.get("reference_time"),
-                        "created_at": node.get("created_at"),
-                        "uuid": node.get("uuid"),
-                        "group_id": node.get("group_id"),
-                        "attributes": attributes if isinstance(attributes, dict) else {}
-                    })
-                    continue
-
-                if isinstance(row, (list, tuple)):
-                    attrs = row[9] if len(row) > 9 and isinstance(row[9], dict) else {}
-                    out.append({
-                        "name": row[0] if len(row) > 0 else None,
-                        "summary": row[1] if len(row) > 1 else None,
-                        "summary_text": (row[2] if len(row) > 2 else None) or attrs.get("summary_text"),
-                        "bridge_text": (row[3] if len(row) > 3 else None) or attrs.get("bridge_text"),
-                        "session_id": row[4] if len(row) > 4 else None,
-                        "reference_time": row[5] if len(row) > 5 else None,
-                        "created_at": row[6] if len(row) > 6 else None,
-                        "uuid": row[7] if len(row) > 7 else None,
-                        "group_id": row[8] if len(row) > 8 else None,
-                        "attributes": attrs
-                    })
+                for node in extract_node_dicts(row, required_keys=("uuid",)):
+                    normalized = self._normalize_session_summary_props(node)
+                    if normalized:
+                        out.append(normalized)
             return out
         except Exception as e:
             logger.error(f"get_recent_session_summary_nodes failed: {e}")
             return []
+
+    @staticmethod
+    def _normalize_session_summary_props(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(node, dict):
+            return None
+
+        attrs_raw = node.get("attributes")
+        attrs: Dict[str, Any] = attrs_raw if isinstance(attrs_raw, dict) else {}
+        synthesized_attrs = dict(attrs)
+        # Graphiti currently flattens custom attributes to top-level node properties.
+        # Rebuild a stable attributes map so downstream code can read either shape.
+        for key in (
+            "summary_text",
+            "bridge_text",
+            "session_id",
+            "reference_time",
+            "summary_facts",
+            "tone",
+            "moment",
+            "decisions",
+            "unresolved",
+            "index_text",
+            "salience",
+        ):
+            value = node.get(key)
+            if value is not None and key not in synthesized_attrs:
+                synthesized_attrs[key] = value
+
+        summary_text = node.get("summary_text")
+        if not summary_text:
+            summary_text = synthesized_attrs.get("summary_text")
+        bridge_text = node.get("bridge_text")
+        if not bridge_text:
+            bridge_text = synthesized_attrs.get("bridge_text")
+
+        return {
+            "name": node.get("name"),
+            "summary": node.get("summary"),
+            "summary_text": summary_text,
+            "bridge_text": bridge_text,
+            "session_id": node.get("session_id") or synthesized_attrs.get("session_id"),
+            "reference_time": node.get("reference_time") or synthesized_attrs.get("reference_time"),
+            "created_at": node.get("created_at"),
+            "uuid": node.get("uuid"),
+            "group_id": node.get("group_id"),
+            "attributes": synthesized_attrs,
+        }
 
     async def get_session_summary_nodes_by_ids(
         self,

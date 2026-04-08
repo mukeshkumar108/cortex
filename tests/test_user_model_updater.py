@@ -5,9 +5,12 @@ import pytest
 
 from src.main import (
     _apply_user_model_proposal,
+    _has_meaningful_user_model_diff,
+    _proposal_from_enrichment_payload,
     _compute_daily_analysis_quality_flag,
     _build_user_model_staleness_metadata,
     _default_user_model,
+    _normalize_user_model,
     _infer_domain_from_text,
     _is_strategic_goal_candidate,
     _map_loop_domain_to_north_star,
@@ -61,6 +64,307 @@ def test_apply_user_model_proposal_preserves_stronger_user_stated_north_star():
     assert merged["north_star"]["work"]["goal"] == "Build products that change behavior at scale"
     assert merged["north_star"]["work"]["goal_source"] == "user_stated"
     assert merged["north_star"]["work"]["goal_confidence"] == 0.95
+
+
+def test_apply_user_model_proposal_llm_enricher_overrides_inferred_same_field():
+    current = _default_user_model()
+    current["work_context"] = {
+        "text": "Legacy inferred work context",
+        "confidence": 0.55,
+        "source": "inferred",
+        "updated_at": "2026-02-20T00:00:00Z",
+    }
+
+    proposal = {
+        "work_context": {
+            "text": "Shaping release quality for memory product",
+            "confidence": 0.72,
+            "source": "llm_session_enricher",
+            "updated_at": "2026-02-22T00:00:00Z",
+        }
+    }
+
+    merged = _apply_user_model_proposal(current, proposal)
+    assert merged["work_context"]["text"] == "Shaping release quality for memory product"
+    assert merged["work_context"]["source"] == "llm_session_enricher"
+
+
+def test_apply_user_model_proposal_preserves_user_stated_over_llm_enricher():
+    current = _default_user_model()
+    current["current_focus"] = {
+        "text": "Ship integration with reliability checks",
+        "confidence": 0.92,
+        "source": "user_stated",
+        "updated_at": "2026-02-20T00:00:00Z",
+    }
+
+    proposal = {
+        "current_focus": {
+            "text": "Keep moving on project updates",
+            "confidence": 0.8,
+            "source": "llm_session_enricher",
+            "updated_at": "2026-02-22T00:00:00Z",
+        }
+    }
+
+    merged = _apply_user_model_proposal(current, proposal)
+    assert merged["current_focus"]["text"] == "Ship integration with reliability checks"
+    assert merged["current_focus"]["source"] == "user_stated"
+
+
+def test_apply_user_model_proposal_is_idempotent_for_patterns_and_relationships():
+    current = _default_user_model()
+    proposal = {
+        "patterns": [
+            {
+                "text": "Returns to long-standing threads after short pauses",
+                "confidence": 0.78,
+                "source": "llm_session_enricher",
+                "updated_at": "2026-02-22T00:00:00Z",
+                "evidence": [
+                    {"session_id": "s1", "msg_index": 1, "quote": "I keep returning to the same thread."},
+                    {"session_id": "s2", "msg_index": 2, "quote": "Again I am back on that thread."},
+                ],
+            }
+        ],
+        "key_relationships": [
+            {
+                "name": "Ashley",
+                "who": "partner",
+                "status": "repairing",
+                "confidence": 0.79,
+                "source": "llm_session_enricher",
+                "updated_at": "2026-02-22T00:00:00Z",
+            }
+        ],
+    }
+
+    merged_once = _apply_user_model_proposal(current, proposal)
+    merged_twice = _apply_user_model_proposal(merged_once, proposal)
+    assert merged_once == merged_twice
+    assert len(merged_twice["patterns"]) == 1
+    assert len(merged_twice["key_relationships"]) == 1
+
+
+def test_enrichment_payload_items_without_evidence_are_rejected():
+    payload = {
+        "key_relationships": [
+            {
+                "name": "Ashley",
+                "who": "partner",
+                "status": "repairing",
+                "confidence": 0.88,
+            }
+        ],
+        "patterns": [
+            {
+                "text": "Returns to unresolved threads",
+                "confidence": 0.81,
+            }
+        ],
+        "current_focus": {
+            "text": "Ship memory reliability improvements",
+            "confidence": 0.82,
+        },
+        "small_human_details": [
+            {
+                "text": "Feels pressure before shipping",
+                "confidence": 0.8,
+            }
+        ],
+        "north_star": {
+            "work": {
+                "goal": "Ship a reliable memory system",
+                "goal_confidence": 0.85,
+            }
+        },
+    }
+    proposal = _proposal_from_enrichment_payload(
+        payload=payload,
+        min_confidence=0.72,
+        source="llm_session_enricher",
+        now_iso="2026-02-22T00:00:00Z",
+    )
+    assert proposal == {}
+
+
+def test_enrichment_pattern_requires_two_sessions_or_habitual():
+    payload = {
+        "patterns": [
+            {
+                "text": "Returns to unresolved work threads",
+                "confidence": 0.84,
+                "evidences": [
+                    {"session_id": "s1", "msg_index": 1, "quote": "I keep circling back to the same release problem."},
+                    {"session_id": "s2", "msg_index": 3, "quote": "Again I'm stuck on that release reliability issue."},
+                ],
+                "habitual_explicit": False,
+            },
+            {
+                "text": "went for a walk",
+                "confidence": 0.95,
+                "evidences": [
+                    {"session_id": "s1", "msg_index": 2, "quote": "I went for a walk."},
+                    {"session_id": "s2", "msg_index": 1, "quote": "I went for a walk again."},
+                ],
+                "habitual_explicit": False,
+            },
+            {
+                "text": "tends to delay start until late evening",
+                "confidence": 0.78,
+                "evidences": [
+                    {"session_id": "s3", "msg_index": 0, "quote": "I tend to delay starting until late evening."},
+                ],
+                "habitual_explicit": True,
+            },
+        ]
+    }
+    proposal = _proposal_from_enrichment_payload(
+        payload=payload,
+        min_confidence=0.72,
+        source="llm_session_enricher",
+        now_iso="2026-02-22T00:00:00Z",
+    )
+    texts = [p["text"] for p in proposal.get("patterns", [])]
+    assert "Returns to unresolved work threads" in texts
+    assert "tends to delay start until late evening" in texts
+    assert "went for a walk" not in texts
+
+
+def test_enrichment_steps_go_to_daily_anchors_not_preferences_notes():
+    payload = {
+        "small_human_details": [
+            {
+                "text": "10,000 steps goal",
+                "confidence": 0.82,
+                "evidence": {"session_id": "s1", "msg_index": 0, "quote": "I will do 10,000 steps tomorrow."},
+            },
+            {
+                "text": "5,000 steps minimum",
+                "confidence": 0.8,
+                "evidence": {"session_id": "s2", "msg_index": 1, "quote": "At minimum I want 5,000 steps."},
+            },
+        ]
+    }
+    proposal = _proposal_from_enrichment_payload(
+        payload=payload,
+        min_confidence=0.72,
+        source="llm_session_enricher",
+        now_iso="2026-02-22T00:00:00Z",
+    )
+    assert "preferences" not in proposal
+    anchors = proposal.get("daily_anchors") or {}
+    assert anchors.get("steps_goal", {}).get("value") == 10000
+    assert anchors.get("minimum_steps", {}).get("value") == 5000
+
+
+def test_user_model_hygiene_drops_invalid_patterns_and_migrates_step_notes():
+    model = _default_user_model()
+    model["patterns"] = [
+        {
+            "text": "going for a walk",
+            "source": "llm_session_enricher",
+            "confidence": 0.9,
+            "evidence": {"session_id": "s1", "msg_index": 0, "quote": "I am going for a walk."},
+        },
+        {
+            "text": "Returns to unresolved release threads",
+            "source": "llm_session_enricher",
+            "confidence": 0.84,
+            "evidence": [
+                {"session_id": "s1", "msg_index": 1, "quote": "Still on that release issue."},
+                {"session_id": "s2", "msg_index": 2, "quote": "Again back to release reliability."},
+            ],
+        },
+    ]
+    model["preferences"] = {
+        "notes": ["5,000 steps today", "10,000 steps goal", "prefers direct language"],
+        "confidence": 0.72,
+        "source": "llm_session_enricher",
+        "updated_at": "2026-02-22T13:01:11.686194",
+        "evidence": [
+            {"session_id": "s3", "msg_index": 3, "quote": "I did 5,000 steps today."},
+            {"session_id": "s4", "msg_index": 0, "quote": "I will do a 10K walk tomorrow morning."},
+        ],
+    }
+
+    normalized = _normalize_user_model(model)
+    texts = [row.get("text") for row in normalized.get("patterns", []) if isinstance(row, dict)]
+    assert "going for a walk" not in texts
+    assert "Returns to unresolved release threads" in texts
+    assert normalized.get("preferences", {}).get("notes") == ["prefers direct language"]
+    assert normalized.get("daily_anchors", {}).get("steps_goal", {}).get("value") == 10000
+    assert normalized.get("daily_anchors", {}).get("minimum_steps", {}).get("value") == 5000
+
+
+def test_user_model_hygiene_drops_malformed_relationship_entries():
+    model = _default_user_model()
+    model["key_relationships"] = [
+        {
+            "name": "and",
+            "who": "brother",
+            "status": "active",
+            "source": "llm_session_enricher",
+            "confidence": 0.82,
+        },
+        {
+            "name": "Nina",
+            "who": "partner",
+            "status": "active",
+            "source": "user_stated",
+            "confidence": 0.91,
+        },
+        {
+            "name": "Alex",
+            "who": "",
+            "status": "active",
+            "source": "inferred",
+            "confidence": 0.7,
+        },
+    ]
+
+    normalized = _normalize_user_model(model)
+    relationships = normalized.get("key_relationships") or []
+    assert len(relationships) == 1
+    assert relationships[0]["name"] == "Nina"
+    assert relationships[0]["who"] == "partner"
+    assert relationships[0]["status"] == "active"
+
+
+def test_hygiene_meaningful_diff_ignores_metadata_and_order():
+    before = _default_user_model()
+    before["patterns"] = [
+        {
+            "text": "Returns to unresolved release threads",
+            "source": "llm_session_enricher",
+            "confidence": 0.81,
+            "updated_at": "2026-02-22T10:00:00Z",
+        }
+    ]
+    before["preferences"] = {
+        "notes": ["prefers direct language", "short check-ins"],
+        "source": "llm_session_enricher",
+        "updated_at": "2026-02-22T10:00:00Z",
+        "confidence": 0.7,
+    }
+
+    after = _default_user_model()
+    after["patterns"] = [
+        {
+            "text": "Returns to unresolved release threads",
+            "source": "inferred",
+            "confidence": 0.55,
+            "updated_at": "2026-02-22T12:00:00Z",
+        }
+    ]
+    after["preferences"] = {
+        "notes": ["short check-ins", "prefers direct language"],
+        "source": "inferred",
+        "updated_at": "2026-02-22T12:00:00Z",
+        "confidence": 0.55,
+    }
+
+    assert _has_meaningful_user_model_diff(before, after) is False
 
 
 def test_user_model_staleness_metadata_thresholds():

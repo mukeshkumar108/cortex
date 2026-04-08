@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Response
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Response, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
@@ -6,8 +6,10 @@ from datetime import datetime, timedelta, date, timezone as dt_timezone
 import logging
 import re
 import json
+import uuid
 from copy import deepcopy
 from typing import Optional, Dict, Any, List, Tuple
+from urllib.parse import parse_qsl, urlencode
 
 from .models import (
     IngestRequest,
@@ -22,6 +24,7 @@ from .models import (
     Entity,
     SessionStartBriefResponse,
     SessionStartBriefItem,
+    SessionStartBriefEntityProfile,
     SessionCloseRequest,
     SessionIngestRequest,
     SessionIngestResponse,
@@ -30,6 +33,8 @@ from .models import (
     UserModelPatchRequest,
     UserModelResponse,
     DailyAnalysisResponse,
+    HabitDailyLogUpsertRequest,
+    HabitDailyLogUpsertResponse,
 )
 from .utils import extract_location
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -86,6 +91,55 @@ def _normalize_text(value: Any) -> str:
     if not isinstance(value, str):
         value = str(value)
     return re.sub(r"\s+", " ", value).strip()
+
+
+TENANT_ALIASES: Dict[str, str] = {
+    "sophie-prod": "default",
+}
+
+TENANT_ALIAS_REVERSE: Dict[str, List[str]] = {}
+for _alias, _canonical in TENANT_ALIASES.items():
+    TENANT_ALIAS_REVERSE.setdefault(_canonical, []).append(_alias)
+
+
+def _canonical_tenant_id(value: Any) -> Any:
+    clean = _normalize_text(value)
+    if not clean:
+        return value
+    canonical = TENANT_ALIASES.get(clean.lower())
+    return canonical or value
+
+
+def _tenant_scope_candidates(value: Any) -> List[str]:
+    """
+    Return canonical tenant first, then known equivalent aliases.
+    This supports read-path fallback when historical rows were written
+    before alias normalization was consistently applied.
+    """
+    clean = _normalize_text(value)
+    if not clean:
+        return []
+    canonical = _normalize_text(_canonical_tenant_id(clean)) or clean
+    candidates: List[str] = []
+    for item in [canonical, clean, *(TENANT_ALIAS_REVERSE.get(canonical, []))]:
+        normalized = _normalize_text(item)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+    return candidates
+
+
+def _normalize_tenant_aliases_in_payload(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        normalized: Dict[str, Any] = {}
+        for key, value in payload.items():
+            if key in {"tenantId", "tenant_id"}:
+                normalized[key] = _canonical_tenant_id(value)
+            else:
+                normalized[key] = _normalize_tenant_aliases_in_payload(value)
+        return normalized
+    if isinstance(payload, list):
+        return [_normalize_tenant_aliases_in_payload(item) for item in payload]
+    return payload
 
 
 def _strip_list_prefix(value: str) -> str:
@@ -356,13 +410,22 @@ def _default_user_model() -> Dict[str, Any]:
 
     return {
         "north_star": _default_north_star(),
+        "preferred_name": None,
+        "age": None,
+        "sex": None,
+        "location": None,
         "current_focus": None,
         "key_relationships": [],
         "work_context": None,
         "patterns": [],
+        "recent_signals": [],
+        "daily_anchors": {},
         "preferences": {},
         "health": None,
         "spirituality": None,
+        "narrative": None,
+        "narrative_stable": None,
+        "narrative_current": None,
     }
 
 
@@ -566,6 +629,7 @@ def _build_user_model_staleness_metadata(
     _record("health", model.get("health"), default_days)
     _record("spirituality", model.get("spirituality"), default_days)
     _record("preferences", model.get("preferences"), default_days)
+    _record("daily_anchors", model.get("daily_anchors"), default_days)
 
     north_star = model.get("north_star")
     if isinstance(north_star, dict):
@@ -581,6 +645,11 @@ def _build_user_model_staleness_metadata(
     if isinstance(patterns, list):
         for idx, row in enumerate(patterns):
             _record(f"patterns[{idx}]", row, default_days)
+
+    recent_signals = model.get("recent_signals")
+    if isinstance(recent_signals, list):
+        for idx, row in enumerate(recent_signals):
+            _record(f"recent_signals[{idx}]", row, default_days)
 
     stale_paths = [path for path, meta in fields.items() if meta.get("stale")]
     return {
@@ -614,10 +683,247 @@ def _normalize_user_model(value: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     baseline = _default_user_model()
     if not isinstance(value, dict):
         return baseline
-    normalized = baseline.copy()
+    normalized = deepcopy(baseline)
     normalized.update(value)
     normalized["north_star"] = _normalize_north_star(normalized.get("north_star"))
-    return normalized
+    return _sanitize_user_model_hygiene(normalized)
+
+
+def _hydrate_user_model_narratives(model: Dict[str, Any], row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    hydrated = _normalize_user_model(model if isinstance(model, dict) else None)
+    stable = _normalize_text(hydrated.get("narrative_stable")) or _normalize_text((row or {}).get("narrative_stable")) or None
+    current = _normalize_text(hydrated.get("narrative_current")) or _normalize_text((row or {}).get("narrative_current")) or None
+    hydrated["narrative_stable"] = stable
+    hydrated["narrative_current"] = current
+    hydrated["narrative"] = _normalize_text(" ".join([x for x in [stable, current] if x])) or _normalize_text(hydrated.get("narrative")) or None
+    return hydrated
+
+
+def _is_high_trust_model_source(source: Any) -> bool:
+    return _normalize_text(source).lower() in {"user_stated", "manual_patch"}
+
+
+def _extract_pattern_evidence_rows(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    evidence = row.get("evidence")
+    if isinstance(evidence, list):
+        out.extend([e for e in evidence if isinstance(e, dict)])
+    elif isinstance(evidence, dict):
+        out.append(evidence)
+    evidences = row.get("evidences")
+    if isinstance(evidences, list):
+        out.extend([e for e in evidences if isinstance(e, dict)])
+    cleaned: List[Dict[str, Any]] = []
+    seen = set()
+    for item in out:
+        session_id = _normalize_text(item.get("session_id"))
+        quote = _normalize_text(item.get("quote"))
+        msg_index = item.get("msg_index")
+        timestamp = _normalize_text(item.get("timestamp"))
+        key = (session_id.lower(), quote.lower(), msg_index, timestamp.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(item)
+    return cleaned
+
+
+def _pattern_meets_hygiene_rules(row: Dict[str, Any], text: str) -> bool:
+    if _looks_like_single_action_pattern(text):
+        return False
+    source = row.get("source")
+    if _is_high_trust_model_source(source):
+        return True
+    if bool(row.get("habitual_explicit")):
+        return True
+    evidences = _extract_pattern_evidence_rows(row)
+    sessions = {_normalize_text(e.get("session_id")).lower() for e in evidences if _normalize_text(e.get("session_id"))}
+    return len(sessions) >= 2
+
+
+def _sanitize_patterns_for_hygiene(patterns: Any) -> List[Dict[str, Any]]:
+    if not isinstance(patterns, list):
+        return []
+    index: Dict[str, Dict[str, Any]] = {}
+    for row in patterns:
+        if not isinstance(row, dict):
+            continue
+        text = _normalize_text(row.get("text"))
+        if not text:
+            continue
+        candidate = deepcopy(row)
+        candidate["text"] = text[:160]
+        if not _pattern_meets_hygiene_rules(candidate, text):
+            continue
+        key = text.lower()
+        prev = index.get(key)
+        if not prev:
+            index[key] = candidate
+            continue
+        prev_conf = _extract_confidence(prev, default=0.0)
+        next_conf = _extract_confidence(candidate, default=0.0)
+        if _should_replace_by_source(
+            existing_source=prev.get("source"),
+            existing_conf=prev_conf,
+            incoming_source=candidate.get("source"),
+            incoming_conf=next_conf,
+        ):
+            index[key] = candidate
+    return list(index.values())
+
+
+_RELATIONSHIP_SIGNAL_TEXT_RE = re.compile(
+    r"^(?P<name>[^()\n:][^()\n:]{0,79}) \((?P<who>[a-z][a-z0-9 _-]{1,39})\): (?P<status>[^\n:][^\n]{0,79})$",
+    flags=re.IGNORECASE,
+)
+_INVALID_RELATIONSHIP_ENTITIES = {"and", "or", "but", "the", "a", "an", "of", "in", "to"}
+
+
+def _build_relationship_signal_text(name: Any, who: Any, status: Any) -> Optional[str]:
+    normalized_name = _normalize_text(name)
+    normalized_who = _normalize_text(who).lower()
+    normalized_status = _normalize_text(status).lower()
+    if not normalized_name or not normalized_who or not normalized_status:
+        return None
+    if normalized_name.lower() in _INVALID_RELATIONSHIP_ENTITIES:
+        return None
+    text = f"{normalized_name} ({normalized_who}): {normalized_status}"
+    match = _RELATIONSHIP_SIGNAL_TEXT_RE.match(text)
+    if not match:
+        return None
+    if _normalize_text(match.group("name")).lower() in _INVALID_RELATIONSHIP_ENTITIES:
+        return None
+    return text
+
+
+def _sanitize_relationships_for_hygiene(relationships: Any) -> List[Dict[str, Any]]:
+    if not isinstance(relationships, list):
+        return []
+    cleaned: List[Dict[str, Any]] = []
+    for row in relationships:
+        if not isinstance(row, dict):
+            continue
+        if not _build_relationship_signal_text(row.get("name"), row.get("who"), row.get("status")):
+            continue
+        candidate = deepcopy(row)
+        candidate["name"] = _normalize_text(row.get("name"))[:80]
+        candidate["who"] = _normalize_text(row.get("who")).lower()[:40]
+        candidate["status"] = _normalize_text(row.get("status")).lower()[:40]
+        cleaned.append(candidate)
+    return _merge_relationships([], cleaned)
+
+
+def _extract_anchor_evidence_from_preferences(preferences: Dict[str, Any], note_index: int) -> Optional[Dict[str, Any]]:
+    evidence_payload = preferences.get("evidence")
+    if isinstance(evidence_payload, list):
+        if 0 <= note_index < len(evidence_payload):
+            candidate = evidence_payload[note_index]
+            if isinstance(candidate, dict):
+                return candidate
+        for candidate in evidence_payload:
+            if isinstance(candidate, dict):
+                return candidate
+    elif isinstance(evidence_payload, dict):
+        return evidence_payload
+    return None
+
+
+def _migrate_preferences_notes_to_daily_anchors(model: Dict[str, Any]) -> Dict[str, Any]:
+    preferences = model.get("preferences")
+    if not isinstance(preferences, dict):
+        return model
+    notes = preferences.get("notes")
+    if not isinstance(notes, list):
+        return model
+
+    now_iso = datetime.utcnow().isoformat()
+    source = _normalize_text(preferences.get("source")) or "inferred"
+    confidence = _normalize_confidence(preferences.get("confidence"), default=0.7)
+    incoming_anchors: Dict[str, Any] = {}
+    kept_notes: List[str] = []
+
+    for idx, item in enumerate(notes):
+        note = _normalize_text(item)
+        if not note:
+            continue
+        if not _looks_like_daily_anchor_signal(note):
+            kept_notes.append(note[:200])
+            continue
+        value = _extract_steps_anchor_value(note)
+        if value is None:
+            kept_notes.append(note[:200])
+            continue
+        key = "steps_goal" if ("goal" in note.lower() or value >= 8000) else "minimum_steps"
+        evidence = _extract_anchor_evidence_from_preferences(preferences, idx)
+        incoming_anchors[key] = {
+            "value": int(value),
+            "confidence": confidence,
+            "source": source,
+            "updated_at": _normalize_text(preferences.get("updated_at")) or now_iso,
+            "evidence": evidence,
+        }
+
+    if incoming_anchors:
+        model["daily_anchors"] = _merge_daily_anchors(model.get("daily_anchors"), incoming_anchors)
+
+    updated_preferences = deepcopy(preferences)
+    if kept_notes:
+        updated_preferences["notes"] = kept_notes[:4]
+    else:
+        updated_preferences.pop("notes", None)
+    model["preferences"] = updated_preferences
+    return model
+
+
+def _sanitize_user_model_hygiene(model: Dict[str, Any]) -> Dict[str, Any]:
+    cleaned = deepcopy(model) if isinstance(model, dict) else _default_user_model()
+    cleaned["key_relationships"] = _sanitize_relationships_for_hygiene(cleaned.get("key_relationships"))
+    cleaned["patterns"] = _sanitize_patterns_for_hygiene(cleaned.get("patterns"))
+    cleaned["recent_signals"] = _merge_recent_signals(
+        cleaned.get("recent_signals") if isinstance(cleaned.get("recent_signals"), list) else [],
+        [],
+    )
+    cleaned = _migrate_preferences_notes_to_daily_anchors(cleaned)
+    return cleaned
+
+
+_HYGIENE_DIFF_METADATA_KEYS = {
+    "updated_at",
+    "source",
+    "confidence",
+    "evidence",
+    "expires_at",
+    "goal_confidence",
+    "vision_confidence",
+    "goal_source",
+    "vision_source",
+    "habitual_explicit",
+}
+
+
+def _canonicalize_user_model_for_hygiene_diff(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if key in _HYGIENE_DIFF_METADATA_KEYS:
+                continue
+            canonical = _canonicalize_user_model_for_hygiene_diff(value.get(key))
+            if canonical in (None, "", [], {}):
+                continue
+            out[key] = canonical
+        return out
+    if isinstance(value, list):
+        canonical_items = [_canonicalize_user_model_for_hygiene_diff(item) for item in value]
+        canonical_items = [item for item in canonical_items if item not in (None, "", [], {})]
+        canonical_items.sort(key=lambda x: json.dumps(x, sort_keys=True, ensure_ascii=True))
+        return canonical_items
+    if isinstance(value, str):
+        return _normalize_text(value)
+    return value
+
+
+def _has_meaningful_user_model_diff(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
+    return _canonicalize_user_model_for_hygiene_diff(before) != _canonicalize_user_model_for_hygiene_diff(after)
 
 
 def _extract_first_match(texts: List[str], patterns: List[re.Pattern]) -> Optional[str]:
@@ -644,12 +950,17 @@ def _extract_relationships_from_texts(texts: List[str], confidence: float) -> Li
     seen = set()
     for text in texts:
         for who, name in relationship_re.findall(text):
+            normalized_name = _normalize_text(name)
+            if len(normalized_name) < 2:
+                continue
+            if not _build_relationship_signal_text(normalized_name, who, "active"):
+                continue
             key = f"{name.lower()}|{who.lower()}"
             if key in seen:
                 continue
             seen.add(key)
             out.append({
-                "name": name,
+                "name": normalized_name,
                 "who": who.lower(),
                 "status": "active",
                 "confidence": confidence,
@@ -664,11 +975,15 @@ def _merge_relationships(existing: List[Dict[str, Any]], incoming: List[Dict[str
     for rel in existing or []:
         if not isinstance(rel, dict):
             continue
+        if not _build_relationship_signal_text(rel.get("name"), rel.get("who"), rel.get("status")):
+            continue
         key = f"{str(rel.get('name', '')).lower()}|{str(rel.get('who', '')).lower()}"
         if key.strip("|"):
             index[key] = rel
     for rel in incoming or []:
         if not isinstance(rel, dict):
+            continue
+        if not _build_relationship_signal_text(rel.get("name"), rel.get("who"), rel.get("status")):
             continue
         key = f"{str(rel.get('name', '')).lower()}|{str(rel.get('who', '')).lower()}"
         if not key.strip("|"):
@@ -679,6 +994,247 @@ def _merge_relationships(existing: List[Dict[str, Any]], incoming: List[Dict[str
         if not prev or new_conf >= prev_conf:
             index[key] = rel
     return list(index.values())
+
+
+def _parse_utc_ts(value: Any) -> Optional[datetime]:
+    raw = _normalize_text(value)
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=dt_timezone.utc)
+    return dt.astimezone(dt_timezone.utc)
+
+
+def _fact_temporal_relevance(
+    fact_row: Dict[str, Any],
+    now_utc: datetime
+) -> Tuple[bool, str, int]:
+    valid_at = _parse_utc_ts(fact_row.get("valid_at"))
+    invalid_at = _parse_utc_ts(fact_row.get("invalid_at"))
+
+    # Explicitly expired facts should not be returned.
+    if invalid_at is not None and invalid_at <= now_utc:
+        return False, "stale", 3
+
+    # Time-bound facts within recent window are highest priority.
+    if valid_at is not None:
+        age = now_utc - valid_at
+        if age > timedelta(days=7) and invalid_at is None:
+            return True, "stale", 2
+        return True, "recent", 0
+
+    # Untimed facts are treated as persistent memory.
+    return True, "persistent", 1
+
+
+_QUERY_STOPWORDS = {
+    "the", "a", "an", "and", "or", "for", "to", "of", "in", "on", "at", "by",
+    "with", "from", "is", "are", "was", "were", "be", "been", "being", "do",
+    "did", "does", "why", "what", "when", "where", "who", "how", "i", "me",
+    "my", "you", "your", "we", "our", "it", "this", "that", "these", "those",
+    "remember",
+}
+
+
+def _query_terms(query: str) -> List[str]:
+    terms = re.findall(r"[A-Za-z0-9]+", _normalize_text(query).lower())
+    return [term for term in terms if len(term) >= 3 and term not in _QUERY_STOPWORDS]
+
+
+def _query_overlap_score(text: str, query_terms: List[str]) -> float:
+    normalized = _normalize_text(text).lower()
+    if not normalized:
+        return 0.0
+    if not query_terms:
+        return 0.0
+    hits = sum(1 for term in query_terms if term in normalized)
+    if hits <= 0:
+        return 0.0
+    # Keep this stable and bounded for downstream ranking.
+    return min(0.99, 0.35 + (hits * 0.2))
+
+
+def _extract_user_model_recall_candidates(model: Dict[str, Any]) -> List[str]:
+    rows: List[str] = []
+    if not isinstance(model, dict):
+        return rows
+
+    def _append(value: Any) -> None:
+        text = _normalize_text(value)
+        if text:
+            rows.append(text)
+
+    for key in ("narrative_current", "narrative_stable", "narrative"):
+        _append(model.get(key))
+
+    current_focus = model.get("current_focus") if isinstance(model.get("current_focus"), dict) else None
+    if current_focus:
+        _append(current_focus.get("text"))
+
+    for key in ("work_context", "health", "spirituality"):
+        field = model.get(key) if isinstance(model.get(key), dict) else None
+        if field:
+            _append(field.get("text"))
+
+    recent_signals = model.get("recent_signals")
+    if isinstance(recent_signals, list):
+        for row in recent_signals[:10]:
+            if isinstance(row, dict):
+                _append(row.get("text"))
+
+    relationships = model.get("key_relationships")
+    if isinstance(relationships, list):
+        for rel in relationships[:10]:
+            if not isinstance(rel, dict):
+                continue
+            signal = _build_relationship_signal_text(rel.get("name"), rel.get("who"), rel.get("status"))
+            if signal:
+                rows.append(signal)
+
+    return _dedupe_keep_order(rows, limit=16)
+
+
+def _resolve_tenant_scope(value: Any) -> Tuple[str, List[str]]:
+    requested = _normalize_text(value)
+    canonical = _normalize_text(_canonical_tenant_id(requested)) or requested
+    candidates = _tenant_scope_candidates(canonical)
+    if not candidates and canonical:
+        candidates = [canonical]
+    return canonical or requested, candidates
+
+
+def _is_session_summary_node(node: Any) -> bool:
+    if not isinstance(node, dict):
+        return False
+    labels = node.get("labels")
+    normalized_labels = {
+        _normalize_text(label).lower()
+        for label in (labels or [])
+        if _normalize_text(label)
+    } if isinstance(labels, list) else set()
+    if "sessionsummary" in normalized_labels:
+        return True
+    node_type = _normalize_text(node.get("type")).lower()
+    return node_type == "sessionsummary"
+
+
+def _extract_session_summary_candidate_texts(node: Dict[str, Any]) -> List[str]:
+    attrs = node.get("attributes") if isinstance(node.get("attributes"), dict) else {}
+    candidates: List[str] = []
+    for raw in (
+        attrs.get("summary_facts"),
+        attrs.get("latest_thread_text"),
+        attrs.get("summary_text"),
+        attrs.get("index_text"),
+        node.get("summary"),
+        node.get("index_text"),
+    ):
+        for claim in _split_claims(_normalize_text(raw)):
+            if _allow_claim(claim) and _allow_fact_text(claim) and not _is_explicit_user_state_claim(claim):
+                candidates.append(claim)
+    return _dedupe_keep_order(candidates, limit=8)
+
+
+async def _fetch_user_model_rows_for_scope(
+    tenant_scope: List[str],
+    user_id: str
+) -> List[Dict[str, Any]]:
+    tenants = [_normalize_text(t) for t in (tenant_scope or []) if _normalize_text(t)]
+    if not tenants or not user_id:
+        return []
+    rows = await db.fetch(
+        """
+        SELECT tenant_id, model, version, created_at, updated_at, last_source, narrative_stable, narrative_current
+        FROM user_model
+        WHERE tenant_id = ANY($1::text[]) AND user_id = $2
+        """,
+        tenants,
+        user_id,
+    )
+    if not rows:
+        return []
+    order_map = {tenant: idx for idx, tenant in enumerate(tenants)}
+
+    def _sort_key(row: Dict[str, Any]) -> Tuple[float, int]:
+        tenant = _normalize_text(row.get("tenant_id"))
+        rank = order_map.get(tenant, 999)
+        updated_at = row.get("updated_at")
+        updated_ts = updated_at.timestamp() if isinstance(updated_at, datetime) else 0.0
+        return (-updated_ts, rank)
+
+    return sorted(rows, key=_sort_key)
+
+
+def _extract_valid_relationship_entities(model: Dict[str, Any], limit: int = 10) -> List[Dict[str, str]]:
+    relationships = model.get("key_relationships")
+    if not isinstance(relationships, list):
+        return []
+    entities: List[Dict[str, str]] = []
+    seen = set()
+    for rel in relationships:
+        if not isinstance(rel, dict):
+            continue
+        if not _build_relationship_signal_text(rel.get("name"), rel.get("who"), rel.get("status")):
+            continue
+        name = _normalize_text(rel.get("name"))
+        who = _normalize_text(rel.get("who")).lower()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entities.append({"name": name, "who": who})
+        if len(entities) >= limit:
+            break
+    return entities
+
+
+def _build_entity_profile_text(name: str, facts: List[str], relationship_type: Optional[str] = None) -> str:
+    normalized_name = _normalize_text(name) or "This person"
+    relationship = _normalize_text(relationship_type).lower()
+    clean_facts = [_normalize_text(f) for f in (facts or []) if _normalize_text(f)]
+    lead = (
+        f"{normalized_name} is the user's {relationship} and remains a key relationship in the memory context."
+        if relationship
+        else f"{normalized_name} is a key person in the user's relationship context."
+    )
+    if not clean_facts:
+        return f"{lead} The emotional significance is present but current facts are sparse, and no clear recent event or open thread is available yet."
+
+    emotion_markers = (
+        "hurt", "sad", "anger", "angry", "guilt", "love", "loss", "struggling", "upset",
+        "tension", "disappointment", "emotional", "burdened", "neglect"
+    )
+    recent_markers = (
+        "today", "yesterday", "last night", "recent", "currently", "this week", "this month",
+        "2026", "2025", "february", "january", "march", "april", "may", "june", "july",
+        "august", "september", "october", "november", "december", "last year"
+    )
+    open_thread_markers = (
+        "struggling", "unresolved", "blocked", "breakup", "neglect", "hospital",
+        "argument", "upset", "hurt", "suffers", "loss"
+    )
+
+    emotional_fact = next((f for f in clean_facts if any(k in f.lower() for k in emotion_markers)), clean_facts[0])
+    recent_fact = next((f for f in clean_facts if any(k in f.lower() for k in recent_markers)), None)
+    open_thread_fact = next((f for f in clean_facts if any(k in f.lower() for k in open_thread_markers)), None)
+
+    sentence_two = f"Emotionally, this matters because {_shorten_line(emotional_fact, 180)}"
+    sentence_three_parts: List[str] = []
+    if recent_fact:
+        sentence_three_parts.append(f"Recent event: {_shorten_line(recent_fact, 170)}")
+    if open_thread_fact and open_thread_fact.lower() != (recent_fact or "").lower():
+        sentence_three_parts.append(f"Open thread: {_shorten_line(open_thread_fact, 170)}")
+
+    if sentence_three_parts:
+        sentence_three = " ".join(sentence_three_parts)
+        return _ensure_sentence_spacing(f"{lead} {sentence_two} {sentence_three}")
+    return _ensure_sentence_spacing(f"{lead} {sentence_two}")
 
 
 def _merge_patterns(existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -702,6 +1258,77 @@ def _merge_patterns(existing: List[Dict[str, Any]], incoming: List[Dict[str, Any
         if not prev or new_conf >= prev_conf:
             index[key] = row
     return list(index.values())
+
+
+def _merge_recent_signals(existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    now_dt = datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+    index: Dict[str, Dict[str, Any]] = {}
+
+    def _is_expired(row: Dict[str, Any]) -> bool:
+        expires = _parse_optional_dt(row.get("expires_at"))
+        if not expires:
+            return False
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=dt_timezone.utc)
+        return expires < now_dt
+
+    for row in (existing or []) + (incoming or []):
+        if not isinstance(row, dict):
+            continue
+        text = _normalize_text(row.get("text"))
+        if not text:
+            continue
+        if _is_expired(row):
+            continue
+        key = text.lower()
+        prev = index.get(key)
+        if not prev:
+            index[key] = row
+            continue
+        prev_conf = _extract_confidence(prev, default=0.0)
+        next_conf = _extract_confidence(row, default=0.0)
+        prev_source = prev.get("source")
+        next_source = row.get("source")
+        if _should_replace_by_source(
+            existing_source=prev_source,
+            existing_conf=prev_conf,
+            incoming_source=next_source,
+            incoming_conf=next_conf,
+        ):
+            index[key] = row
+
+    values = list(index.values())
+    values.sort(
+        key=lambda r: (
+            _parse_optional_dt(r.get("expires_at")) or datetime.max.replace(tzinfo=dt_timezone.utc),
+            _extract_confidence(r, default=0.0),
+        ),
+        reverse=True,
+    )
+    return values[:12]
+
+
+def _merge_daily_anchors(existing: Any, incoming: Any) -> Dict[str, Any]:
+    existing_obj = existing if isinstance(existing, dict) else {}
+    incoming_obj = incoming if isinstance(incoming, dict) else {}
+    merged: Dict[str, Any] = deepcopy(existing_obj)
+    for key in ("steps_goal", "minimum_steps"):
+        incoming_entry = incoming_obj.get(key)
+        if not isinstance(incoming_entry, dict):
+            continue
+        existing_entry = merged.get(key)
+        if isinstance(existing_entry, dict):
+            existing_conf = _extract_confidence(existing_entry, default=0.0)
+            incoming_conf = _extract_confidence(incoming_entry, default=0.0)
+            if not _should_replace_by_source(
+                existing_source=existing_entry.get("source"),
+                existing_conf=existing_conf,
+                incoming_source=incoming_entry.get("source"),
+                incoming_conf=incoming_conf,
+            ):
+                continue
+        merged[key] = incoming_entry
+    return merged
 
 
 def _merge_preference_notes(existing_notes: Any, incoming_notes: Any) -> List[str]:
@@ -784,6 +1411,34 @@ def _is_strategic_goal_candidate(loop_item: Any, text: str) -> bool:
     return True
 
 
+def _source_rank(source: Any) -> int:
+    value = _normalize_text(source).lower()
+    ranks = {
+        "inferred": 10,
+        "auto_updater": 10,
+        "legacy": 10,
+        "llm_session_enricher": 20,
+        "manual_patch": 30,
+        "user_stated": 30,
+    }
+    return ranks.get(value, 10)
+
+
+def _should_replace_by_source(
+    existing_source: Any,
+    existing_conf: float,
+    incoming_source: Any,
+    incoming_conf: float
+) -> bool:
+    existing_rank = _source_rank(existing_source)
+    incoming_rank = _source_rank(incoming_source)
+    if incoming_rank > existing_rank:
+        return True
+    if incoming_rank < existing_rank:
+        return False
+    return incoming_conf >= existing_conf
+
+
 def _merge_north_star(current: Any, incoming: Any) -> Dict[str, Any]:
     current_ns = _normalize_north_star(current)
     incoming_ns = _normalize_north_star(incoming)
@@ -807,23 +1462,25 @@ def _merge_north_star(current: Any, incoming: Any) -> Dict[str, Any]:
         existing_vision_source = existing_entry.get("vision_source")
         existing_goal_source = existing_entry.get("goal_source")
 
-        # Vision: protect high-confidence user_stated values.
+        # Vision: preserve source tiers (user_stated/manual_patch > llm_session_enricher > inferred).
         if incoming_vision:
-            if not (
-                existing_vision_source == "user_stated"
-                and existing_vision_conf > incoming_vision_conf
-                and incoming_vision_source != "user_stated"
+            if _should_replace_by_source(
+                existing_source=existing_vision_source,
+                existing_conf=existing_vision_conf,
+                incoming_source=incoming_vision_source,
+                incoming_conf=incoming_vision_conf,
             ):
                 existing_entry["vision"] = incoming_vision
                 existing_entry["vision_confidence"] = incoming_vision_conf
                 existing_entry["vision_source"] = incoming_vision_source
 
-        # Goal: allow inferred updates but do not downgrade stronger user-stated goals.
+        # Goal: preserve source tiers (user_stated/manual_patch > llm_session_enricher > inferred).
         if incoming_goal:
-            if not (
-                existing_goal_source == "user_stated"
-                and existing_goal_conf > incoming_goal_conf
-                and incoming_goal_source != "user_stated"
+            if _should_replace_by_source(
+                existing_source=existing_goal_source,
+                existing_conf=existing_goal_conf,
+                incoming_source=incoming_goal_source,
+                incoming_conf=incoming_goal_conf,
             ):
                 existing_entry["goal"] = incoming_goal
                 existing_entry["goal_confidence"] = incoming_goal_conf
@@ -849,13 +1506,27 @@ def _apply_user_model_proposal(
 ) -> Dict[str, Any]:
     merged = deepcopy(current_model)
 
-    for field in ("north_star", "current_focus", "work_context", "health", "spirituality", "preferences"):
+    for field in (
+        "north_star",
+        "current_focus",
+        "work_context",
+        "health",
+        "spirituality",
+        "preferences",
+        "daily_anchors",
+        "narrative",
+        "narrative_stable",
+        "narrative_current",
+    ):
         incoming = proposal.get(field)
         if incoming is None:
             continue
         existing = merged.get(field)
         if field == "north_star":
             merged[field] = _merge_north_star(existing, incoming)
+            continue
+        if field == "daily_anchors":
+            merged[field] = _merge_daily_anchors(existing, incoming)
             continue
         if field == "preferences" and isinstance(existing, dict) and isinstance(incoming, dict):
             # Preserve stable structured preferences and merge notes instead of replacing whole object.
@@ -870,8 +1541,13 @@ def _apply_user_model_proposal(
         incoming_conf = _extract_confidence(incoming, default=0.0)
         existing_conf = _extract_confidence(existing, default=0.0)
         existing_source = (existing or {}).get("source") if isinstance(existing, dict) else None
-        # Never let low-confidence inferred updates overwrite stronger user-stated values.
-        if existing_source == "user_stated" and existing_conf > incoming_conf:
+        incoming_source = incoming.get("source") if isinstance(incoming, dict) else None
+        if not _should_replace_by_source(
+            existing_source=existing_source,
+            existing_conf=existing_conf,
+            incoming_source=incoming_source,
+            incoming_conf=incoming_conf,
+        ):
             continue
         merged[field] = incoming
 
@@ -885,6 +1561,12 @@ def _apply_user_model_proposal(
         merged["patterns"] = _merge_patterns(
             merged.get("patterns") if isinstance(merged.get("patterns"), list) else [],
             proposal.get("patterns") or []
+        )
+
+    if isinstance(proposal.get("recent_signals"), list):
+        merged["recent_signals"] = _merge_recent_signals(
+            merged.get("recent_signals") if isinstance(merged.get("recent_signals"), list) else [],
+            proposal.get("recent_signals") or [],
         )
 
     return _normalize_user_model(merged)
@@ -1295,23 +1977,101 @@ async def _upsert_user_model(
     model: Dict[str, Any],
     source: str
 ) -> Optional[Dict[str, Any]]:
+    narrative_stable = _normalize_text(model.get("narrative_stable")) or None
+    narrative_current = _normalize_text(model.get("narrative_current")) or None
     return await db.fetchone(
         """
-        INSERT INTO user_model (tenant_id, user_id, model, version, last_source, created_at, updated_at)
-        VALUES ($1, $2, $3::jsonb, 1, $4, NOW(), NOW())
+        INSERT INTO user_model (
+            tenant_id, user_id, model, version, last_source, created_at, updated_at,
+            narrative_stable, narrative_current
+        )
+        VALUES ($1, $2, $3::jsonb, 1, $4, NOW(), NOW(), $5, $6)
         ON CONFLICT (tenant_id, user_id)
         DO UPDATE SET
             model = $3::jsonb,
             version = user_model.version + 1,
             last_source = $4,
+            narrative_stable = COALESCE($5, user_model.narrative_stable),
+            narrative_current = COALESCE($6, user_model.narrative_current),
             updated_at = NOW()
         RETURNING model, version, updated_at
         """,
         tenant_id,
         user_id,
         model,
-        source
+        source,
+        narrative_stable,
+        narrative_current,
     )
+
+
+async def _acquire_user_model_write_claim(
+    tenant_id: str,
+    user_id: str,
+    claim_owner: str,
+    ttl_seconds: int = 180
+) -> bool:
+    row = await db.fetchone(
+        """
+        INSERT INTO user_model_write_claims (
+            tenant_id, user_id, claim_owner, claimed_at, expires_at
+        )
+        VALUES ($1, $2, $3, NOW(), NOW() + ($4::int * INTERVAL '1 second'))
+        ON CONFLICT (tenant_id, user_id)
+        DO UPDATE SET
+            claim_owner = EXCLUDED.claim_owner,
+            claimed_at = NOW(),
+            expires_at = EXCLUDED.expires_at
+        WHERE user_model_write_claims.expires_at <= NOW()
+           OR user_model_write_claims.claim_owner = EXCLUDED.claim_owner
+        RETURNING claim_owner
+        """,
+        tenant_id,
+        user_id,
+        claim_owner,
+        max(30, int(ttl_seconds)),
+    )
+    return bool(row and row.get("claim_owner") == claim_owner)
+
+
+async def _release_user_model_write_claim(tenant_id: str, user_id: str, claim_owner: str) -> None:
+    await db.execute(
+        """
+        DELETE FROM user_model_write_claims
+        WHERE tenant_id = $1 AND user_id = $2 AND claim_owner = $3
+        """,
+        tenant_id,
+        user_id,
+        claim_owner,
+    )
+
+
+@asynccontextmanager
+async def _user_model_write_claim(
+    tenant_id: str,
+    user_id: str,
+    ttl_seconds: int = 180
+):
+    claim_owner = uuid.uuid4().hex
+    acquired = False
+    try:
+        acquired = await _acquire_user_model_write_claim(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            claim_owner=claim_owner,
+            ttl_seconds=ttl_seconds,
+        )
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                await _release_user_model_write_claim(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    claim_owner=claim_owner,
+                )
+            except Exception:
+                pass
 
 
 async def _run_user_model_updater_once(
@@ -1361,43 +2121,49 @@ async def _run_user_model_updater_once(
         if not tenant_id or not user_id:
             continue
         try:
-            texts = await _get_recent_user_texts(tenant_id, user_id, limit_sessions=6)
-            active_loops = await loops.get_top_loops_for_startbrief(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                limit=12,
-                persona_id=None
-            )
-            proposal = _propose_user_model_patch(
-                user_texts=texts,
-                active_loops=active_loops or [],
-                high_conf=high_conf,
-                low_conf=low_conf
-            )
-            if not proposal:
-                continue
+            async with _user_model_write_claim(tenant_id=tenant_id, user_id=user_id) as claimed:
+                if not claimed:
+                    continue
+                texts = await _get_recent_user_texts(tenant_id, user_id, limit_sessions=6)
+                active_loops = await loops.get_top_loops_for_startbrief(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    limit=12,
+                    persona_id=None
+                )
+                proposal = _propose_user_model_patch(
+                    user_texts=texts,
+                    active_loops=active_loops or [],
+                    high_conf=high_conf,
+                    low_conf=low_conf
+                )
+                if not proposal:
+                    continue
 
-            existing = await db.fetchone(
-                """
-                SELECT model
-                FROM user_model
-                WHERE tenant_id = $1 AND user_id = $2
-                """,
-                tenant_id,
-                user_id
-            )
-            current = _normalize_user_model(existing.get("model") if existing else None)
-            merged = _apply_user_model_proposal(current, proposal)
-            if merged == current:
-                continue
+                existing = await db.fetchone(
+                    """
+                    SELECT model, narrative_stable, narrative_current
+                    FROM user_model
+                    WHERE tenant_id = $1 AND user_id = $2
+                    """,
+                    tenant_id,
+                    user_id
+                )
+                current = _hydrate_user_model_narratives(
+                    existing.get("model") if existing else None,
+                    row=existing if isinstance(existing, dict) else None,
+                )
+                merged = _apply_user_model_proposal(current, proposal)
+                if merged == current:
+                    continue
 
-            await _upsert_user_model(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                model=merged,
-                source="auto_updater"
-            )
-            updates += 1
+                await _upsert_user_model(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    model=merged,
+                    source="auto_updater"
+                )
+                updates += 1
         except Exception as e:
             logger.error(f"user model updater failed for {tenant_id}:{user_id}: {e}")
             continue
@@ -1425,6 +2191,1304 @@ async def user_model_updater_loop(
             raise
         except Exception as e:
             logger.error(f"user model updater loop error: {e}")
+        await asyncio.sleep(max(30, interval_seconds))
+
+
+def _coerce_enrichment_confidence(value: Any, default: float = 0.0) -> float:
+    return _normalize_confidence(value, default=default)
+
+
+def _extract_session_summary_evidence_rows(
+    nodes: List[Dict[str, Any]],
+    window_start: datetime,
+    window_end: datetime
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for raw in nodes or []:
+        normalized = _normalize_startbrief_session_summary_node(raw)
+        if not normalized:
+            continue
+        created_at = _normalize_text(normalized.get("created_at"))
+        created_dt = _parse_optional_dt(created_at)
+        if created_dt and created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=dt_timezone.utc)
+        if created_dt and not (window_start <= created_dt <= window_end):
+            continue
+        evidence = {
+            "session_id": _normalize_text(normalized.get("session_id")),
+            "created_at": created_at,
+            "summary_facts": _normalize_text(normalized.get("summary_facts")),
+            "tone": _normalize_text(normalized.get("tone")),
+            "moment": _normalize_text(normalized.get("moment")),
+            "decisions": normalized.get("decisions") if isinstance(normalized.get("decisions"), list) else [],
+            "unresolved": normalized.get("unresolved") if isinstance(normalized.get("unresolved"), list) else [],
+            "bridge_text": _normalize_text(normalized.get("bridge_text")),
+            "salience": _normalize_text(normalized.get("salience")) or "low",
+        }
+        if any(_normalize_text(evidence.get(k)) for k in ("summary_facts", "tone", "moment", "bridge_text")):
+            rows.append(evidence)
+    return rows
+
+
+async def _get_transcript_fallback_sessions(
+    tenant_id: str,
+    user_id: str,
+    window_start: datetime,
+    window_end: datetime,
+    limit: int = 10
+) -> List[Dict[str, Any]]:
+    rows = await db.fetch(
+        """
+        SELECT session_id, messages, updated_at
+        FROM session_transcript
+        WHERE tenant_id = $1
+          AND user_id = $2
+          AND updated_at >= $3
+          AND updated_at <= $4
+        ORDER BY updated_at DESC
+        LIMIT $5
+        """,
+        tenant_id,
+        user_id,
+        window_start,
+        window_end,
+        limit
+    )
+    out: List[Dict[str, Any]] = []
+    for row in rows or []:
+        messages = row.get("messages")
+        if isinstance(messages, str):
+            try:
+                messages = json.loads(messages)
+            except Exception:
+                messages = []
+        if not isinstance(messages, list):
+            continue
+        out.append(
+            {
+                "session_id": _normalize_text(row.get("session_id")),
+                "updated_at": row.get("updated_at").isoformat() if row.get("updated_at") else None,
+                "messages": [
+                    {
+                        "role": _normalize_text(m.get("role")).lower(),
+                        "text": _normalize_text(m.get("text")),
+                        "timestamp": _normalize_text(m.get("timestamp")) or None,
+                    }
+                    for m in messages
+                    if isinstance(m, dict) and _normalize_text(m.get("text"))
+                ][:40],
+            }
+        )
+    return out
+
+
+async def _load_enrichment_transcript_inputs(
+    tenant_id: str,
+    user_id: str,
+    window_start: datetime,
+    window_end: datetime,
+    session_index: List[Dict[str, Any]],
+    max_sessions: int = 16,
+    max_user_turns: int = 180,
+    max_chars: int = 12000
+) -> List[Dict[str, Any]]:
+    rows = await db.fetch(
+        """
+        SELECT session_id, messages, updated_at
+        FROM session_transcript
+        WHERE tenant_id = $1
+          AND user_id = $2
+          AND updated_at >= $3
+          AND updated_at <= $4
+        ORDER BY updated_at DESC
+        LIMIT $5
+        """,
+        tenant_id,
+        user_id,
+        window_start,
+        window_end,
+        max(max_sessions * 8, 80),
+    )
+    summary_rank: Dict[str, int] = {}
+    for idx, item in enumerate(session_index or []):
+        sid = _normalize_text(item.get("session_id"))
+        if sid and sid not in summary_rank:
+            summary_rank[sid] = idx
+
+    normalized_rows: List[Dict[str, Any]] = []
+    for row in rows or []:
+        session_id = _normalize_text(row.get("session_id"))
+        messages = row.get("messages")
+        if isinstance(messages, str):
+            try:
+                messages = json.loads(messages)
+            except Exception:
+                messages = []
+        if not isinstance(messages, list):
+            continue
+        user_turns: List[Dict[str, Any]] = []
+        for msg_index, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                continue
+            if _normalize_text(msg.get("role")).lower() != "user":
+                continue
+            text = _normalize_text(msg.get("text"))
+            if not text:
+                continue
+            user_turns.append(
+                {
+                    "msg_index": msg_index,
+                    "timestamp": _normalize_text(msg.get("timestamp")) or None,
+                    "text": text,
+                }
+            )
+        if not user_turns:
+            continue
+        rank = summary_rank.get(session_id, 10_000)
+        updated_at = row.get("updated_at")
+        updated_at_iso = updated_at.isoformat() if updated_at else None
+        normalized_rows.append(
+            {
+                "session_id": session_id,
+                "updated_at": updated_at_iso,
+                "summary_rank": rank,
+                "user_turns": user_turns,
+            }
+        )
+
+    normalized_rows.sort(
+        key=lambda r: (
+            int(r.get("summary_rank") if r.get("summary_rank") is not None else 10_000),
+            _normalize_text(r.get("updated_at")),
+        ),
+        reverse=False,
+    )
+
+    selected: List[Dict[str, Any]] = []
+    total_turns = 0
+    total_chars = 0
+    for row in normalized_rows:
+        if len(selected) >= max_sessions:
+            break
+        capped_turns: List[Dict[str, Any]] = []
+        for turn in row.get("user_turns") or []:
+            text = _normalize_text(turn.get("text"))
+            if not text:
+                continue
+            projected_turns = total_turns + 1
+            projected_chars = total_chars + len(text)
+            if projected_turns > max_user_turns or projected_chars > max_chars:
+                break
+            capped_turns.append(
+                {
+                    "msg_index": int(turn.get("msg_index") or 0),
+                    "timestamp": _normalize_text(turn.get("timestamp")) or None,
+                    "text": text[:400],
+                }
+            )
+            total_turns = projected_turns
+            total_chars = projected_chars
+        if not capped_turns:
+            continue
+        selected.append(
+            {
+                "session_id": _normalize_text(row.get("session_id")),
+                "updated_at": _normalize_text(row.get("updated_at")) or None,
+                "user_turns": capped_turns,
+            }
+        )
+        if total_turns >= max_user_turns or total_chars >= max_chars:
+            break
+    return selected
+
+
+def _normalize_enrichment_evidence(payload: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+    session_id = _normalize_text(payload.get("session_id"))
+    quote = _normalize_text(payload.get("quote"))
+    timestamp = _normalize_text(payload.get("timestamp"))
+    msg_index_raw = payload.get("msg_index")
+    msg_index: Optional[int] = None
+    try:
+        if msg_index_raw is not None:
+            msg_index = int(msg_index_raw)
+    except Exception:
+        msg_index = None
+    if not session_id or not quote:
+        return None
+    if msg_index is None and not timestamp:
+        return None
+    evidence: Dict[str, Any] = {
+        "session_id": session_id,
+        "quote": quote[:240],
+    }
+    if msg_index is not None and msg_index >= 0:
+        evidence["msg_index"] = msg_index
+    if timestamp:
+        evidence["timestamp"] = timestamp
+    return evidence
+
+
+def _normalize_enrichment_evidence_list(payload: Any) -> List[Dict[str, Any]]:
+    if not isinstance(payload, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for item in payload:
+        normalized = _normalize_enrichment_evidence(item)
+        if not normalized:
+            continue
+        key = (
+            normalized.get("session_id"),
+            normalized.get("msg_index"),
+            normalized.get("timestamp"),
+            normalized.get("quote"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(normalized)
+    return out
+
+
+def _looks_like_single_action_pattern(text: str) -> bool:
+    lower = _normalize_text(text).lower()
+    if not lower:
+        return True
+    one_off_patterns = (
+        r"^\b(went|go|going|did|made|tidied|cleaned|walked|ran|finished|completed)\b",
+        r"\b(today|yesterday|this morning|this evening)\b",
+    )
+    return any(re.search(p, lower) for p in one_off_patterns)
+
+
+def _looks_like_daily_anchor_signal(text: str) -> bool:
+    lower = _normalize_text(text).lower()
+    if not lower:
+        return False
+    return bool(re.search(r"\b\d{1,3}(?:,\d{3})?\s*(?:k|steps?)\b", lower)) or "steps goal" in lower
+
+
+def _extract_steps_anchor_value(text: str) -> Optional[int]:
+    lower = _normalize_text(text).lower().replace(",", "")
+    if not lower:
+        return None
+    m = re.search(r"\b(\d{1,3})\s*k\b", lower)
+    if m:
+        return int(m.group(1)) * 1000
+    m = re.search(r"\b(\d{3,6})\s*steps?\b", lower)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _coerce_small_human_details(
+    payload: Any,
+    min_confidence: float,
+    source: str,
+    now_iso: str
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in payload or []:
+        if not isinstance(row, dict):
+            continue
+        text = _normalize_text(row.get("text"))
+        conf = _coerce_enrichment_confidence(row.get("confidence"), default=0.0)
+        evidence = _normalize_enrichment_evidence(row.get("evidence"))
+        if not text or conf < min_confidence or not evidence:
+            continue
+        if _looks_like_daily_anchor_signal(text):
+            continue
+        out.append(
+            {
+                "text": text[:200],
+                "confidence": conf,
+                "source": source,
+                "updated_at": now_iso,
+                "evidence": evidence,
+            }
+        )
+    return out
+
+
+def _coerce_enrichment_relationships(
+    payload: Any,
+    min_confidence: float,
+    source: str,
+    now_iso: str
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in payload or []:
+        if not isinstance(row, dict):
+            continue
+        name = _normalize_text(row.get("name"))
+        who = _normalize_text(row.get("who")).lower()
+        status = _normalize_text(row.get("status")).lower() or "active"
+        conf = _coerce_enrichment_confidence(row.get("confidence"), default=0.0)
+        evidence = _normalize_enrichment_evidence(row.get("evidence"))
+        if not name or not who or conf < min_confidence or not evidence:
+            continue
+        if not _build_relationship_signal_text(name, who, status):
+            continue
+        out.append(
+            {
+                "name": name[:80],
+                "who": who[:40],
+                "status": status[:40],
+                "confidence": conf,
+                "source": source,
+                "updated_at": now_iso,
+                "evidence": evidence,
+            }
+        )
+    return out
+
+
+def _coerce_enrichment_patterns(
+    payload: Any,
+    min_confidence: float,
+    source: str,
+    now_iso: str
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in payload or []:
+        if not isinstance(row, dict):
+            continue
+        text = _normalize_text(row.get("text"))
+        conf = _coerce_enrichment_confidence(row.get("confidence"), default=0.0)
+        habitual_explicit = bool(row.get("habitual_explicit"))
+        evidences = _normalize_enrichment_evidence_list(row.get("evidences"))
+        if not evidences:
+            single = _normalize_enrichment_evidence(row.get("evidence"))
+            if single:
+                evidences = [single]
+        evidence_sessions = {e.get("session_id") for e in evidences if _normalize_text(e.get("session_id"))}
+        if not text or conf < min_confidence:
+            continue
+        if _looks_like_single_action_pattern(text):
+            continue
+        if not habitual_explicit and len(evidence_sessions) < 2:
+            continue
+        out.append(
+            {
+                "text": text[:160],
+                "confidence": conf,
+                "source": source,
+                "updated_at": now_iso,
+                "evidence": evidences[:3],
+                "habitual_explicit": habitual_explicit,
+            }
+        )
+    return out
+
+
+def _coerce_enrichment_scalar_field(
+    payload: Any,
+    min_confidence: float,
+    source: str,
+    now_iso: str
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+    text = _normalize_text(payload.get("text"))
+    conf = _coerce_enrichment_confidence(payload.get("confidence"), default=0.0)
+    evidence = _normalize_enrichment_evidence(payload.get("evidence"))
+    if not text or conf < min_confidence or not evidence:
+        return None
+    return {
+        "text": text[:180],
+        "confidence": conf,
+        "source": source,
+        "updated_at": now_iso,
+        "evidence": evidence,
+    }
+
+
+def _coerce_enrichment_north_star(
+    payload: Any,
+    min_confidence: float,
+    source: str,
+    now_iso: str
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if not isinstance(payload, dict):
+        return out
+    for domain in ("relationships", "work", "health", "spirituality", "general"):
+        entry = payload.get(domain)
+        if not isinstance(entry, dict):
+            continue
+        vision = _normalize_text(entry.get("vision"))
+        goal = _normalize_text(entry.get("goal"))
+        vision_conf = _coerce_enrichment_confidence(entry.get("vision_confidence"), default=0.0)
+        goal_conf = _coerce_enrichment_confidence(entry.get("goal_confidence"), default=0.0)
+        normalized_entry: Dict[str, Any] = {"status": "active", "updated_at": now_iso}
+        vision_evidence = _normalize_enrichment_evidence(entry.get("vision_evidence"))
+        goal_evidence = _normalize_enrichment_evidence(entry.get("goal_evidence"))
+        if vision and vision_conf >= min_confidence and vision_evidence:
+            normalized_entry.update(
+                {
+                    "vision": vision[:180],
+                    "vision_confidence": vision_conf,
+                    "vision_source": source,
+                    "vision_evidence": vision_evidence,
+                }
+            )
+        if goal and goal_conf >= min_confidence and (goal_evidence or "vision" in normalized_entry):
+            if goal_evidence:
+                normalized_entry["goal_evidence"] = goal_evidence
+            normalized_entry.update(
+                {
+                    "goal": goal[:180],
+                    "goal_confidence": goal_conf,
+                    "goal_source": source,
+                }
+            )
+        if any(k in normalized_entry for k in ("vision", "goal")):
+            out[domain] = normalized_entry
+    return out
+
+
+def _coerce_recent_signals(
+    payload: Any,
+    min_confidence: float,
+    source: str,
+    now_iso: str
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    now_dt = _parse_optional_dt(now_iso) or datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=dt_timezone.utc)
+    for row in payload or []:
+        if not isinstance(row, dict):
+            continue
+        text = _normalize_text(row.get("text"))
+        conf = _coerce_enrichment_confidence(row.get("confidence"), default=0.0)
+        evidence = _normalize_enrichment_evidence(row.get("evidence"))
+        if not text or conf < min_confidence or not evidence:
+            continue
+        expires_at = _parse_optional_dt(row.get("expires_at"))
+        if not expires_at:
+            expires_at = now_dt + timedelta(days=7)
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=dt_timezone.utc)
+        if expires_at < now_dt:
+            continue
+        out.append(
+            {
+                "text": text[:200],
+                "confidence": conf,
+                "source": source,
+                "updated_at": now_iso,
+                "expires_at": expires_at.isoformat(),
+                "evidence": evidence,
+            }
+        )
+    return out
+
+
+def _coerce_daily_anchors(
+    payload: Any,
+    min_confidence: float,
+    source: str,
+    now_iso: str,
+    small_human_details: Optional[List[Dict[str, Any]]] = None
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    payload_obj = payload if isinstance(payload, dict) else {}
+
+    def _apply_anchor(anchor_key: str, value: Any, confidence: Any, evidence_payload: Any) -> None:
+        try:
+            numeric = int(value)
+        except Exception:
+            return
+        if numeric <= 0 or numeric > 250000:
+            return
+        conf = _coerce_enrichment_confidence(confidence, default=0.0)
+        evidence = _normalize_enrichment_evidence(evidence_payload)
+        if conf < min_confidence or not evidence:
+            return
+        out[anchor_key] = {
+            "value": numeric,
+            "confidence": conf,
+            "source": source,
+            "updated_at": now_iso,
+            "evidence": evidence,
+        }
+
+    _apply_anchor(
+        "steps_goal",
+        payload_obj.get("steps_goal"),
+        payload_obj.get("steps_goal_confidence"),
+        payload_obj.get("steps_goal_evidence"),
+    )
+    _apply_anchor(
+        "minimum_steps",
+        payload_obj.get("minimum_steps"),
+        payload_obj.get("minimum_steps_confidence"),
+        payload_obj.get("minimum_steps_evidence"),
+    )
+
+    for row in small_human_details or []:
+        text = _normalize_text(row.get("text"))
+        if not text or not _looks_like_daily_anchor_signal(text):
+            continue
+        value = _extract_steps_anchor_value(text)
+        if value is None:
+            continue
+        conf = _coerce_enrichment_confidence(row.get("confidence"), default=0.0)
+        evidence = _normalize_enrichment_evidence(row.get("evidence"))
+        if conf < min_confidence or not evidence:
+            continue
+        key = "steps_goal" if ("goal" in text.lower() or value >= 8000) else "minimum_steps"
+        if key not in out:
+            out[key] = {
+                "value": int(value),
+                "confidence": conf,
+                "source": source,
+                "updated_at": now_iso,
+                "evidence": evidence,
+            }
+    return out
+
+
+def _proposal_from_enrichment_payload(
+    payload: Dict[str, Any],
+    min_confidence: float,
+    source: str,
+    now_iso: str
+) -> Dict[str, Any]:
+    proposal: Dict[str, Any] = {}
+
+    relationships = _coerce_enrichment_relationships(
+        payload.get("key_relationships"), min_confidence=min_confidence, source=source, now_iso=now_iso
+    )
+    if relationships:
+        proposal["key_relationships"] = relationships
+
+    patterns = _coerce_enrichment_patterns(
+        payload.get("patterns"), min_confidence=min_confidence, source=source, now_iso=now_iso
+    )
+    if patterns:
+        proposal["patterns"] = patterns
+
+    recent_signals = _coerce_recent_signals(
+        payload.get("recent_signals"), min_confidence=min_confidence, source=source, now_iso=now_iso
+    )
+    if recent_signals:
+        proposal["recent_signals"] = recent_signals
+
+    for key, target in (
+        ("current_focus", "current_focus"),
+        ("work_context", "work_context"),
+        ("health", "health"),
+        ("spirituality", "spirituality"),
+    ):
+        normalized = _coerce_enrichment_scalar_field(
+            payload.get(key), min_confidence=min_confidence, source=source, now_iso=now_iso
+        )
+        if normalized:
+            proposal[target] = normalized
+
+    preferences_notes = _coerce_small_human_details(
+        payload.get("small_human_details"), min_confidence=min_confidence, source=source, now_iso=now_iso
+    )
+    daily_anchors = _coerce_daily_anchors(
+        payload.get("daily_anchors"),
+        min_confidence=min_confidence,
+        source=source,
+        now_iso=now_iso,
+        small_human_details=payload.get("small_human_details") if isinstance(payload.get("small_human_details"), list) else [],
+    )
+    if daily_anchors:
+        proposal["daily_anchors"] = daily_anchors
+
+    if preferences_notes:
+        notes = [_normalize_text(x.get("text"))[:200] for x in preferences_notes if _normalize_text(x.get("text"))]
+        if notes:
+            proposal["preferences"] = {
+                "notes": notes[:4],
+                "confidence": max(min_confidence, 0.72),
+                "source": source,
+                "updated_at": now_iso,
+                "evidence": [x.get("evidence") for x in preferences_notes[:4] if isinstance(x.get("evidence"), dict)],
+            }
+
+    north_star = _coerce_enrichment_north_star(
+        payload.get("north_star"), min_confidence=min_confidence, source=source, now_iso=now_iso
+    )
+    if north_star:
+        proposal["north_star"] = north_star
+
+    return proposal
+
+
+async def _generate_user_model_enrichment_proposal(
+    tenant_id: str,
+    user_id: str,
+    mode: str,
+    window_start: datetime,
+    window_end: datetime,
+    session_summaries: List[Dict[str, Any]],
+    min_confidence: float
+) -> Dict[str, Any]:
+    transcript_inputs = await _load_enrichment_transcript_inputs(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        window_start=window_start,
+        window_end=window_end,
+        session_index=session_summaries,
+        max_sessions=14 if mode == "daily" else 28,
+        max_user_turns=160 if mode == "daily" else 260,
+        max_chars=10000 if mode == "daily" else 18000,
+    )
+    if not transcript_inputs:
+        return {}
+    llm = get_llm_client()
+    prompt = (
+        "You are enriching a long-lived user profile from memory evidence.\n"
+        "Return strict JSON only with keys:\n"
+        "{"
+        "\"key_relationships\": [], "
+        "\"patterns\": [], "
+        "\"recent_signals\": [], "
+        "\"daily_anchors\": {}, "
+        "\"current_focus\": null, "
+        "\"work_context\": null, "
+        "\"health\": null, "
+        "\"spirituality\": null, "
+        "\"small_human_details\": [], "
+        "\"north_star\": {}"
+        "}\n"
+        "Rules:\n"
+        "- Use only direct evidence from raw transcript user turns.\n"
+        "- Session summaries are index metadata only; do not treat as evidence.\n"
+        "- If category has no direct evidence, return empty list or null.\n"
+        "- No hallucinations. Keep updates concise.\n"
+        "- Include confidence 0..1 for every extracted item/object.\n"
+        "- PATTERN hard criteria:\n"
+        "  * A pattern must be repeating behavior or stable trait over time.\n"
+        "  * Must be supported by >=2 evidence quotes from different sessions OR be explicitly habitual (\"I always\", \"I tend to\", \"I usually\", \"I keep\").\n"
+        "  * Must NOT be a single action/event (example rejects: \"went for a walk\", \"tidied\").\n"
+        "  * If criteria fail, output no pattern item.\n"
+        "- Every extracted item MUST include evidence: {session_id, msg_index or timestamp, quote}.\n"
+        "- For patterns: include `evidences` array (2+ if not habitual) and `habitual_explicit` boolean.\n"
+        "- For key_relationships: include an `evidence` object.\n"
+        "- For recent_signals: include {text, confidence, evidence, expires_at}.\n"
+        "- For daily_anchors: include {steps_goal?, minimum_steps?} plus confidence/evidence per key.\n"
+        "- Step targets/habit anchors (e.g., 5k/10k steps) must be returned under daily_anchors, not preferences.\n"
+        "- For current_focus/work_context/health/spirituality objects: include `evidence`.\n"
+        "- For small_human_details: return objects {text, confidence, evidence}.\n"
+        "- For north_star domain entries: include `vision_evidence` for vision and `goal_evidence` for goal.\n"
+        "- Prefer durable personal signals over one-off trivia.\n\n"
+        f"MODE: {mode}\n"
+        f"WINDOW_START: {window_start.isoformat()}\n"
+        f"WINDOW_END: {window_end.isoformat()}\n"
+        f"MIN_CONFIDENCE_FOR_WRITE: {min_confidence}\n\n"
+        f"SESSION_INDEX_JSON (ranking-only):\n{json.dumps(session_summaries, ensure_ascii=True)}\n\n"
+        f"RAW_TRANSCRIPT_USER_TURNS_JSON:\n{json.dumps(transcript_inputs, ensure_ascii=True)}\n"
+    )
+    raw = await llm._call_llm(
+        prompt=prompt,
+        max_tokens=900,
+        temperature=0.1,
+        task="user_model_enrichment",
+    )
+    payload = _safe_parse_json_object(raw) if raw else None
+    if not payload:
+        return {}
+    proposal = _proposal_from_enrichment_payload(
+        payload=payload,
+        min_confidence=min_confidence,
+        source="llm_session_enricher",
+        now_iso=datetime.utcnow().isoformat(),
+    )
+    try:
+        existing = await db.fetchone(
+            """
+            SELECT model, narrative_stable, narrative_current
+            FROM user_model
+            WHERE tenant_id = $1 AND user_id = $2
+            """,
+            tenant_id,
+            user_id,
+        )
+        current_model = _hydrate_user_model_narratives(
+            existing.get("model") if existing else None,
+            row=existing if isinstance(existing, dict) else None,
+        )
+        top_loops = await loops.get_top_loops_for_startbrief(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            limit=5,
+        )
+        latest_daily = await db.fetchone(
+            """
+            SELECT analysis_date, themes, scores, steering_note, confidence, updated_at
+            FROM daily_analysis
+            WHERE tenant_id = $1 AND user_id = $2
+            ORDER BY analysis_date DESC
+            LIMIT 1
+            """,
+            tenant_id,
+            user_id,
+        )
+        loops_payload = [
+            {
+                "type": _normalize_text(getattr(loop_item, "type", "")),
+                "text": _normalize_text(getattr(loop_item, "text", "")),
+                "status": _normalize_text(getattr(loop_item, "status", "")),
+                "time_horizon": _normalize_text(getattr(loop_item, "timeHorizon", "")),
+                "salience": getattr(loop_item, "salience", None),
+            }
+            for loop_item in (top_loops or [])
+            if _normalize_text(getattr(loop_item, "text", ""))
+        ]
+        daily_payload: Dict[str, Any] = {}
+        if latest_daily:
+            daily_payload = {
+                "analysis_date": (
+                    latest_daily.get("analysis_date").isoformat()
+                    if latest_daily.get("analysis_date") is not None
+                    else None
+                ),
+                "themes": latest_daily.get("themes") or [],
+                "scores": latest_daily.get("scores") or {},
+                "steering_note": _normalize_text(latest_daily.get("steering_note")),
+                "confidence": latest_daily.get("confidence"),
+                "updated_at": (
+                    latest_daily.get("updated_at").isoformat()
+                    if latest_daily.get("updated_at") is not None
+                    else None
+                ),
+            }
+        narrative_prompt = (
+            "Write/maintain two narrative sections for this user.\n"
+            "Return strict JSON only:\n"
+            "{\"narrative_stable\":\"...\",\"narrative_current\":\"...\"}\n\n"
+            "Rules:\n"
+            "- narrative_stable: long-lived identity/background facts only. Update only when genuinely new permanent facts emerge.\n"
+            "- narrative_stable: never use time-relative language (no recently, currently, today, this week).\n"
+            "- narrative_current: actively refresh from recent sessions and recent evidence.\n"
+            "- narrative_current: include approximate age markers for time-relative facts when possible (e.g., \"about 2 weeks ago\").\n"
+            "- narrative_current: after ~30 days, drop stale items unless still evidenced; move to narrative_stable only if clearly durable.\n"
+            "- Never assume current facts are still true without recent evidence.\n"
+            "- Describe the person only; do not give instructions/advice.\n\n"
+            f"WINDOW_START: {window_start.isoformat()}\n"
+            f"WINDOW_END: {window_end.isoformat()}\n\n"
+            f"CURRENT_USER_MODEL_JSON:\n{json.dumps(current_model, ensure_ascii=True)}\n\n"
+            f"SESSION_INDEX_JSON:\n{json.dumps(session_summaries, ensure_ascii=True)}\n\n"
+            f"TOP_5_LOOPS_JSON:\n{json.dumps(loops_payload, ensure_ascii=True)}\n\n"
+            f"LATEST_DAILY_ANALYSIS_JSON:\n{json.dumps(daily_payload, ensure_ascii=True)}\n"
+        )
+        narrative_raw = await llm._call_llm(
+            prompt=narrative_prompt,
+            max_tokens=520,
+            temperature=0.1,
+            task="user_model_enrichment",
+        )
+        narrative_payload = _safe_parse_json_object(narrative_raw) if narrative_raw else None
+        if isinstance(narrative_payload, dict):
+            narrative_stable = _normalize_text(narrative_payload.get("narrative_stable"))
+            narrative_current = _normalize_text(narrative_payload.get("narrative_current"))
+            if narrative_stable:
+                proposal["narrative_stable"] = narrative_stable[:2000]
+            if narrative_current:
+                proposal["narrative_current"] = narrative_current[:2000]
+            combined = _normalize_text(" ".join([narrative_stable, narrative_current]).strip())
+            if combined:
+                proposal["narrative"] = combined[:1200]
+    except Exception as e:
+        logger.warning("user model enrichment narrative generation failed tenant=%s user=%s error=%s", tenant_id, user_id, e)
+    return proposal
+
+
+async def _update_enrichment_state_success(tenant_id: str, user_id: str, mode: str) -> None:
+    await db.execute(
+        """
+        INSERT INTO user_model_enrichment_state (
+            tenant_id, user_id, last_enriched_at, last_daily_enriched_at, last_weekly_enriched_at,
+            next_retry_at, retry_attempts, last_error, last_mode, updated_at
+        )
+        VALUES (
+            $1, $2, NOW(),
+            CASE WHEN $3 = 'daily' THEN NOW() ELSE NULL END,
+            CASE WHEN $3 IN ('weekly', 'backfill') THEN NOW() ELSE NULL END,
+            NULL, 0, NULL, $3, NOW()
+        )
+        ON CONFLICT (tenant_id, user_id)
+        DO UPDATE SET
+            last_enriched_at = NOW(),
+            last_daily_enriched_at = CASE WHEN $3 = 'daily' THEN NOW() ELSE user_model_enrichment_state.last_daily_enriched_at END,
+            last_weekly_enriched_at = CASE WHEN $3 IN ('weekly', 'backfill') THEN NOW() ELSE user_model_enrichment_state.last_weekly_enriched_at END,
+            next_retry_at = NULL,
+            retry_attempts = 0,
+            last_error = NULL,
+            last_mode = $3,
+            updated_at = NOW()
+        """,
+        tenant_id,
+        user_id,
+        mode,
+    )
+
+
+async def _update_enrichment_state_failure(
+    tenant_id: str,
+    user_id: str,
+    mode: str,
+    error: str,
+    base_backoff_seconds: int,
+    max_backoff_seconds: int
+) -> None:
+    row = await db.fetchone(
+        """
+        SELECT retry_attempts
+        FROM user_model_enrichment_state
+        WHERE tenant_id = $1 AND user_id = $2
+        """,
+        tenant_id,
+        user_id,
+    )
+    attempts = int((row or {}).get("retry_attempts") or 0) + 1
+    backoff = min(max_backoff_seconds, max(base_backoff_seconds, base_backoff_seconds * (2 ** (attempts - 1))))
+    await db.execute(
+        """
+        INSERT INTO user_model_enrichment_state (
+            tenant_id, user_id, next_retry_at, retry_attempts, last_error, last_mode, updated_at
+        )
+        VALUES ($1, $2, NOW() + ($3::int * INTERVAL '1 second'), $4, $5, $6, NOW())
+        ON CONFLICT (tenant_id, user_id)
+        DO UPDATE SET
+            next_retry_at = NOW() + ($3::int * INTERVAL '1 second'),
+            retry_attempts = $4,
+            last_error = $5,
+            last_mode = $6,
+            updated_at = NOW()
+        """,
+        tenant_id,
+        user_id,
+        backoff,
+        attempts,
+        _normalize_text(error)[:1000],
+        mode,
+    )
+
+
+async def _fetch_enrichment_candidates(
+    mode: str,
+    max_users: int,
+    daily_lookback_hours: int,
+    weekly_lookback_days: int
+) -> List[Dict[str, Any]]:
+    if mode == "daily":
+        return await db.fetch(
+            """
+            WITH active_users AS (
+                SELECT tenant_id, user_id, MAX(updated_at) AS last_activity
+                FROM session_transcript
+                WHERE updated_at >= NOW() - ($1::int * INTERVAL '1 hour')
+                GROUP BY tenant_id, user_id
+            )
+            SELECT a.tenant_id, a.user_id
+            FROM active_users a
+            LEFT JOIN user_model_enrichment_state s
+              ON s.tenant_id = a.tenant_id AND s.user_id = a.user_id
+            WHERE (s.next_retry_at IS NULL OR s.next_retry_at <= NOW())
+              AND (
+                s.last_daily_enriched_at IS NULL
+                OR s.last_daily_enriched_at <= NOW() - INTERVAL '20 hours'
+              )
+            ORDER BY a.last_activity DESC
+            LIMIT $2
+            """,
+            daily_lookback_hours,
+            max_users,
+        )
+    if mode == "weekly":
+        return await db.fetch(
+            """
+            WITH active_users AS (
+                SELECT tenant_id, user_id, MAX(updated_at) AS last_activity
+                FROM session_transcript
+                WHERE updated_at >= NOW() - ($1::int * INTERVAL '1 day')
+                GROUP BY tenant_id, user_id
+            )
+            SELECT a.tenant_id, a.user_id
+            FROM active_users a
+            LEFT JOIN user_model_enrichment_state s
+              ON s.tenant_id = a.tenant_id AND s.user_id = a.user_id
+            WHERE (s.next_retry_at IS NULL OR s.next_retry_at <= NOW())
+              AND (
+                s.last_weekly_enriched_at IS NULL
+                OR s.last_weekly_enriched_at <= NOW() - INTERVAL '6 days'
+              )
+            ORDER BY a.last_activity DESC
+            LIMIT $2
+            """,
+            weekly_lookback_days,
+            max_users,
+        )
+    return []
+
+
+async def _run_user_model_enrichment_for_user(
+    tenant_id: str,
+    user_id: str,
+    mode: str,
+    min_confidence: float,
+    retry_backoff_seconds: int,
+    retry_max_seconds: int,
+    now: Optional[datetime] = None
+) -> bool:
+    now_dt = now or datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=dt_timezone.utc)
+    if mode == "daily":
+        window_start = now_dt - timedelta(hours=24)
+    elif mode == "weekly":
+        window_start = now_dt - timedelta(days=7)
+    else:
+        window_start = datetime(1970, 1, 1, tzinfo=dt_timezone.utc)
+    window_end = now_dt
+
+    try:
+        async with _user_model_write_claim(tenant_id=tenant_id, user_id=user_id, ttl_seconds=240) as claimed:
+            if not claimed:
+                return False
+            session_nodes = await graphiti_client.get_recent_session_summary_nodes(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                limit=60 if mode == "daily" else 200,
+            )
+            session_summaries = _extract_session_summary_evidence_rows(
+                nodes=session_nodes or [],
+                window_start=window_start,
+                window_end=window_end,
+            )
+
+            proposal = await _generate_user_model_enrichment_proposal(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                mode=mode,
+                window_start=window_start,
+                window_end=window_end,
+                session_summaries=session_summaries,
+                min_confidence=min_confidence,
+            )
+            existing = await db.fetchone(
+                """
+                SELECT model, narrative_stable, narrative_current
+                FROM user_model
+                WHERE tenant_id = $1 AND user_id = $2
+                """,
+                tenant_id,
+                user_id,
+            )
+            current = _hydrate_user_model_narratives(
+                existing.get("model") if existing else None,
+                row=existing if isinstance(existing, dict) else None,
+            )
+            merged = _apply_user_model_proposal(current, proposal or {})
+            changed = merged != current
+            if changed:
+                await _upsert_user_model(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    model=merged,
+                    source="llm_session_enricher",
+                )
+            await _update_enrichment_state_success(tenant_id=tenant_id, user_id=user_id, mode=mode)
+            return changed
+    except Exception as e:
+        await _update_enrichment_state_failure(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            mode=mode,
+            error=str(e),
+            base_backoff_seconds=retry_backoff_seconds,
+            max_backoff_seconds=retry_max_seconds,
+        )
+        raise
+
+
+async def _run_user_model_enrichment_mode_once(
+    mode: str,
+    max_users: int,
+    min_confidence: float,
+    daily_lookback_hours: int,
+    weekly_lookback_days: int,
+    retry_backoff_seconds: int,
+    retry_max_seconds: int
+) -> Dict[str, int]:
+    users = await _fetch_enrichment_candidates(
+        mode=mode,
+        max_users=max_users,
+        daily_lookback_hours=daily_lookback_hours,
+        weekly_lookback_days=weekly_lookback_days,
+    )
+    counts = {"selected": len(users or []), "updated": 0, "failed": 0}
+    for row in users or []:
+        tenant_id = row.get("tenant_id")
+        user_id = row.get("user_id")
+        if not tenant_id or not user_id:
+            continue
+        try:
+            changed = await _run_user_model_enrichment_for_user(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                mode=mode,
+                min_confidence=min_confidence,
+                retry_backoff_seconds=retry_backoff_seconds,
+                retry_max_seconds=retry_max_seconds,
+            )
+            if changed:
+                counts["updated"] += 1
+        except Exception as e:
+            logger.error("user model enrichment failed mode=%s tenant=%s user=%s error=%s", mode, tenant_id, user_id, e)
+            counts["failed"] += 1
+    return counts
+
+
+async def _run_user_model_enrichment_backfill_once(
+    max_users: int,
+    min_confidence: float,
+    retry_backoff_seconds: int,
+    retry_max_seconds: int
+) -> Dict[str, int]:
+    users = await db.fetch(
+        """
+        SELECT tenant_id, user_id
+        FROM (
+            SELECT tenant_id, user_id, MAX(updated_at) AS ts
+            FROM session_transcript
+            GROUP BY tenant_id, user_id
+        ) x
+        ORDER BY ts DESC
+        LIMIT $1
+        """,
+        max_users,
+    )
+    counts = {"selected": len(users or []), "updated": 0, "failed": 0}
+    for row in users or []:
+        tenant_id = row.get("tenant_id")
+        user_id = row.get("user_id")
+        if not tenant_id or not user_id:
+            continue
+        try:
+            changed = await _run_user_model_enrichment_for_user(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                mode="backfill",
+                min_confidence=min_confidence,
+                retry_backoff_seconds=retry_backoff_seconds,
+                retry_max_seconds=retry_max_seconds,
+            )
+            if changed:
+                counts["updated"] += 1
+        except Exception as e:
+            logger.error("user model enrichment backfill failed tenant=%s user=%s error=%s", tenant_id, user_id, e)
+            counts["failed"] += 1
+    return counts
+
+
+async def _fetch_hygiene_candidates(max_users: int) -> List[Dict[str, Any]]:
+    return await db.fetch(
+        """
+        WITH session_touch AS (
+            SELECT tenant_id, user_id, MAX(updated_at) AS ts
+            FROM session_transcript
+            WHERE updated_at >= NOW() - INTERVAL '48 hours'
+            GROUP BY tenant_id, user_id
+        ),
+        model_touch AS (
+            SELECT tenant_id, user_id, MAX(updated_at) AS ts
+            FROM user_model
+            WHERE updated_at >= NOW() - INTERVAL '48 hours'
+            GROUP BY tenant_id, user_id
+        ),
+        touched AS (
+            SELECT tenant_id, user_id, MAX(ts) AS ts
+            FROM (
+                SELECT * FROM session_touch
+                UNION ALL
+                SELECT * FROM model_touch
+            ) x
+            GROUP BY tenant_id, user_id
+        )
+        SELECT x.tenant_id, x.user_id
+        FROM (
+            SELECT t.tenant_id, t.user_id, t.ts
+            FROM touched t
+            LEFT JOIN user_model_enrichment_state s
+              ON s.tenant_id = t.tenant_id AND s.user_id = t.user_id
+            WHERE (
+                s.last_hygiene_at IS NULL
+                OR s.last_hygiene_at <= NOW() - INTERVAL '24 hours'
+            )
+            AND (
+                s.next_hygiene_at IS NULL
+                OR s.next_hygiene_at <= NOW()
+            )
+        ) x
+        ORDER BY x.ts DESC
+        LIMIT $1
+        """,
+        max(1, int(max_users)),
+    )
+
+
+async def _update_hygiene_state_success(tenant_id: str, user_id: str) -> None:
+    await db.execute(
+        """
+        INSERT INTO user_model_enrichment_state (
+            tenant_id, user_id, last_hygiene_at, next_hygiene_at, updated_at
+        )
+        VALUES (
+            $1, $2, NOW(), NOW() + INTERVAL '24 hours', NOW()
+        )
+        ON CONFLICT (tenant_id, user_id)
+        DO UPDATE SET
+            last_hygiene_at = NOW(),
+            next_hygiene_at = NOW() + INTERVAL '24 hours',
+            updated_at = NOW()
+        """,
+        tenant_id,
+        user_id,
+    )
+
+
+async def _run_user_model_hygiene_for_user(tenant_id: str, user_id: str) -> bool:
+    async with _user_model_write_claim(tenant_id=tenant_id, user_id=user_id, ttl_seconds=180) as claimed:
+        if not claimed:
+            return False
+        state = await db.fetchone(
+            """
+            SELECT last_hygiene_at
+            FROM user_model_enrichment_state
+            WHERE tenant_id = $1 AND user_id = $2
+            """,
+            tenant_id,
+            user_id,
+        )
+        last_hygiene_at = _parse_optional_dt((state or {}).get("last_hygiene_at"))
+        now_dt = datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+        if last_hygiene_at:
+            if last_hygiene_at.tzinfo is None:
+                last_hygiene_at = last_hygiene_at.replace(tzinfo=dt_timezone.utc)
+            if (now_dt - last_hygiene_at) < timedelta(hours=24):
+                return False
+
+        row = await db.fetchone(
+            """
+            SELECT model, narrative_stable, narrative_current
+            FROM user_model
+            WHERE tenant_id = $1 AND user_id = $2
+            """,
+            tenant_id,
+            user_id,
+        )
+        if not row:
+            await _update_hygiene_state_success(tenant_id=tenant_id, user_id=user_id)
+            return False
+        raw_model = row.get("model")
+        if not isinstance(raw_model, dict):
+            await _update_hygiene_state_success(tenant_id=tenant_id, user_id=user_id)
+            return False
+        cleaned = _hydrate_user_model_narratives(raw_model, row=row if isinstance(row, dict) else None)
+        if not _has_meaningful_user_model_diff(raw_model, cleaned):
+            await _update_hygiene_state_success(tenant_id=tenant_id, user_id=user_id)
+            return False
+        await _upsert_user_model(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            model=cleaned,
+            source="hygiene_pass",
+        )
+        await _update_hygiene_state_success(tenant_id=tenant_id, user_id=user_id)
+        return True
+
+
+async def _run_user_model_hygiene_mode_once(
+    max_users: int
+) -> Dict[str, int]:
+    users = await _fetch_hygiene_candidates(max_users=max_users)
+    counts = {"selected": len(users or []), "updated": 0, "failed": 0}
+    for row in users or []:
+        tenant_id = row.get("tenant_id")
+        user_id = row.get("user_id")
+        if not tenant_id or not user_id:
+            continue
+        try:
+            changed = await _run_user_model_hygiene_for_user(tenant_id=tenant_id, user_id=user_id)
+            if changed:
+                counts["updated"] += 1
+        except Exception as e:
+            logger.error("user model hygiene failed tenant=%s user=%s error=%s", tenant_id, user_id, e)
+            counts["failed"] += 1
+    return counts
+
+
+async def user_model_enrichment_loop(
+    interval_seconds: int,
+    max_users: int,
+    min_confidence: float,
+    daily_lookback_hours: int,
+    weekly_lookback_days: int,
+    retry_backoff_seconds: int,
+    retry_max_seconds: int
+) -> None:
+    last_hygiene_run: Optional[datetime] = None
+    while True:
+        try:
+            daily_counts = await _run_user_model_enrichment_mode_once(
+                mode="daily",
+                max_users=max_users,
+                min_confidence=min_confidence,
+                daily_lookback_hours=daily_lookback_hours,
+                weekly_lookback_days=weekly_lookback_days,
+                retry_backoff_seconds=retry_backoff_seconds,
+                retry_max_seconds=retry_max_seconds,
+            )
+            weekly_counts = await _run_user_model_enrichment_mode_once(
+                mode="weekly",
+                max_users=max_users,
+                min_confidence=min_confidence,
+                daily_lookback_hours=daily_lookback_hours,
+                weekly_lookback_days=weekly_lookback_days,
+                retry_backoff_seconds=retry_backoff_seconds,
+                retry_max_seconds=retry_max_seconds,
+            )
+            hygiene_counts = {"selected": 0, "updated": 0, "failed": 0}
+            now_dt = datetime.utcnow()
+            should_run_hygiene = (
+                last_hygiene_run is None
+                or (now_dt - last_hygiene_run) >= timedelta(hours=20)
+            )
+            if should_run_hygiene:
+                hygiene_counts = await _run_user_model_hygiene_mode_once(
+                    max_users=max_users,
+                )
+                last_hygiene_run = now_dt
+
+            if (
+                daily_counts.get("updated")
+                or weekly_counts.get("updated")
+                or hygiene_counts.get("updated")
+                or daily_counts.get("failed")
+                or weekly_counts.get("failed")
+                or hygiene_counts.get("failed")
+            ):
+                logger.info(
+                    "user model enrichment loop daily=%s weekly=%s hygiene=%s",
+                    daily_counts,
+                    weekly_counts,
+                    hygiene_counts,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"user model enrichment loop error: {e}")
         await asyncio.sleep(max(30, interval_seconds))
 
 
@@ -2287,6 +4351,318 @@ async def daily_analysis_loop(
         await asyncio.sleep(max(3600, interval_seconds))
 
 
+def _normalize_habit_dedupe_plan(
+    raw: Optional[Dict[str, Any]],
+    valid_ids: set[str],
+) -> Dict[str, Any]:
+    plan = raw if isinstance(raw, dict) else {}
+    merge_groups_out: List[Dict[str, Any]] = []
+    for item in (plan.get("merge_groups") or []):
+        if not isinstance(item, dict):
+            continue
+        group_ids = [
+            _normalize_text(x)
+            for x in (item.get("habit_ids") or [])
+            if _normalize_text(x) in valid_ids
+        ]
+        group_ids = _dedupe_keep_order(group_ids, limit=20)
+        if len(group_ids) < 2:
+            continue
+        canonical_id = _normalize_text(item.get("canonical_habit_id"))
+        if canonical_id not in group_ids:
+            canonical_id = group_ids[0]
+        merge_groups_out.append(
+            {
+                "habit_ids": group_ids,
+                "canonical_habit_id": canonical_id,
+                "reason": _normalize_text(item.get("reason")),
+            }
+        )
+
+    flagged_out: List[Dict[str, str]] = []
+    for item in (plan.get("flagged_uncertain") or []):
+        if isinstance(item, str):
+            habit_id = _normalize_text(item)
+            if habit_id in valid_ids:
+                flagged_out.append({"habit_id": habit_id, "reason": ""})
+            continue
+        if not isinstance(item, dict):
+            continue
+        habit_id = _normalize_text(item.get("habit_id"))
+        if habit_id not in valid_ids:
+            continue
+        flagged_out.append(
+            {
+                "habit_id": habit_id,
+                "reason": _normalize_text(item.get("reason")),
+            }
+        )
+    return {
+        "merge_groups": merge_groups_out,
+        "flagged_uncertain": flagged_out,
+    }
+
+
+async def _mark_habit_dedupe_run_state(
+    tenant_id: str,
+    user_id: str,
+    run_date: date,
+) -> None:
+    await db.execute(
+        """
+        INSERT INTO habit_dedupe_state (tenant_id, user_id, last_run_date, updated_at)
+        VALUES ($1, $2, $3, NOW())
+        ON CONFLICT (tenant_id, user_id)
+        DO UPDATE SET
+            last_run_date = EXCLUDED.last_run_date,
+            updated_at = NOW()
+        """,
+        tenant_id,
+        user_id,
+        run_date,
+    )
+
+
+async def _run_habit_dedupe_for_user(
+    tenant_id: str,
+    user_id: str,
+    run_date: date,
+) -> Dict[str, int]:
+    rows = await db.fetch(
+        """
+        SELECT id::text AS id, text, time_horizon, confidence, salience, metadata,
+               last_seen_at, updated_at, created_at
+        FROM loops
+        WHERE tenant_id = $1
+          AND user_id = $2
+          AND type = 'habit'
+          AND status = 'active'
+        ORDER BY COALESCE(last_seen_at, updated_at, created_at AT TIME ZONE 'UTC') DESC
+        """,
+        tenant_id,
+        user_id,
+    )
+    if not rows:
+        return {"staled": 0, "flagged": 0}
+
+    habits_payload: List[Dict[str, Any]] = []
+    valid_ids: set[str] = set()
+    for row in rows:
+        habit_id = _normalize_text(row.get("id"))
+        habit_text = _normalize_text(row.get("text"))
+        if not habit_id or not habit_text:
+            continue
+        valid_ids.add(habit_id)
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        habits_payload.append(
+            {
+                "habit_id": habit_id,
+                "text": habit_text,
+                "time_horizon": _normalize_text(row.get("time_horizon")) or "ongoing",
+                "confidence": _normalize_confidence(row.get("confidence"), default=0.72),
+                "salience": int(row.get("salience") or 0),
+                "reason": _normalize_text(metadata.get("reason")),
+                "existing_needs_confirmation": bool(metadata.get("needs_confirmation")),
+            }
+        )
+    if not habits_payload:
+        return {"staled": 0, "flagged": 0}
+
+    prompt = (
+        "Given these active daily habits for one user, identify:\n"
+        "(a) duplicates or near-duplicates that mean the same thing,\n"
+        "(b) entries unlikely to be genuine daily habits (aspirations/themes/relationship goals/one-off intentions).\n\n"
+        "Rules:\n"
+        "- Use only provided habit_ids.\n"
+        "- A merge group must contain at least 2 habit_ids.\n"
+        "- canonical_habit_id must be one of habit_ids and should be the clearest/most specific phrasing.\n"
+        "- For uncertain entries, return habit_id and short reason.\n"
+        "- Return strict JSON only.\n\n"
+        "JSON schema:\n"
+        "{\n"
+        "  \"merge_groups\": [\n"
+        "    {\"habit_ids\": [\"...\", \"...\"], \"canonical_habit_id\": \"...\", \"reason\": \"...\"}\n"
+        "  ],\n"
+        "  \"flagged_uncertain\": [\n"
+        "    {\"habit_id\": \"...\", \"reason\": \"...\"}\n"
+        "  ]\n"
+        "}\n\n"
+        f"RUN_DATE_UTC: {run_date.isoformat()}\n"
+        f"HABITS_JSON: {json.dumps(habits_payload, ensure_ascii=True)}"
+    )
+    llm_client = get_llm_client()
+    raw = await llm_client._call_llm(
+        prompt=prompt,
+        max_tokens=900,
+        temperature=0.1,
+        task="loops",
+    )
+    parsed = _safe_parse_json_object(raw) if raw else None
+    plan = _normalize_habit_dedupe_plan(parsed, valid_ids=valid_ids)
+
+    stale_ids: set[str] = set()
+    keep_ids: set[str] = set()
+    for group in plan.get("merge_groups") or []:
+        group_ids = group.get("habit_ids") if isinstance(group.get("habit_ids"), list) else []
+        canonical = _normalize_text(group.get("canonical_habit_id"))
+        if canonical:
+            keep_ids.add(canonical)
+        for hid in group_ids:
+            clean_hid = _normalize_text(hid)
+            if clean_hid and clean_hid != canonical:
+                stale_ids.add(clean_hid)
+    stale_ids = {hid for hid in stale_ids if hid not in keep_ids}
+
+    stale_count = 0
+    if stale_ids:
+        stale_count = int(
+            await db.fetchval(
+                """
+                WITH updated AS (
+                    UPDATE loops
+                    SET status = 'stale',
+                        updated_at = NOW()
+                    WHERE tenant_id = $1
+                      AND user_id = $2
+                      AND status = 'active'
+                      AND id = ANY($3::uuid[])
+                    RETURNING id
+                )
+                SELECT count(*) FROM updated
+                """,
+                tenant_id,
+                user_id,
+                list(stale_ids),
+            )
+            or 0
+        )
+
+    flagged_count = 0
+    for item in plan.get("flagged_uncertain") or []:
+        habit_id = _normalize_text(item.get("habit_id"))
+        if not habit_id or habit_id in stale_ids:
+            continue
+        reason = _normalize_text(item.get("reason"))
+        if reason:
+            row = await db.fetchone(
+                """
+                UPDATE loops
+                SET metadata = jsonb_set(
+                        jsonb_set(COALESCE(metadata, '{}'::jsonb), '{needs_confirmation}', 'true'::jsonb, true),
+                        '{needs_confirmation_reason}',
+                        to_jsonb($4::text),
+                        true
+                    ),
+                    updated_at = NOW()
+                WHERE tenant_id = $1
+                  AND user_id = $2
+                  AND id = $3::uuid
+                  AND status = 'active'
+                RETURNING id
+                """,
+                tenant_id,
+                user_id,
+                habit_id,
+                reason,
+            )
+        else:
+            row = await db.fetchone(
+                """
+                UPDATE loops
+                SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{needs_confirmation}', 'true'::jsonb, true),
+                    updated_at = NOW()
+                WHERE tenant_id = $1
+                  AND user_id = $2
+                  AND id = $3::uuid
+                  AND status = 'active'
+                RETURNING id
+                """,
+                tenant_id,
+                user_id,
+                habit_id,
+            )
+        if row:
+            flagged_count += 1
+
+    return {"staled": stale_count, "flagged": flagged_count}
+
+
+async def _run_daily_habit_dedupe_once(
+    run_date: date,
+    max_users: int,
+) -> Dict[str, int]:
+    users = await db.fetch(
+        """
+        SELECT u.tenant_id, u.user_id
+        FROM (
+            SELECT l.tenant_id, l.user_id,
+                   MAX(COALESCE(l.last_seen_at, l.updated_at, l.created_at AT TIME ZONE 'UTC')) AS latest_seen
+            FROM loops l
+            WHERE l.type = 'habit'
+              AND l.status = 'active'
+            GROUP BY l.tenant_id, l.user_id
+        ) u
+        LEFT JOIN habit_dedupe_state s
+          ON s.tenant_id = u.tenant_id
+         AND s.user_id = u.user_id
+        WHERE s.last_run_date IS NULL OR s.last_run_date < $1
+        ORDER BY u.latest_seen DESC NULLS LAST
+        LIMIT $2
+        """,
+        run_date,
+        max(1, int(max_users)),
+    )
+    counts = {"users_seen": len(users or []), "users_updated": 0, "staled": 0, "flagged": 0}
+    for row in users or []:
+        tenant_id = _normalize_text(row.get("tenant_id"))
+        user_id = _normalize_text(row.get("user_id"))
+        if not tenant_id or not user_id:
+            continue
+        try:
+            result = await _run_habit_dedupe_for_user(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                run_date=run_date,
+            )
+            await _mark_habit_dedupe_run_state(tenant_id=tenant_id, user_id=user_id, run_date=run_date)
+            staled = int((result or {}).get("staled") or 0)
+            flagged = int((result or {}).get("flagged") or 0)
+            counts["staled"] += staled
+            counts["flagged"] += flagged
+            if staled or flagged:
+                counts["users_updated"] += 1
+        except Exception as e:
+            logger.error("habit dedupe failed tenant=%s user=%s error=%s", tenant_id, user_id, e)
+    return counts
+
+
+async def daily_habit_dedupe_loop(
+    interval_seconds: int,
+    max_users: int,
+) -> None:
+    while True:
+        try:
+            run_date = datetime.utcnow().date()
+            counts = await _run_daily_habit_dedupe_once(
+                run_date=run_date,
+                max_users=max_users,
+            )
+            if counts.get("users_updated"):
+                logger.info(
+                    "daily habit dedupe run_date=%s users_seen=%s users_updated=%s staled=%s flagged=%s",
+                    run_date.isoformat(),
+                    counts.get("users_seen"),
+                    counts.get("users_updated"),
+                    counts.get("staled"),
+                    counts.get("flagged"),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"daily habit dedupe loop error: {e}")
+        await asyncio.sleep(max(3600, interval_seconds))
+
+
 async def _get_latest_steering_note(
     tenant_id: str,
     user_id: str,
@@ -2545,73 +4921,89 @@ async def _generate_startbrief_bridge_llm(
     rewrite_only: bool = False
 ) -> Optional[str]:
     llm_client = get_llm_client()
-    word_cap = {
-        "continuation": 35,
-        "today": 80,
-        "yesterday": 95,
-        "multi_day": 120,
-    }.get(depth_label, 95)
     now_local = _normalize_text(narrative_ingredients.get("now_local"))
     gap_human = _normalize_text(narrative_ingredients.get("gap_human"))
-    session_frequency = _normalize_text(narrative_ingredients.get("session_frequency"))
     last_thread = _normalize_text(narrative_ingredients.get("last_thread"))
     user_tone = _normalize_text(narrative_ingredients.get("user_tone"))
     open_threads = [_normalize_text(x) for x in (narrative_ingredients.get("open_threads") or []) if _normalize_text(x)]
+    open_thread_reasons = [_normalize_text(x) for x in (narrative_ingredients.get("open_thread_reasons") or []) if _normalize_text(x)]
+    open_loops = [_normalize_text(x) for x in (narrative_ingredients.get("open_loops") or []) if _normalize_text(x)]
+    yesterday_themes = [_normalize_text(x) for x in (narrative_ingredients.get("yesterday_themes") or []) if _normalize_text(x)]
+    steering_note = _normalize_text(narrative_ingredients.get("steering_note"))
+    continuation_hint = _normalize_text(narrative_ingredients.get("continuation_hint"))
+    user_narrative_stable = _normalize_text(narrative_ingredients.get("user_narrative_stable"))
+    user_narrative_current = _normalize_text(narrative_ingredients.get("user_narrative_current"))
     if rewrite_only:
         prompt = (
-            "Rewrite the ORIENTATION BRIEF to satisfy all constraints exactly.\n"
+            "Rewrite the STARTBRIEF to satisfy all constraints exactly.\n"
             "Do not add facts. Do not remove real facts. Rephrase only.\n\n"
             "Constraints:\n"
             "- Address the assistant as \"you\" and refer to the human as \"the user\".\n"
-            "- Include NOW_LOCAL once, GAP_HUMAN once, and SESSION_FREQUENCY once.\n"
-            "- Include LAST_THREAD and USER_TONE in neutral phrasing.\n"
-            "- Include OPEN_THREADS (1-2 max).\n"
+            "- Do not mention conversation count.\n"
+            "- If OPEN_THREAD_REASONS exists, pair each reason with its thread text.\n"
+            "- Keep complete sentences only; no clipped endings.\n"
+            "- No artificial word cap; use only the length needed for meaningful context.\n"
             "- No advice or imperatives: avoid should/could/try/maybe/a good idea.\n"
             "- No filler verbs: reported/stated/noted/mentioned/said.\n"
+            "- No event labels or significance scoring words: avoid significant/development/event/context labels.\n"
+            "- No interpretation framing: avoid indicating/suggesting/it means/may symbolize.\n"
             "- No years (20xx), no full calendar dates, no clock time format HH:MM.\n"
             "- One paragraph only.\n"
-            f"- Word cap for DEPTH={depth_label}: {word_cap} words.\n\n"
+            "- If little happened, keep it brief (about 2 sentences).\n"
+            "- If a lot happened, include enough detail (up to about 8 sentences).\n\n"
             "Inputs:\n"
             f"DEPTH: {depth_label}\n"
             f"NOW_LOCAL: {now_local}\n"
             f"GAP_HUMAN: {gap_human}\n"
-            f"SESSION_FREQUENCY: {session_frequency}\n"
             f"LAST_THREAD: {last_thread}\n"
             f"USER_TONE: {user_tone}\n"
             f"OPEN_THREADS: {json.dumps(open_threads, ensure_ascii=True)}\n\n"
+            f"OPEN_THREAD_REASONS: {json.dumps(open_thread_reasons, ensure_ascii=True)}\n"
+            f"OPEN_LOOPS: {json.dumps(open_loops, ensure_ascii=True)}\n"
+            f"YESTERDAY_THEMES: {json.dumps(yesterday_themes, ensure_ascii=True)}\n"
+            f"STEERING_NOTE: {steering_note}\n"
+            f"CONTINUATION_HINT: {continuation_hint}\n\n"
+            f"USER_NARRATIVE_STABLE: {user_narrative_stable}\n"
+            f"USER_NARRATIVE_CURRENT: {user_narrative_current}\n\n"
             "Return ONLY the rewritten paragraph."
         )
     else:
         prompt = (
-            "Write a short ORIENTATION BRIEF addressed to the assistant (\"you\") about the user (\"the user\").\n"
+            "Write a STARTBRIEF paragraph addressed to the assistant (\"you\") about the user (\"the user\").\n"
             "This text will be prepended as context for a stateless LLM call. It is not shown to the user.\n\n"
-            "Include these elements, in order:\n"
-            "1) Current local time + time-of-day\n"
-            "2) Time gap since last session\n"
-            "3) Conversation frequency\n"
-            "4) Most recent thread and observed user tone\n"
-            "5) Remaining open threads (1-2 max)\n\n"
             "Constraints:\n"
             "- Use \"you\" only for the assistant; use \"the user\" for the human.\n"
-            "- Neutral, factual tone. No conversational fluff.\n"
+            "- Do not mention conversation count. That is handled separately.\n"
+            "- Write like a sharp friend making quick notes before a call. Specific details only — what actually happened, what was said, what mattered. No interpretation, no inference, no 'may symbolize', no 'indicating a possible.' If the user saw a butterfly, say he saw a butterfly. Don't explain what it means.\n"
+            "- No event labelling, no significance scoring, no case-note framing.\n"
+            "- No indicating that/suggesting that phrasing.\n"
+            "- Keep complete sentences only; never end mid-thought.\n"
+            "- No artificial word cap. Use as much length as needed for meaningful context and no more.\n"
+            "- If little happened, two sentences is fine. If a lot happened, up to eight sentences is fine.\n"
             "- No advice or imperatives. Avoid should/could/try/maybe/a good idea.\n"
             "- No filler verbs: reported/stated/noted/mentioned/said.\n"
             "- No years (20xx). Avoid full calendar dates and HH:MM clock times.\n"
             "- One paragraph only.\n"
-            f"- Word cap for DEPTH={depth_label}: {word_cap}.\n\n"
+            "- If OPEN_THREAD_REASONS exists, pair each reason with its thread text.\n\n"
             "Inputs:\n"
             f"DEPTH: {depth_label}\n"
             f"NOW_LOCAL: {now_local}\n"
             f"GAP_HUMAN: {gap_human}\n"
-            f"SESSION_FREQUENCY: {session_frequency}\n"
             f"LAST_THREAD: {last_thread}\n"
             f"USER_TONE: {user_tone}\n"
-            f"OPEN_THREADS: {json.dumps(open_threads, ensure_ascii=True)}\n\n"
+            f"OPEN_THREADS: {json.dumps(open_threads, ensure_ascii=True)}\n"
+            f"OPEN_THREAD_REASONS: {json.dumps(open_thread_reasons, ensure_ascii=True)}\n"
+            f"OPEN_LOOPS: {json.dumps(open_loops, ensure_ascii=True)}\n"
+            f"YESTERDAY_THEMES: {json.dumps(yesterday_themes, ensure_ascii=True)}\n"
+            f"STEERING_NOTE: {steering_note}\n"
+            f"CONTINUATION_HINT: {continuation_hint}\n\n"
+            f"USER_NARRATIVE_STABLE: {user_narrative_stable}\n"
+            f"USER_NARRATIVE_CURRENT: {user_narrative_current}\n\n"
             "Return ONLY the paragraph."
         )
     response = await llm_client._call_llm(
         prompt=prompt,
-        max_tokens=220,
+        max_tokens=400,
         temperature=0.1,
         task="startbrief_bridge"
     )
@@ -2659,15 +5051,6 @@ _LOW_VALUE_LOOP_PATTERNS = (
 )
 
 
-def _handover_word_cap(depth_label: str) -> int:
-    return {
-        "continuation": 35,
-        "today": 80,
-        "yesterday": 95,
-        "multi_day": 120,
-    }.get(depth_label, 95)
-
-
 def _handover_mentions_advice(text: str) -> bool:
     lower = _normalize_text(text).lower()
     return any(re.search(p, lower) for p in _STARTBRIEF_ADVICE_PATTERNS)
@@ -2711,22 +5094,6 @@ def _validate_handover_text(
         reasons.append("ops_context_leak")
     if len(re.findall(r"\b(gap|since last spoke|hours since|minutes since)\b", clean.lower())) > 1:
         reasons.append("repeated_time_gap")
-    if required_context:
-        now_local = _normalize_text(required_context.get("now_local")).lower()
-        gap_human = _normalize_text(required_context.get("gap_human")).lower()
-        session_frequency = _normalize_text(required_context.get("session_frequency")).lower()
-        if now_local and now_local not in clean_lower:
-            reasons.append("missing_now_local")
-        if gap_human and gap_human not in clean_lower:
-            reasons.append("missing_gap_human")
-        if session_frequency and session_frequency not in clean_lower:
-            reasons.append("missing_session_frequency")
-    if len(re.findall(r"\b\w+\b", clean)) > _handover_word_cap(depth_label):
-        reasons.append("over_word_cap")
-    if depth_label == "continuation":
-        sentence_count = len([s for s in re.split(r"[.!?]+", clean) if _normalize_text(s)])
-        if sentence_count > 2:
-            reasons.append("continuation_too_long")
     return reasons
 
 
@@ -2734,13 +5101,21 @@ def _truncate_at_word_boundary(value: str, limit: int) -> str:
     clean = _normalize_text(value)
     if len(clean) <= limit:
         return clean
-    cutoff = max(0, limit - 3)
-    candidate = clean[:cutoff]
-    last_space = candidate.rfind(" ")
-    if last_space > 0:
-        candidate = candidate[:last_space]
-    candidate = candidate.rstrip(" ,.;:")
-    return candidate + "..."
+    sentences = [
+        _normalize_text(s)
+        for s in re.split(r"(?<=[.!?])\s+", clean)
+        if _normalize_text(s)
+    ]
+    kept: List[str] = []
+    for sentence in sentences:
+        candidate = " ".join(kept + [sentence]).strip()
+        if len(candidate) <= limit:
+            kept.append(sentence)
+        else:
+            break
+    if kept:
+        return " ".join(kept).strip()
+    return sentences[0] if sentences else clean
 
 
 def _truncate_to_word_cap(value: str, word_cap: int) -> str:
@@ -2748,7 +5123,23 @@ def _truncate_to_word_cap(value: str, word_cap: int) -> str:
     words = re.findall(r"\S+", clean)
     if len(words) <= word_cap:
         return clean
-    return _normalize_text(" ".join(words[:word_cap]))
+    sentences = [
+        _normalize_text(s)
+        for s in re.split(r"(?<=[.!?])\s+", clean)
+        if _normalize_text(s)
+    ]
+    kept: List[str] = []
+    used_words = 0
+    for sentence in sentences:
+        sentence_words = len(re.findall(r"\S+", sentence))
+        if used_words + sentence_words <= word_cap:
+            kept.append(sentence)
+            used_words += sentence_words
+        else:
+            break
+    if kept:
+        return _normalize_text(" ".join(kept))
+    return sentences[0] if sentences else clean
 
 
 def _ensure_sentence_spacing(value: str) -> str:
@@ -2756,6 +5147,19 @@ def _ensure_sentence_spacing(value: str) -> str:
     if not clean:
         return ""
     return re.sub(r"([.!?])([A-Za-z])", r"\1 \2", clean)
+
+
+def _join_sentence_parts(parts: List[str]) -> str:
+    """Join narrative fragments while enforcing sentence boundaries between fragments."""
+    joined: List[str] = []
+    for raw in parts:
+        part = _normalize_text(raw)
+        if not part:
+            continue
+        if joined and not re.search(r"[.!?]$", joined[-1]):
+            joined[-1] = f"{joined[-1]}."
+        joined.append(part)
+    return _ensure_sentence_spacing(" ".join(joined))
 
 
 def _humanize_thread_text(value: str) -> str:
@@ -2791,37 +5195,40 @@ def _fallback_handover_text(ingredients: Dict[str, Any], depth_label: str) -> st
     last_thread = _ensure_sentence_spacing(_normalize_text(ingredients.get("last_thread")))
     user_tone = _normalize_text(ingredients.get("user_tone"))
     open_threads = [_normalize_text(x) for x in (ingredients.get("open_threads") or []) if _normalize_text(x)]
+    open_thread_reasons = [_normalize_text(x) for x in (ingredients.get("open_thread_reasons") or []) if _normalize_text(x)]
     now_local = _normalize_text(ingredients.get("now_local")) or "the current local time context is available"
     gap_human = _normalize_text(ingredients.get("gap_human")) or "an unknown interval"
-    session_frequency = _normalize_text(ingredients.get("session_frequency")) or "session frequency is limited"
 
-    tone_clause = ""
-    if user_tone and user_tone.lower() not in {"neutral", "steady", "calm", "ok", "fine"}:
-        tone_clause = f"The user came in {user_tone}."
-    threads_clause = _natural_open_threads_clause(open_threads)
-    if depth_label == "continuation":
-        base = (
-            f"It is {now_local}. You last spoke with the user {gap_human} ago. {session_frequency}. "
-            f"The latest thread is {last_thread or 'ongoing'}. {threads_clause}"
-        )
-    elif depth_label == "today":
-        base = (
-            f"It is {now_local}. You last spoke with the user {gap_human} ago. {session_frequency}. "
-            f"The latest thread is {last_thread or 'ongoing'}. {tone_clause} {threads_clause}"
-        )
-    elif depth_label == "yesterday":
-        base = (
-            f"It is {now_local}. You last spoke with the user {gap_human} ago. {session_frequency}. "
-            f"The latest thread is {last_thread or 'ongoing'}. {tone_clause} {threads_clause}"
-        )
-    else:
-        base = (
-            f"It is {now_local}. You last spoke with the user {gap_human} ago. {session_frequency}. "
-            f"The latest thread across recent sessions is {last_thread or 'ongoing'}. {tone_clause} {threads_clause}"
-        )
+    relationship_keywords = ("relationship", "wife", "husband", "partner", "girlfriend", "boyfriend", "friend", "family", "mother", "father", "sister", "brother", "rupture", "repair")
+    relationship_clause = ""
+    relationship_source = " ".join([last_thread] + open_threads).lower()
+    if any(k in relationship_source for k in relationship_keywords):
+        relationship_clause = f"A relationship thread is open: {last_thread or open_threads[0]}."
 
-    text = _truncate_at_word_boundary(base, {"continuation": 260, "today": 420, "yesterday": 520, "multi_day": 620}.get(depth_label, 520))
-    return _truncate_to_word_cap(text, _handover_word_cap(depth_label))
+    emotional_pairs: List[str] = []
+    for idx, thread in enumerate(open_threads[:2]):
+        reason = open_thread_reasons[idx] if idx < len(open_thread_reasons) else ""
+        if reason:
+            emotional_pairs.append(f"{thread} (reason: {reason})")
+        else:
+            emotional_pairs.append(thread)
+
+    sentences: List[str] = [
+        f"It is {now_local}.",
+        f"You last spoke with the user {gap_human} ago.",
+    ]
+    if relationship_clause:
+        sentences.append(relationship_clause)
+    if emotional_pairs:
+        sentences.append(f"Open emotional threads: {'; '.join(emotional_pairs)}.")
+    if last_thread:
+        sentences.append(f"Recent context: {last_thread}.")
+    elif user_tone:
+        sentences.append(f"The user tone was {user_tone}.")
+    if not relationship_clause and not emotional_pairs and not last_thread:
+        sentences.append("No major new events were recorded; recent context was limited.")
+
+    return _normalize_text(" ".join(sentences))
 
 
 def _sanitize_handover_tone(text: str) -> str:
@@ -2942,6 +5349,26 @@ def _normalize_startbrief_session_summary_node(raw: Any, stats: Optional[Dict[st
     attrs = _unwrap_node_like(node.get("attributes")) if isinstance(node.get("attributes"), dict) else {}
     if not isinstance(attrs, dict):
         attrs = {}
+    # Graphiti may flatten custom SessionSummary attributes to top-level properties.
+    if not attrs:
+        attrs = {
+            key: node.get(key)
+            for key in (
+                "summary_text",
+                "bridge_text",
+                "session_id",
+                "reference_time",
+                "created_at",
+                "summary_facts",
+                "tone",
+                "moment",
+                "decisions",
+                "unresolved",
+                "index_text",
+                "salience",
+            )
+            if node.get(key) is not None
+        }
 
     session_id = _first_clean_startbrief_value(node.get("session_id"), attrs.get("session_id"), stats=stats)
     created_at = _first_clean_startbrief_value(
@@ -3104,10 +5531,15 @@ def select_startbrief_ingredients(
         in_24h,
         key=lambda s: -int((_parse_optional_dt(s.get("created_at")) or datetime.min.replace(tzinfo=dt_timezone.utc)).timestamp())
     )
-    if most_recent:
-        recent = most_recent[0]
-        if (not selected or recent.get("session_id") != selected[0].get("session_id")) and _normalize_text(recent.get("salience")).lower() in {"high", "medium"}:
+    for recent in most_recent:
+        if selected and recent.get("session_id") == selected[0].get("session_id"):
+            continue
+        recent_salience = _normalize_text(recent.get("salience")).lower()
+        # Missing salience should not be treated the same as explicit low salience.
+        salience_allows_recent = (not recent_salience) or (recent_salience in {"high", "medium"})
+        if salience_allows_recent:
             selected.append(recent)
+            break
     selected = selected[:2]
 
     filtered_loops: List[Dict[str, Any]] = []
@@ -3151,9 +5583,9 @@ def select_startbrief_ingredients(
         unresolved = s.get("unresolved")
         if not unresolved and isinstance(s.get("attributes"), dict):
             unresolved = s.get("attributes", {}).get("unresolved")
-        line = " ".join([p for p in [facts, tone, moment] if p]).strip()
+        line = _join_sentence_parts([facts, tone, moment])
         if line:
-            last_thread_parts.append(_shorten_line(line, 220))
+            last_thread_parts.append(line)
         if tone:
             tone_parts.append(tone)
         if isinstance(unresolved, list):
@@ -3175,6 +5607,14 @@ def select_startbrief_ingredients(
                 break
 
     open_threads = _dedupe_keep_order(unresolved_items + [_normalize_text(l.get("text")) for l in filtered_loops], limit=2)
+    open_thread_reasons = _dedupe_keep_order(
+        [
+            _normalize_text(l.get("reason"))
+            for l in filtered_loops
+            if _normalize_text(l.get("reason"))
+        ],
+        limit=2,
+    )
     gap_human = _format_gap_human(gap_minutes)
     session_frequency = _session_frequency_phrase(sessions_today_count)
     now_local = _format_now_local(reference_now, time_of_day_label)
@@ -3184,9 +5624,10 @@ def select_startbrief_ingredients(
         "gap_minutes": gap_minutes,
         "sessions_today_count": sessions_today_count,
         "selected_summaries": selected,
-        "last_thread": " ".join(last_thread_parts[:2]).strip(),
+        "last_thread": _join_sentence_parts(last_thread_parts),
         "user_tone": _normalize_text(" ".join(_dedupe_keep_order(tone_parts, limit=2))),
         "open_threads": open_threads,
+        "open_thread_reasons": open_thread_reasons,
         "open_loops": [_normalize_text(l.get("text")) for l in filtered_loops[:2] if _normalize_text(l.get("text"))],
         "continuation_hint": continuation_hint,
         "now_state": _normalize_text(filtered_loops[0].get("text")) if filtered_loops else "",
@@ -3234,6 +5675,920 @@ def compose_ops_context(
     }
 
 
+SIGNAL_PACK_CLASSES = ("identity", "trajectory", "today", "open_loops", "state", "relationships", "habits", "momentum", "stale_threads")
+SIGNAL_PACK_MAX_PER_CLASS = 3
+SIGNAL_PACK_CLASS_CAPS: Dict[str, Optional[int]] = {
+    "identity": SIGNAL_PACK_MAX_PER_CLASS,
+    "trajectory": SIGNAL_PACK_MAX_PER_CLASS,
+    "today": SIGNAL_PACK_MAX_PER_CLASS,
+    "open_loops": SIGNAL_PACK_MAX_PER_CLASS,
+    "state": SIGNAL_PACK_MAX_PER_CLASS,
+    "relationships": SIGNAL_PACK_MAX_PER_CLASS,
+    # Habits are always surfaced and should not be dropped by caps.
+    "habits": None,
+    # Momentum is supportive context; keep small and low-precedence.
+    "momentum": 3,
+    # Stale threads are low-priority check-ins; at most one per session.
+    "stale_threads": 1,
+}
+SIGNAL_HIGH_SENSITIVITY_TERMS = (
+    "abuse", "assault", "suicide", "self-harm", "addiction", "relapse",
+    "depressed", "panic", "trauma", "pregnan", "medical", "diagnos",
+)
+SIGNAL_MEDIUM_SENSITIVITY_TERMS = ("anxious", "anxiety", "therapy", "money", "debt", "fight", "conflict")
+
+
+def _normalize_signal_salience(raw: Any, default: float = 0.6) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if value > 1.0:
+        value = value / 5.0 if value <= 5.0 else value / 10.0
+    return max(0.0, min(1.0, value))
+
+
+def _classify_signal_sensitivity(text: str) -> str:
+    lower = _normalize_text(text).lower()
+    if not lower:
+        return "LOW"
+    if any(term in lower for term in SIGNAL_HIGH_SENSITIVITY_TERMS):
+        return "HIGH"
+    if any(term in lower for term in SIGNAL_MEDIUM_SENSITIVITY_TERMS):
+        return "MEDIUM"
+    return "LOW"
+
+
+def _signal_id(signal_class: str, source: str, text: str) -> str:
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"{signal_class}|{source}|{_normalize_text(text).lower()}").hex[:16]
+
+
+def _record_signal_rejection(debug: Dict[str, Any], signal_class: str, reason: str, source: str) -> None:
+    reasons = debug.setdefault("rejection_reasons", {})
+    reasons[reason] = int(reasons.get(reason) or 0) + 1
+    by_class = debug.setdefault("rejections_by_class", {})
+    class_reasons = by_class.setdefault(signal_class, {})
+    class_reasons[reason] = int(class_reasons.get(reason) or 0) + 1
+    debug.setdefault("rejections", []).append({"class": signal_class, "reason": reason, "source": source})
+
+
+def _coerce_datetime_utc(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value.astimezone(dt_timezone.utc).replace(tzinfo=None) if value.tzinfo else value
+    if isinstance(value, str):
+        parsed = _parse_optional_dt(value)
+        if parsed:
+            return parsed.astimezone(dt_timezone.utc).replace(tzinfo=None) if parsed.tzinfo else parsed
+    return None
+
+
+def _days_since(reference_now: datetime, when: Optional[datetime]) -> Optional[int]:
+    if not when:
+        return None
+    gap = reference_now - when
+    return max(0, int(gap.total_seconds() // 86400))
+
+
+def _is_covered_by_existing_signal(candidate: str, existing_texts: List[str]) -> bool:
+    candidate_clean = _normalize_text(candidate).lower()
+    if not candidate_clean:
+        return True
+    for existing in existing_texts:
+        existing_clean = _normalize_text(existing).lower()
+        if not existing_clean:
+            continue
+        if candidate_clean == existing_clean:
+            return True
+        if candidate_clean in existing_clean or existing_clean in candidate_clean:
+            return True
+    return False
+
+
+def _append_signal(
+    classes: Dict[str, List[Dict[str, Any]]],
+    debug: Dict[str, Any],
+    *,
+    signal_class: str,
+    text: str,
+    confidence: float,
+    salience: float,
+    recency_ts: Optional[str],
+    source: str,
+    evidence: Optional[Dict[str, Any]] = None,
+) -> None:
+    class_list = classes.setdefault(signal_class, [])
+    debug_counts = debug.setdefault("counts", {})
+    considered = debug_counts.setdefault("considered", {})
+    emitted = debug_counts.setdefault("emitted", {})
+    considered[signal_class] = int(considered.get(signal_class) or 0) + 1
+
+    clean_text = _normalize_text(text)
+    if not clean_text:
+        _record_signal_rejection(debug, signal_class, "empty_text", source)
+        return
+    existing = {_normalize_text(item.get("text")).lower() for item in class_list}
+    if clean_text.lower() in existing:
+        _record_signal_rejection(debug, signal_class, "duplicate", source)
+        return
+    class_cap = SIGNAL_PACK_CLASS_CAPS.get(signal_class, SIGNAL_PACK_MAX_PER_CLASS)
+    if class_cap is not None and len(class_list) >= class_cap:
+        _record_signal_rejection(debug, signal_class, "class_cap", source)
+        return
+
+    sensitivity = _classify_signal_sensitivity(clean_text)
+    rendered_text = clean_text
+    signal_evidence = evidence.copy() if isinstance(evidence, dict) else None
+    signal: Dict[str, Any] = {
+        "id": _signal_id(signal_class, source, clean_text),
+        "class": signal_class,
+        "text": rendered_text,
+        "confidence": _normalize_confidence(confidence, default=0.6),
+        "salience": _normalize_signal_salience(salience, default=0.6),
+        "sensitivity": sensitivity,
+        "recency_ts": recency_ts,
+        "source": source,
+    }
+    if sensitivity == "HIGH":
+        signal["surface_policy"] = "steer_only"
+        signal["text"] = "Sensitive topic present. Use gentle steering, avoid verbatim repetition."
+        if signal_evidence is None:
+            signal_evidence = {}
+        signal_evidence["redacted"] = True
+    if signal_evidence:
+        signal["evidence"] = signal_evidence
+
+    class_list.append(signal)
+    emitted[signal_class] = int(emitted.get(signal_class) or 0) + 1
+
+
+async def _build_signals_pack(
+    tenantId: str,
+    userId: str,
+    sessionId: Optional[str] = None,
+    now: Optional[str] = None,
+    capacity: Optional[str] = None,
+    tactic_appetite: Optional[str] = None,
+):
+    try:
+        reference_now = datetime.utcnow()
+        if now:
+            parsed_now = _parse_optional_dt(now)
+            if parsed_now:
+                reference_now = parsed_now.astimezone(dt_timezone.utc).replace(tzinfo=None) if parsed_now.tzinfo else parsed_now
+
+        generated_at = reference_now.replace(tzinfo=dt_timezone.utc).isoformat().replace("+00:00", "Z")
+        resolved_session_id = sessionId or await _get_latest_session_id(tenantId, userId)
+        classes: Dict[str, List[Dict[str, Any]]] = {name: [] for name in SIGNAL_PACK_CLASSES}
+        debug: Dict[str, Any] = {
+            "counts": {
+                "considered": {name: 0 for name in SIGNAL_PACK_CLASSES},
+                "emitted": {name: 0 for name in SIGNAL_PACK_CLASSES},
+            },
+            "sources_used": [],
+            "rejection_reasons": {},
+            "rejections_by_class": {},
+            "rejections": [],
+            "triage_trace": {"checkin_tactic_fired": False},
+        }
+
+        top_loops = await loops.get_top_loops_for_startbrief(
+            tenant_id=tenantId,
+            user_id=userId,
+            limit=10,
+            persona_id=None
+        )
+        if top_loops:
+            debug["sources_used"].append("loops")
+        for loop_item in top_loops or []:
+            loop_text = _normalize_text(getattr(loop_item, "text", ""))
+            loop_ts = _normalize_text(getattr(loop_item, "lastSeenAt", "") or getattr(loop_item, "updatedAt", ""))
+            loop_type = _normalize_text(getattr(loop_item, "type", ""))
+            loop_horizon = _normalize_text(getattr(loop_item, "timeHorizon", ""))
+            loop_salience = getattr(loop_item, "salience", None)
+            loop_confidence = getattr(loop_item, "confidence", None)
+            _append_signal(
+                classes,
+                debug,
+                signal_class="open_loops",
+                text=loop_text,
+                confidence=loop_confidence if loop_confidence is not None else 0.72,
+                salience=loop_salience if loop_salience is not None else 0.75,
+                recency_ts=loop_ts or generated_at,
+                source="loops",
+                evidence={"loop_type": loop_type or None, "time_horizon": loop_horizon or None},
+            )
+            if loop_horizon == "today":
+                _append_signal(
+                    classes,
+                    debug,
+                    signal_class="today",
+                    text=f"Today priority: {loop_text}",
+                    confidence=0.7,
+                    salience=loop_salience if loop_salience is not None else 0.7,
+                    recency_ts=loop_ts or generated_at,
+                    source="loops",
+                )
+            if loop_type in {"commitment", "decision", "thread"}:
+                _append_signal(
+                    classes,
+                    debug,
+                    signal_class="trajectory",
+                    text=f"{loop_type.title()}: {loop_text}",
+                    confidence=0.68,
+                    salience=loop_salience if loop_salience is not None else 0.66,
+                    recency_ts=loop_ts or generated_at,
+                    source="loops",
+                )
+
+        # Habits need dedicated daily visibility, independent of top loop ranking caps.
+        active_habit_rows = await db.fetch(
+            """
+            SELECT
+                l.id,
+                l.text,
+                l.hint,
+                l.metadata,
+                l.confidence,
+                l.salience,
+                l.time_horizon,
+                l.updated_at,
+                l.last_seen_at,
+                hdl.completed,
+                hdl.nudged,
+                hdl.acknowledged
+            FROM loops l
+            LEFT JOIN habit_daily_log hdl
+              ON hdl.habit_id = l.id
+             AND hdl.date = $3
+            WHERE l.tenant_id = $1
+              AND l.user_id = $2
+              AND l.type = 'habit'
+              AND l.status = 'active'
+            ORDER BY
+              CASE WHEN l.time_horizon = 'ongoing' THEN 0 ELSE 1 END,
+              COALESCE(l.last_seen_at, l.updated_at) DESC
+            """,
+            tenantId,
+            userId,
+            reference_now.date(),
+        )
+        if active_habit_rows:
+            if "loops" not in debug["sources_used"]:
+                debug["sources_used"].append("loops")
+            for habit_row in active_habit_rows:
+                habit_text = _normalize_text(habit_row.get("text"))
+                if not habit_text:
+                    continue
+                habit_horizon = _normalize_text(habit_row.get("time_horizon")) or "ongoing"
+                habit_hint = _normalize_text(habit_row.get("hint"))
+                habit_completed = bool(habit_row.get("completed"))
+                habit_nudged = bool(habit_row.get("nudged"))
+                habit_acknowledged = bool(habit_row.get("acknowledged"))
+                habit_metadata = habit_row.get("metadata") if isinstance(habit_row.get("metadata"), dict) else {}
+                needs_confirmation = bool(habit_metadata.get("needs_confirmation"))
+                habit_today_status = "done" if habit_completed else "not yet"
+                habit_nudged_status = "yes" if habit_nudged else "no"
+                habit_acknowledged_status = "yes" if habit_acknowledged else "no"
+                habit_line = f"[habit] {habit_text} ({habit_horizon})"
+                if habit_hint:
+                    habit_line += f" — {habit_hint}"
+                if needs_confirmation:
+                    habit_line += " | needs confirmation"
+                else:
+                    habit_line += (
+                        f" | today: {habit_today_status} | nudged: {habit_nudged_status}"
+                        f" | acknowledged: {habit_acknowledged_status}"
+                    )
+                habit_ts = None
+                if isinstance(habit_row.get("last_seen_at"), datetime):
+                    habit_ts = habit_row["last_seen_at"].isoformat().replace("+00:00", "Z")
+                elif isinstance(habit_row.get("updated_at"), datetime):
+                    habit_ts = habit_row["updated_at"].isoformat().replace("+00:00", "Z")
+                _append_signal(
+                    classes,
+                    debug,
+                    signal_class="habits",
+                    text=habit_line,
+                    confidence=_normalize_confidence(habit_row.get("confidence"), default=0.72),
+                    salience=habit_row.get("salience") if habit_row.get("salience") is not None else 0.7,
+                    recency_ts=habit_ts or generated_at,
+                    source="loops",
+                    evidence={
+                        "loop_type": "habit",
+                        "habit_text": habit_text,
+                        "time_horizon": habit_horizon,
+                        "completed_today": habit_completed,
+                        "nudged_today": habit_nudged,
+                        "acknowledged_today": habit_acknowledged,
+                        "needs_confirmation": needs_confirmation,
+                    },
+                )
+
+        # Momentum: recent completions and streaks (low-precedence, max 3).
+        momentum_candidates: List[Dict[str, Any]] = []
+        momentum_seen = set()
+        surfaced_habit_texts = {
+            _normalize_text((item or {}).get("evidence", {}).get("habit_text", ""))
+            for item in classes.get("habits", [])
+            if isinstance(item, dict) and isinstance(item.get("evidence"), dict)
+        }
+        surfaced_habit_texts = {t for t in surfaced_habit_texts if t}
+
+        def _add_momentum_candidate(
+            text: str,
+            *,
+            ts: Optional[datetime],
+            confidence: float,
+            salience: float,
+            source: str,
+            allow_habit_repeat: bool = False,
+            evidence: Optional[Dict[str, Any]] = None,
+        ) -> None:
+            clean = _normalize_text(text)
+            if not clean:
+                return
+            key = clean.lower()
+            if key in momentum_seen:
+                return
+            if not allow_habit_repeat and any(_normalize_text(h).lower() in clean.lower() for h in surfaced_habit_texts):
+                return
+            momentum_seen.add(key)
+            momentum_candidates.append(
+                {
+                    "text": clean,
+                    "ts": ts,
+                    "confidence": confidence,
+                    "salience": salience,
+                    "source": source,
+                    "evidence": evidence or {},
+                }
+            )
+
+        # Completed habits and streaks from habit_daily_log.
+        if active_habit_rows:
+            habit_ids: List[str] = []
+            habit_rows_by_id: Dict[str, Dict[str, Any]] = {}
+            for row in active_habit_rows:
+                raw_id = row.get("id")
+                habit_id = str(raw_id) if raw_id is not None else ""
+                habit_text = _normalize_text(row.get("text"))
+                if not habit_id or not habit_text:
+                    continue
+                habit_ids.append(habit_id)
+                habit_rows_by_id[habit_id] = row
+                if bool(row.get("completed")):
+                    _add_momentum_candidate(
+                        f"[momentum] {habit_text} — completed today",
+                        ts=_coerce_datetime_utc(row.get("last_seen_at") or row.get("updated_at") or reference_now),
+                        confidence=_normalize_confidence(row.get("confidence"), default=0.74),
+                        salience=0.74,
+                        source="habit_daily_log",
+                        allow_habit_repeat=True,
+                        evidence={"kind": "habit_completed_today", "habit_id": habit_id, "habit_text": habit_text},
+                    )
+            if habit_ids:
+                streak_rows = await db.fetch(
+                    """
+                    SELECT hdl.habit_id::text AS habit_id, hdl.date, hdl.completed
+                    FROM habit_daily_log hdl
+                    WHERE hdl.user_id = $1
+                      AND hdl.habit_id = ANY($2::uuid[])
+                      AND hdl.date >= ($3::date - INTERVAL '31 days')
+                    ORDER BY hdl.habit_id, hdl.date DESC
+                    """,
+                    userId,
+                    habit_ids,
+                    reference_now.date(),
+                )
+                by_habit: Dict[str, Dict[date, bool]] = {}
+                for row in streak_rows or []:
+                    hid = _normalize_text(row.get("habit_id"))
+                    day = row.get("date")
+                    if not hid or not isinstance(day, date):
+                        continue
+                    by_habit.setdefault(hid, {})[day] = bool(row.get("completed"))
+                for habit_id, logs_by_day in by_habit.items():
+                    row = habit_rows_by_id.get(habit_id) or {}
+                    habit_text = _normalize_text(row.get("text"))
+                    if not habit_text:
+                        continue
+                    streak = 0
+                    cursor = reference_now.date()
+                    while logs_by_day.get(cursor) is True:
+                        streak += 1
+                        cursor = cursor - timedelta(days=1)
+                    if streak >= 2:
+                        _add_momentum_candidate(
+                            f"[momentum] {habit_text} — {streak} day streak",
+                            ts=_coerce_datetime_utc(row.get("last_seen_at") or row.get("updated_at") or reference_now),
+                            confidence=_normalize_confidence(row.get("confidence"), default=0.76),
+                            salience=0.78,
+                            source="habit_daily_log",
+                            allow_habit_repeat=True,
+                            evidence={"kind": "habit_streak", "habit_id": habit_id, "habit_text": habit_text, "streak_days": streak},
+                        )
+
+        # Recently completed loops in the last 48 hours.
+        done_rows = await db.fetch(
+            """
+            SELECT id, text, type, updated_at, confidence, salience
+            FROM loops
+            WHERE tenant_id = $1
+              AND user_id = $2
+              AND status = 'completed'
+              AND updated_at >= (NOW() - INTERVAL '48 hours')
+            ORDER BY updated_at DESC
+            LIMIT 20
+            """,
+            tenantId,
+            userId,
+        )
+        if done_rows:
+            if "loops" not in debug["sources_used"]:
+                debug["sources_used"].append("loops")
+            for row in done_rows:
+                text = _normalize_text(row.get("text"))
+                if not text:
+                    continue
+                updated_dt = _coerce_datetime_utc(row.get("updated_at")) or reference_now
+                days_ago = _days_since(reference_now, updated_dt)
+                when = "today" if days_ago == 0 else f"{days_ago} day{'s' if days_ago != 1 else ''} ago"
+                _add_momentum_candidate(
+                    f"[momentum] {text} — completed {when}",
+                    ts=updated_dt,
+                    confidence=_normalize_confidence(row.get("confidence"), default=0.72),
+                    salience=row.get("salience") if row.get("salience") is not None else 0.7,
+                    source="loops",
+                    evidence={"kind": "loop_done_recent", "loop_type": _normalize_text(row.get("type")) or None},
+                )
+
+        # Kept commitments recently resolved (trajectory-oriented commitments).
+        commitment_rows = await db.fetch(
+            """
+            SELECT id, text, type, status, updated_at, confidence, salience, metadata
+            FROM loops
+            WHERE tenant_id = $1
+              AND user_id = $2
+              AND type = 'commitment'
+              AND (
+                    status = 'completed'
+                    OR COALESCE(metadata->>'resolved', 'false') = 'true'
+                  )
+              AND updated_at >= (NOW() - INTERVAL '48 hours')
+            ORDER BY updated_at DESC
+            LIMIT 10
+            """,
+            tenantId,
+            userId,
+        )
+        if commitment_rows:
+            if "loops" not in debug["sources_used"]:
+                debug["sources_used"].append("loops")
+            for row in commitment_rows:
+                text = _normalize_text(row.get("text"))
+                if not text:
+                    continue
+                updated_dt = _coerce_datetime_utc(row.get("updated_at")) or reference_now
+                days_ago = _days_since(reference_now, updated_dt)
+                when = "today" if days_ago == 0 else f"{days_ago} day{'s' if days_ago != 1 else ''} ago"
+                _add_momentum_candidate(
+                    f"[momentum] {text} — completed {when}",
+                    ts=updated_dt,
+                    confidence=_normalize_confidence(row.get("confidence"), default=0.73),
+                    salience=row.get("salience") if row.get("salience") is not None else 0.72,
+                    source="loops",
+                    evidence={"kind": "kept_commitment_recent", "loop_type": "commitment"},
+                )
+
+        if momentum_candidates:
+            momentum_candidates.sort(
+                key=lambda item: item.get("ts") or datetime.min,
+                reverse=True,
+            )
+            for item in momentum_candidates[:3]:
+                ts = item.get("ts")
+                recency_ts = (
+                    ts.replace(tzinfo=dt_timezone.utc).isoformat().replace("+00:00", "Z")
+                    if isinstance(ts, datetime) else generated_at
+                )
+                _append_signal(
+                    classes,
+                    debug,
+                    signal_class="momentum",
+                    text=item.get("text") or "",
+                    confidence=item.get("confidence") or 0.7,
+                    salience=item.get("salience") if item.get("salience") is not None else 0.7,
+                    recency_ts=recency_ts,
+                    source=_normalize_text(item.get("source")) or "loops",
+                    evidence=item.get("evidence") if isinstance(item.get("evidence"), dict) else None,
+                )
+
+        user_model_row = await db.fetchone(
+            """
+            SELECT model, updated_at
+            FROM user_model
+            WHERE tenant_id = $1 AND user_id = $2
+            LIMIT 1
+            """,
+            tenantId,
+            userId
+        )
+        user_model = _normalize_user_model((user_model_row or {}).get("model"))
+        user_model_updated_at = (user_model_row or {}).get("updated_at")
+        user_model_ts = user_model_updated_at.isoformat().replace("+00:00", "Z") if isinstance(user_model_updated_at, datetime) else generated_at
+        if user_model_row:
+            debug["sources_used"].append("user_model")
+
+        current_focus = user_model.get("current_focus")
+        if isinstance(current_focus, dict):
+            focus_text = _normalize_text(current_focus.get("text"))
+            if focus_text:
+                focus_conf = _normalize_confidence(current_focus.get("confidence"), default=0.65)
+                _append_signal(
+                    classes,
+                    debug,
+                    signal_class="today",
+                    text=f"Current focus: {focus_text}",
+                    confidence=focus_conf,
+                    salience=0.78,
+                    recency_ts=user_model_ts,
+                    source="user_model",
+                )
+                _append_signal(
+                    classes,
+                    debug,
+                    signal_class="state",
+                    text=f"Active thread: {focus_text}",
+                    confidence=focus_conf,
+                    salience=0.65,
+                    recency_ts=user_model_ts,
+                    source="user_model",
+                )
+
+        north_star = user_model.get("north_star")
+        if isinstance(north_star, dict):
+            for domain in ("work", "relationships", "health", "spirituality", "general"):
+                entry = north_star.get(domain)
+                if not isinstance(entry, dict):
+                    continue
+                goal = _normalize_text(entry.get("goal"))
+                vision = _normalize_text(entry.get("vision"))
+                if goal:
+                    _append_signal(
+                        classes,
+                        debug,
+                        signal_class="trajectory",
+                        text=f"{domain} goal: {goal}",
+                        confidence=_normalize_confidence(entry.get("goal_confidence"), default=0.62),
+                        salience=0.64,
+                        recency_ts=user_model_ts,
+                        source="user_model",
+                    )
+                if vision:
+                    _append_signal(
+                        classes,
+                        debug,
+                        signal_class="identity",
+                        text=f"{domain} vision: {vision}",
+                        confidence=_normalize_confidence(entry.get("vision_confidence"), default=0.6),
+                        salience=0.58,
+                        recency_ts=user_model_ts,
+                        source="user_model",
+                    )
+
+        relationships = user_model.get("key_relationships")
+        if isinstance(relationships, list):
+            for rel in relationships:
+                if not isinstance(rel, dict):
+                    continue
+                name = _normalize_text(rel.get("name"))
+                who = _normalize_text(rel.get("who"))
+                status = _normalize_text(rel.get("status"))
+                relationship_text = _build_relationship_signal_text(name, who, status)
+                if not relationship_text:
+                    continue
+                _append_signal(
+                    classes,
+                    debug,
+                    signal_class="relationships",
+                    text=relationship_text,
+                    confidence=_normalize_confidence(rel.get("confidence"), default=0.6),
+                    salience=0.65,
+                    recency_ts=user_model_ts,
+                    source="user_model",
+                )
+
+        daily_row = await db.fetchone(
+            """
+            SELECT analysis_date, themes, steering_note, confidence, updated_at
+            FROM daily_analysis
+            WHERE tenant_id = $1 AND user_id = $2
+            ORDER BY analysis_date DESC
+            LIMIT 1
+            """,
+            tenantId,
+            userId
+        )
+        if daily_row:
+            debug["sources_used"].append("daily_analysis")
+            daily_conf = _normalize_confidence(daily_row.get("confidence"), default=0.58)
+            analysis_date = daily_row.get("analysis_date")
+            daily_ts = None
+            if isinstance(daily_row.get("updated_at"), datetime):
+                daily_ts = daily_row["updated_at"].isoformat().replace("+00:00", "Z")
+            elif analysis_date:
+                daily_ts = f"{analysis_date.isoformat()}T00:00:00Z"
+            themes = daily_row.get("themes") if isinstance(daily_row.get("themes"), list) else []
+            for theme in themes[:4]:
+                theme_text = _normalize_text(theme)
+                if not theme_text:
+                    continue
+                _append_signal(
+                    classes,
+                    debug,
+                    signal_class="trajectory",
+                    text=f"Recent theme: {theme_text}",
+                    confidence=daily_conf,
+                    salience=0.57,
+                    recency_ts=daily_ts or generated_at,
+                    source="daily_analysis",
+                )
+            steering_note = _normalize_text(daily_row.get("steering_note"))
+            if steering_note:
+                _append_signal(
+                    classes,
+                    debug,
+                    signal_class="today",
+                    text=f"Steering note: {steering_note}",
+                    confidence=daily_conf,
+                    salience=0.62,
+                    recency_ts=daily_ts or generated_at,
+                    source="daily_analysis",
+                )
+
+        summary_rows: List[Dict[str, Any]] = []
+        try:
+            summary_nodes = await graphiti_client.get_recent_session_summary_nodes(
+                tenant_id=tenantId,
+                user_id=userId,
+                limit=2
+            )
+            for node in summary_nodes or []:
+                normalized = _normalize_startbrief_session_summary_node(node)
+                if not normalized:
+                    continue
+                summary_rows.append({
+                    "summary_text": _normalize_text(normalized.get("summary_text")),
+                    "tone": _normalize_text(normalized.get("tone")),
+                    "moment": _normalize_text(normalized.get("moment")),
+                    "reference_time": _normalize_text(normalized.get("reference_time") or normalized.get("created_at")),
+                })
+            if summary_rows:
+                debug["sources_used"].append("session_summary")
+        except Exception as e:
+            logger.info("signals pack summary lookup failed: %s", e)
+
+        if not summary_rows:
+            transcript_row = await db.fetchone(
+                """
+                SELECT messages, updated_at
+                FROM session_transcript
+                WHERE tenant_id = $1 AND user_id = $2
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                tenantId,
+                userId
+            )
+            messages = (transcript_row or {}).get("messages") if isinstance(transcript_row, dict) else None
+            if isinstance(messages, list) and messages:
+                tail = [_normalize_text((m or {}).get("text")) for m in messages[-2:] if _normalize_text((m or {}).get("text"))]
+                if tail:
+                    debug["sources_used"].append("session_transcript_tail")
+                    _append_signal(
+                        classes,
+                        debug,
+                        signal_class="state",
+                        text=f"Recent session tail: {' | '.join(tail)}",
+                        confidence=0.5,
+                        salience=0.5,
+                        recency_ts=(transcript_row.get("updated_at").isoformat().replace("+00:00", "Z") if isinstance(transcript_row.get("updated_at"), datetime) else generated_at),
+                        source="session_transcript_tail",
+                    )
+        else:
+            for summary in summary_rows:
+                summary_text = _normalize_text(summary.get("summary_text"))
+                summary_ts = _normalize_text(summary.get("reference_time")) or generated_at
+                if summary_text:
+                    _append_signal(
+                        classes,
+                        debug,
+                        signal_class="state",
+                        text=f"Session summary: {summary_text}",
+                        confidence=0.74,
+                        salience=0.68,
+                        recency_ts=summary_ts,
+                        source="session_summary",
+                    )
+                    _append_signal(
+                        classes,
+                        debug,
+                        signal_class="trajectory",
+                        text=f"Recent direction: {summary_text}",
+                        confidence=0.7,
+                        salience=0.63,
+                        recency_ts=summary_ts,
+                        source="session_summary",
+                    )
+                tone = _normalize_text(summary.get("tone"))
+                if tone:
+                    _append_signal(
+                        classes,
+                        debug,
+                        signal_class="state",
+                        text=f"Tone: {tone}",
+                        confidence=0.58,
+                        salience=0.5,
+                        recency_ts=summary_ts,
+                        source="session_summary",
+                    )
+
+        # Stale thread candidates from Graphiti facts/entities.
+        try:
+            if not graphiti_client._initialized:
+                await graphiti_client.initialize()
+            driver = getattr(graphiti_client.client, "driver", None) if graphiti_client.client else None
+            if driver:
+                composite_user_id = graphiti_client._make_composite_user_id(tenantId, userId)
+                scoped_driver = driver
+                clone = getattr(driver, "clone", None)
+                if callable(clone):
+                    try:
+                        scoped_driver = clone(database=composite_user_id)
+                    except Exception:
+                        scoped_driver = driver
+                stale_cutoff = reference_now - timedelta(days=7)
+                rows = await scoped_driver.execute_query(
+                    """
+                    MATCH (n)
+                    WHERE n.group_id = $group_id
+                      AND COALESCE(n.salience, 0) >= 4
+                      AND COALESCE(n.last_seen_at, n.updated_at, n.created_at) <= $stale_cutoff
+                    RETURN n.name AS name,
+                           n.summary AS summary,
+                           n.text AS text,
+                           n.last_seen_at AS last_seen_at,
+                           n.updated_at AS updated_at,
+                           n.created_at AS created_at,
+                           n.salience AS salience
+                    ORDER BY COALESCE(n.last_seen_at, n.updated_at, n.created_at) ASC,
+                             COALESCE(n.salience, 0) DESC
+                    LIMIT 25
+                    """,
+                    group_id=composite_user_id,
+                    stale_cutoff=stale_cutoff,
+                )
+                if rows:
+                    debug["sources_used"].append("graphiti")
+
+                existing_surface_texts = [
+                    _normalize_text(item.get("text"))
+                    for class_name in ("habits", "trajectory", "open_loops", "today")
+                    for item in classes.get(class_name, [])
+                    if isinstance(item, dict) and _normalize_text(item.get("text"))
+                ]
+                for row in rows or []:
+                    if isinstance(row, dict):
+                        raw_text = _normalize_text(row.get("text") or row.get("summary") or row.get("name"))
+                        raw_last_seen = row.get("last_seen_at") or row.get("updated_at") or row.get("created_at")
+                        raw_salience = row.get("salience")
+                    elif isinstance(row, (list, tuple)):
+                        raw_text = _normalize_text(
+                            (row[2] if len(row) > 2 else None)
+                            or (row[1] if len(row) > 1 else None)
+                            or (row[0] if len(row) > 0 else None)
+                        )
+                        raw_last_seen = (
+                            (row[3] if len(row) > 3 else None)
+                            or (row[4] if len(row) > 4 else None)
+                            or (row[5] if len(row) > 5 else None)
+                        )
+                        raw_salience = row[6] if len(row) > 6 else None
+                    else:
+                        continue
+                    if not raw_text:
+                        continue
+                    if _is_covered_by_existing_signal(raw_text, existing_surface_texts):
+                        continue
+                    last_seen_dt = _coerce_datetime_utc(raw_last_seen)
+                    days_ago = _days_since(reference_now, last_seen_dt)
+                    if days_ago is None or days_ago < 7:
+                        continue
+                    stale_line = f"[stale] {raw_text} — last mentioned {days_ago} day{'s' if days_ago != 1 else ''} ago"
+                    stale_ts = (
+                        last_seen_dt.replace(tzinfo=dt_timezone.utc).isoformat().replace("+00:00", "Z")
+                        if isinstance(last_seen_dt, datetime) else generated_at
+                    )
+                    _append_signal(
+                        classes,
+                        debug,
+                        signal_class="stale_threads",
+                        text=stale_line,
+                        confidence=0.58,
+                        salience=raw_salience if raw_salience is not None else 0.55,
+                        recency_ts=stale_ts,
+                        source="graphiti",
+                        evidence={
+                            "stale_entity": raw_text,
+                            "days_since_last_seen": days_ago,
+                        },
+                    )
+                    if classes.get("stale_threads"):
+                        break
+        except Exception as e:
+            logger.info("signals pack stale_threads lookup failed: %s", e)
+
+        overlay_tactics: List[Dict[str, Any]] = []
+        triage_trace = debug.setdefault("triage_trace", {})
+        triage_trace["checkin_tactic_fired"] = False
+        stale_items = classes.get("stale_threads") or []
+        capacity_label = _normalize_text(capacity).upper()
+        appetite_label = _normalize_text(tactic_appetite).upper()
+        if stale_items and capacity_label == "HIGH" and appetite_label == "HIGH":
+            chosen = stale_items[0]
+            evidence = chosen.get("evidence") if isinstance(chosen.get("evidence"), dict) else {}
+            stale_entity = _normalize_text(evidence.get("stale_entity")) or _normalize_text(chosen.get("text"))
+            thread_key = _normalize_text(chosen.get("id")) or uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"{tenantId}|{userId}|{stale_entity}",
+            ).hex
+            cooldown_cutoff = reference_now - timedelta(hours=72)
+            latest_fire = await db.fetchone(
+                """
+                SELECT fired_at
+                FROM checkin_tactic_log
+                WHERE tenant_id = $1
+                  AND user_id = $2
+                  AND thread_key = $3
+                ORDER BY fired_at DESC
+                LIMIT 1
+                """,
+                tenantId,
+                userId,
+                thread_key,
+            )
+            last_fired_at = _coerce_datetime_utc((latest_fire or {}).get("fired_at"))
+            cooldown_ok = not last_fired_at or last_fired_at <= cooldown_cutoff
+            if cooldown_ok and stale_entity:
+                overlay_text = (
+                    f"A thread you know about hasn't come up in a while — {stale_entity}. "
+                    "If the moment feels right and natural, ask about it once, genuinely. "
+                    "Not \"my system shows...\" — just curiosity. One question, then drop it."
+                )
+                overlay_tactics.append(
+                    {
+                        "name": "checkin",
+                        "stale_entity": stale_entity,
+                        "text": overlay_text,
+                    }
+                )
+                triage_trace["checkin_tactic_fired"] = True
+                await db.execute(
+                    """
+                    INSERT INTO checkin_tactic_log (tenant_id, user_id, thread_key, stale_entity, session_id, fired_at)
+                    VALUES ($1, $2, $3, $4, $5, NOW())
+                    """,
+                    tenantId,
+                    userId,
+                    thread_key,
+                    stale_entity,
+                    resolved_session_id,
+                )
+            else:
+                triage_trace["checkin_reason"] = "cooldown"
+        else:
+            triage_trace["checkin_reason"] = "gate_not_met"
+        triage_trace["capacity"] = capacity_label or None
+        triage_trace["tactic_appetite"] = appetite_label or None
+
+        for class_name in SIGNAL_PACK_CLASSES:
+            class_cap = SIGNAL_PACK_CLASS_CAPS.get(class_name, SIGNAL_PACK_MAX_PER_CLASS)
+            if class_cap is None:
+                continue
+            classes[class_name] = classes[class_name][:class_cap]
+
+        return {
+            "generated_at": generated_at,
+            "session_id": resolved_session_id,
+            "classes": classes,
+            "overlay_tactics": overlay_tactics,
+            "debug": debug,
+        }
+    except Exception as e:
+        logger.error(f"Signals pack failed: {e}")
+        raise HTTPException(status_code=500, detail="Signals pack failed")
+
+
 async def _log_startbrief_history(
     tenant_id: str,
     user_id: str,
@@ -3265,6 +6620,242 @@ async def _log_startbrief_history(
     )
 
 
+async def _upsert_habit_daily_log_today(
+    tenant_id: str,
+    user_id: str,
+    habit_id: str,
+    completed: Optional[bool] = None,
+    nudged: Optional[bool] = None,
+    user_response: Optional[str] = None,
+    inferred_from: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        parsed_habit_id = str(uuid.UUID(_normalize_text(habit_id)))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid habitId")
+
+    today_utc = datetime.utcnow().date()
+    row = await db.fetchone(
+        """
+        INSERT INTO habit_daily_log (
+            user_id, habit_id, date, completed, nudged, user_response, inferred_from, created_at
+        )
+        SELECT
+            $2,
+            l.id,
+            $4,
+            COALESCE($5, FALSE),
+            COALESCE($6, FALSE),
+            NULLIF($7, ''),
+            NULLIF($8, ''),
+            NOW()
+        FROM loops l
+        WHERE l.tenant_id = $1
+          AND l.user_id = $2
+          AND l.id = $3::uuid
+          AND l.type = 'habit'
+        ON CONFLICT (habit_id, date)
+        DO UPDATE SET
+            completed = COALESCE($5, habit_daily_log.completed),
+            nudged = COALESCE($6, habit_daily_log.nudged),
+            user_response = COALESCE(NULLIF($7, ''), habit_daily_log.user_response),
+            inferred_from = COALESCE(NULLIF($8, ''), habit_daily_log.inferred_from)
+        RETURNING
+            user_id,
+            habit_id::text AS habit_id,
+            date,
+            completed,
+            nudged,
+            user_response,
+            inferred_from
+        """,
+        tenant_id,
+        user_id,
+        parsed_habit_id,
+        today_utc,
+        completed,
+        nudged,
+        _normalize_text(user_response) or None,
+        _normalize_text(inferred_from) or None,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Active habit not found for user")
+    return row
+
+
+async def _get_session_ingest_freshness(
+    tenant_id: str,
+    user_id: str,
+    reference_now_utc: datetime,
+    session_id: Optional[str] = None
+) -> Dict[str, Any]:
+    filters = ["tenant_id = $1", "user_id = $2", "status = 'pending'", "job_type IN ($3, $4)"]
+    params: List[Any] = [
+        tenant_id,
+        user_id,
+        session.JOB_TYPE_SESSION_RAW_EPISODE,
+        session.JOB_TYPE_POST_INGEST_HOOK,
+    ]
+    if session_id:
+        filters.append("session_id = $5")
+        params.append(session_id)
+    where = " AND ".join(filters)
+    rows = await db.fetch(
+        f"""
+        SELECT session_id, job_type, status, next_attempt_at, created_at
+        FROM graphiti_outbox
+        WHERE {where}
+        ORDER BY created_at ASC
+        LIMIT 200
+        """,
+        *params
+    )
+    pending_raw = 0
+    pending_hooks = 0
+    oldest_created_at: Optional[datetime] = None
+    latest_pending_session_id: Optional[str] = None
+    for row in rows or []:
+        if row.get("job_type") == session.JOB_TYPE_SESSION_RAW_EPISODE:
+            pending_raw += 1
+        elif row.get("job_type") == session.JOB_TYPE_POST_INGEST_HOOK:
+            pending_hooks += 1
+        created_at = row.get("created_at")
+        if isinstance(created_at, datetime):
+            if oldest_created_at is None or created_at < oldest_created_at:
+                oldest_created_at = created_at
+        sid = _normalize_text(row.get("session_id"))
+        if sid:
+            latest_pending_session_id = sid
+    backlog_age_seconds = None
+    if oldest_created_at:
+        backlog_age_seconds = int(
+            max(0, (reference_now_utc - oldest_created_at.astimezone(dt_timezone.utc)).total_seconds())
+        )
+    has_backlog = (pending_raw + pending_hooks) > 0
+    return {
+        "has_pending_session_ingest_jobs": has_backlog,
+        "pending_raw_episode_jobs": pending_raw,
+        "pending_post_ingest_hook_jobs": pending_hooks,
+        "oldest_pending_age_seconds": backlog_age_seconds,
+        "latest_pending_session_id": latest_pending_session_id,
+    }
+
+
+async def _execute_post_ingest_hook(hook_name: str, payload: Dict[str, Any]) -> bool:
+    tenant_id = _normalize_text(payload.get("tenant_id"))
+    user_id = _normalize_text(payload.get("user_id"))
+    session_id = _normalize_text(payload.get("session_id"))
+    reference_time = _parse_optional_dt(payload.get("reference_time")) or datetime.utcnow()
+
+    if not tenant_id or not user_id or not session_id:
+        raise TypeError("validation error: invalid post-ingest hook payload identity")
+
+    transcript_row = await db.fetchone(
+        """
+        SELECT messages
+        FROM session_transcript
+        WHERE tenant_id = $1 AND session_id = $2
+        """,
+        tenant_id,
+        session_id
+    )
+    messages_raw = transcript_row.get("messages") if transcript_row else []
+    if isinstance(messages_raw, str):
+        try:
+            messages_raw = json.loads(messages_raw)
+        except Exception:
+            messages_raw = []
+    messages_payload = [
+        m for m in (messages_raw if isinstance(messages_raw, list) else [])
+        if isinstance(m, dict)
+    ]
+    messages_payload = session.SessionManager._cap_messages_for_processing(
+        messages_payload,
+        max_messages=session.SESSION_INGEST_HOOK_MAX_MESSAGES,
+        max_chars=session.SESSION_INGEST_HOOK_MAX_CHARS
+    )
+
+    if hook_name == session.POST_INGEST_HOOK_SESSION_SUMMARY:
+        if not messages_payload:
+            return True
+        summary_payload = await session.summarize_session_messages(messages_payload)
+        summary_text = (summary_payload or {}).get("summary_text")
+        if not summary_text:
+            return True
+        response = await graphiti_client.add_session_summary(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            summary_text=summary_text,
+            bridge_text=(summary_payload or {}).get("bridge_text"),
+            reference_time=reference_time,
+            episode_uuid=_normalize_text(payload.get("episode_uuid")) or None,
+            extra_attributes={
+                "summary_quality_tier": (summary_payload or {}).get("summary_quality_tier"),
+                "summary_source": (summary_payload or {}).get("summary_source"),
+                "summary_facts": (summary_payload or {}).get("summary_facts"),
+                "tone": (summary_payload or {}).get("tone"),
+                "moment": (summary_payload or {}).get("moment"),
+                "decisions": (summary_payload or {}).get("decisions") or [],
+                "unresolved": (summary_payload or {}).get("unresolved") or [],
+                "index_text": (summary_payload or {}).get("index_text") or "",
+                "salience": (summary_payload or {}).get("salience") or "low",
+            },
+            replace_existing_session=True
+        )
+        if isinstance(response, dict) and response.get("success") is False:
+            session.SessionManager._raise_for_graphiti_response_failure(
+                response,
+                context="session_summary_hook"
+            )
+        return True
+
+    if hook_name == session.POST_INGEST_HOOK_OPEN_LOOPS:
+        if not messages_payload:
+            return True
+        last_user_text = next(
+            (
+                m.get("text")
+                for m in reversed(messages_payload)
+                if isinstance(m, dict) and (m.get("role") or "").lower() == "user" and m.get("text")
+            ),
+            None
+        )
+        if not last_user_text:
+            fallback = messages_payload[-1] if messages_payload else {}
+            if isinstance(fallback, dict):
+                last_user_text = _normalize_text(fallback.get("text"))
+        if not last_user_text:
+            return True
+        ts_values = [_parse_optional_dt((m or {}).get("timestamp")) for m in messages_payload if isinstance(m, dict)]
+        ts_values = [t for t in ts_values if t]
+        start_ts = min(ts_values) if ts_values else None
+        end_ts = max(ts_values) if ts_values else reference_time
+        await loops.extract_and_create_loops(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            persona_id="default",
+            user_text=last_user_text,
+            recent_turns=messages_payload,
+            source_turn_ts=end_ts or datetime.utcnow(),
+            session_id=session_id,
+            provenance={
+                "session_id": session_id,
+                "start_ts": start_ts.isoformat() if start_ts else None,
+                "end_ts": end_ts.isoformat() if end_ts else None
+            }
+        )
+        return True
+
+    if hook_name in {
+        session.POST_INGEST_HOOK_USER_MODEL_DELTA,
+        session.POST_INGEST_HOOK_DAILY_ANALYSIS,
+    }:
+        raise TypeError(f"validation error: hook disabled by policy {hook_name}")
+
+    raise TypeError(f"validation error: unknown post-ingest hook {hook_name}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown"""
@@ -3291,6 +6882,8 @@ async def lifespan(app: FastAPI):
         # Initialize managers
         session.init_session_manager(db)
         logger.info("Session manager initialized")
+        session.set_post_ingest_hook_executor(_execute_post_ingest_hook)
+        logger.info("Post-ingest hook executor initialized")
         loops.init_loop_manager(db)
         logger.info("Loop manager initialized")
 
@@ -3327,6 +6920,19 @@ async def lifespan(app: FastAPI):
                 )
             )
             logger.info("User model updater loop started")
+        if settings.user_model_enrichment_enabled:
+            app.state.user_model_enrichment_task = asyncio.create_task(
+                user_model_enrichment_loop(
+                    interval_seconds=settings.user_model_enrichment_interval_seconds,
+                    max_users=settings.user_model_enrichment_max_users,
+                    min_confidence=settings.user_model_enrichment_min_confidence,
+                    daily_lookback_hours=settings.user_model_enrichment_daily_lookback_hours,
+                    weekly_lookback_days=settings.user_model_enrichment_weekly_lookback_days,
+                    retry_backoff_seconds=settings.user_model_enrichment_retry_backoff_seconds,
+                    retry_max_seconds=settings.user_model_enrichment_retry_max_seconds
+                )
+            )
+            logger.info("User model enrichment loop started")
         if settings.loop_staleness_janitor_enabled:
             app.state.loop_staleness_janitor_task = asyncio.create_task(
                 loop_staleness_janitor_loop(
@@ -3344,6 +6950,13 @@ async def lifespan(app: FastAPI):
                 )
             )
             logger.info("Daily analysis loop started")
+            app.state.daily_habit_dedupe_task = asyncio.create_task(
+                daily_habit_dedupe_loop(
+                    interval_seconds=settings.daily_analysis_interval_seconds,
+                    max_users=settings.daily_analysis_max_users,
+                )
+            )
+            logger.info("Daily habit dedupe loop started")
 
     except Exception as e:
         logger.error(f"Failed to initialize services: {e}")
@@ -3353,6 +6966,7 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down Synapse Memory API")
+    session.set_post_ingest_hook_executor(None)
     if getattr(app.state, "idle_close_task", None):
         app.state.idle_close_task.cancel()
         try:
@@ -3377,6 +6991,14 @@ async def lifespan(app: FastAPI):
             pass
         except Exception:
             pass
+    if getattr(app.state, "user_model_enrichment_task", None):
+        app.state.user_model_enrichment_task.cancel()
+        try:
+            await app.state.user_model_enrichment_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
     if getattr(app.state, "loop_staleness_janitor_task", None):
         app.state.loop_staleness_janitor_task.cancel()
         try:
@@ -3393,6 +7015,14 @@ async def lifespan(app: FastAPI):
             pass
         except Exception:
             pass
+    if getattr(app.state, "daily_habit_dedupe_task", None):
+        app.state.daily_habit_dedupe_task.cancel()
+        try:
+            await app.state.daily_habit_dedupe_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
     await db.close()
     logger.info("Database connection pool closed")
 
@@ -3403,6 +7033,61 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+
+@app.middleware("http")
+async def tenant_alias_normalization_middleware(request: Request, call_next):
+    scope = request.scope
+    query_string = scope.get("query_string", b"")
+    if query_string:
+        try:
+            params = parse_qsl(query_string.decode("latin-1"), keep_blank_values=True)
+            changed = False
+            rebuilt: List[Tuple[str, str]] = []
+            for key, value in params:
+                if key in {"tenantId", "tenant_id"}:
+                    canonical = _canonical_tenant_id(value)
+                    if canonical != value:
+                        changed = True
+                    rebuilt.append((key, str(canonical)))
+                else:
+                    rebuilt.append((key, value))
+            if changed:
+                scope["query_string"] = urlencode(rebuilt, doseq=True).encode("latin-1")
+        except Exception:
+            pass
+
+    content_type = _normalize_text(request.headers.get("content-type")).lower()
+    should_normalize_body = (
+        request.method.upper() in {"POST", "PUT", "PATCH"}
+        and "application/json" in content_type
+    )
+    if not should_normalize_body:
+        return await call_next(request)
+
+    try:
+        raw_body = await request.body()
+    except Exception:
+        raw_body = b""
+    if not raw_body:
+        return await call_next(request)
+
+    try:
+        parsed = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return await call_next(request)
+
+    normalized = _normalize_tenant_aliases_in_payload(parsed)
+    if normalized == parsed:
+        return await call_next(request)
+
+    new_body = json.dumps(normalized, ensure_ascii=True).encode("utf-8")
+
+    async def _receive():
+        return {"type": "http.request", "body": new_body, "more_body": False}
+
+    rewritten_request = Request(scope, _receive)
+    return await call_next(rewritten_request)
 
 
 def _require_internal_token(token: str | None) -> None:
@@ -3495,49 +7180,221 @@ async def memory_query(request: MemoryQueryRequest):
     Query Graphiti for semantic memory snippets on-demand.
     """
     try:
+        fact_limit = max(1, request.limit or 10)
+        canonical_tenant, tenant_scope = _resolve_tenant_scope(request.tenantId)
         reference_time = None
         if request.referenceTime:
             value = request.referenceTime
             if value.endswith("Z"):
                 value = value.replace("Z", "+00:00")
             reference_time = datetime.fromisoformat(value)
+        query_terms = _query_terms(request.query)
 
-        facts = await graphiti_client.search_facts(
-            tenant_id=request.tenantId,
-            user_id=request.userId,
-            query=request.query,
-            limit=request.limit or 10,
-            reference_time=reference_time
+        graphiti_fact_tasks = [
+            graphiti_client.search_facts(
+                tenant_id=tenant_id,
+                user_id=request.userId,
+                query=request.query,
+                limit=fact_limit,
+                reference_time=reference_time
+            )
+            for tenant_id in tenant_scope
+        ]
+        graphiti_node_tasks = [
+            graphiti_client.search_nodes(
+                tenant_id=tenant_id,
+                user_id=request.userId,
+                query=request.query,
+                limit=min(request.limit or 10, 10),
+                reference_time=reference_time
+            )
+            for tenant_id in tenant_scope
+        ]
+        graphiti_fact_results, graphiti_node_results = await asyncio.gather(
+            asyncio.gather(*graphiti_fact_tasks, return_exceptions=True),
+            asyncio.gather(*graphiti_node_tasks, return_exceptions=True),
         )
-        entities = await graphiti_client.search_nodes(
-            tenant_id=request.tenantId,
-            user_id=request.userId,
-            query=request.query,
-            limit=min(request.limit or 10, 10),
-            reference_time=reference_time
-        )
-        fact_texts_raw = [_normalize_text(f.get("text")) for f in facts if f.get("text")]
 
-        fact_texts = _dedupe_keep_order(
-            [
-                t for t in fact_texts_raw
-                if _allow_claim(t) and _allow_fact_text(t) and not _is_explicit_user_state_claim(t)
-            ],
-            limit=4
+        fact_items: List[Dict[str, Any]] = []
+        for tenant_id, rows in zip(tenant_scope, graphiti_fact_results):
+            if isinstance(rows, Exception):
+                logger.warning("memory_query fact search failed tenant=%s user=%s err=%s", tenant_id, request.userId, rows)
+                continue
+            for row in (rows or []):
+                if not isinstance(row, dict):
+                    continue
+                enriched = dict(row)
+                enriched["tenant_id"] = tenant_id
+                fact_items.append(enriched)
+
+        now_utc = (
+            reference_time.astimezone(dt_timezone.utc)
+            if isinstance(reference_time, datetime) and reference_time.tzinfo is not None
+            else (
+                reference_time.replace(tzinfo=dt_timezone.utc)
+                if isinstance(reference_time, datetime)
+                else datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+            )
         )
+        temporal_rows: List[Dict[str, Any]] = []
+        for idx, row in enumerate(fact_items):
+            include, tier, priority = _fact_temporal_relevance(row, now_utc)
+            if not include:
+                continue
+            temporal_rows.append({
+                "row": row,
+                "tier": tier,
+                "priority": priority,
+                "idx": idx,
+            })
+        temporal_rows.sort(key=lambda item: (item["priority"], item["idx"]))
+        ordered_fact_items = [item["row"] for item in temporal_rows]
+        tier_by_text: Dict[str, str] = {}
+        for item in temporal_rows:
+            text_key = _normalize_text(item["row"].get("text")).lower()
+            if text_key and text_key not in tier_by_text:
+                tier_by_text[text_key] = item["tier"]
+
+        entities_raw: List[Dict[str, Any]] = []
+        for tenant_id, nodes in zip(tenant_scope, graphiti_node_results):
+            if isinstance(nodes, Exception):
+                logger.warning("memory_query node search failed tenant=%s user=%s err=%s", tenant_id, request.userId, nodes)
+                continue
+            for node in (nodes or []):
+                if not isinstance(node, dict):
+                    continue
+                enriched = dict(node)
+                enriched["tenant_id"] = tenant_id
+                entities_raw.append(enriched)
+
+        allowed_labels = {"entity", "mentalstate"}
+        excluded_labels = {"episodic", "environment"}
+
+        def _include_memory_query_node(node: Any) -> bool:
+            if not isinstance(node, dict):
+                return False
+            if _is_session_summary_node(node):
+                return True
+            labels = node.get("labels")
+            normalized_labels = {
+                _normalize_text(label).lower()
+                for label in (labels or [])
+                if _normalize_text(label)
+            } if isinstance(labels, list) else set()
+            if normalized_labels:
+                if normalized_labels & excluded_labels:
+                    return False
+                return bool(normalized_labels & allowed_labels)
+            node_type = _normalize_text(node.get("type")).lower()
+            if node_type in excluded_labels:
+                return False
+            return node_type in allowed_labels
+
+        entities = [node for node in (entities_raw or []) if _include_memory_query_node(node)]
+
+        fact_candidates: List[Dict[str, Any]] = []
+        for row in ordered_fact_items:
+            text = _normalize_text(row.get("text"))
+            if not text:
+                continue
+            if not (_allow_claim(text) and _allow_fact_text(text) and not _is_explicit_user_state_claim(text)):
+                continue
+            fact_candidates.append({
+                "text": text,
+                "relevance": row.get("relevance"),
+                "source": _normalize_text(row.get("source")) or "graphiti",
+                "relevance_tier": tier_by_text.get(text.lower()),
+                "tenant_id": _normalize_text(row.get("tenant_id")) or canonical_tenant,
+            })
+
+        for node in entities:
+            if not _is_session_summary_node(node):
+                continue
+            for claim in _extract_session_summary_candidate_texts(node):
+                overlap = _query_overlap_score(claim, query_terms)
+                if query_terms and overlap <= 0:
+                    continue
+                fact_candidates.append({
+                    "text": claim,
+                    "relevance": overlap or 0.55,
+                    "source": "graphiti_session_summary",
+                    "relevance_tier": "recent",
+                    "tenant_id": _normalize_text(node.get("tenant_id")) or canonical_tenant,
+                })
+
+        user_model_rows = await _fetch_user_model_rows_for_scope(tenant_scope=tenant_scope, user_id=request.userId)
+        for row in user_model_rows:
+            hydrated_model = _hydrate_user_model_narratives(
+                row.get("model"),
+                row=row if isinstance(row, dict) else None,
+            )
+            for candidate_text in _extract_user_model_recall_candidates(hydrated_model):
+                overlap = _query_overlap_score(candidate_text, query_terms)
+                if query_terms and overlap <= 0:
+                    continue
+                if not (_allow_claim(candidate_text) and _allow_fact_text(candidate_text)):
+                    continue
+                fact_candidates.append({
+                    "text": candidate_text,
+                    "relevance": overlap or 0.5,
+                    "source": "user_model",
+                    "relevance_tier": "persistent",
+                    "tenant_id": _normalize_text(row.get("tenant_id")) or canonical_tenant,
+                })
+
+        deduped_fact_rows: List[Dict[str, Any]] = []
+        fact_index: Dict[str, int] = {}
+        for candidate in fact_candidates:
+            text = _normalize_text(candidate.get("text"))
+            if not text:
+                continue
+            key = text.lower()
+            existing_idx = fact_index.get(key)
+            if existing_idx is None:
+                fact_index[key] = len(deduped_fact_rows)
+                deduped_fact_rows.append(candidate)
+                continue
+            current = deduped_fact_rows[existing_idx]
+            current_score = float(current.get("relevance") or 0.0)
+            new_score = float(candidate.get("relevance") or 0.0)
+            if new_score > current_score:
+                deduped_fact_rows[existing_idx] = candidate
+
+        deduped_fact_rows.sort(
+            key=lambda row: (
+                float(row.get("relevance") or 0.0),
+                1 if str(row.get("source")).startswith("graphiti") else 0,
+            ),
+            reverse=True,
+        )
+        deduped_fact_rows = deduped_fact_rows[:fact_limit]
+
         fact_models = [
-            Fact(text=text, relevance=f.get("relevance"), source=f.get("source", "graphiti"))
-            for text in fact_texts
-            for f in facts
-            if _normalize_text(f.get("text")) == text
-        ][:4]
+            Fact(
+                text=_normalize_text(row.get("text")),
+                relevance=row.get("relevance"),
+                source=row.get("source"),
+                relevance_tier=row.get("relevance_tier"),
+            )
+            for row in deduped_fact_rows
+            if _normalize_text(row.get("text"))
+        ]
+        fact_texts = [item.text for item in fact_models]
+        fact_texts_raw = fact_texts[:]
 
         entity_models = []
         for e in entities:
+            if _is_session_summary_node(e):
+                continue
             summary = _normalize_text(e.get("summary"))
             if not summary:
                 continue
             entity_models.append(Entity(summary=summary, type=e.get("type"), uuid=e.get("uuid")))
+
+        provenance_counts: Dict[str, int] = {}
+        for item in fact_models:
+            source = _normalize_text(item.source) or "unknown"
+            provenance_counts[source] = int(provenance_counts.get(source) or 0) + 1
 
         response = MemoryQueryResponse(
             facts=fact_texts,
@@ -3548,19 +7405,38 @@ async def memory_query(request: MemoryQueryRequest):
                 "responseMode": "context" if request.includeContext else "recall",
                 "facts": len(fact_models),
                 "entities": len(entity_models),
-                "limit": request.limit or 10
+                "limit": fact_limit,
+                "tenantCanonical": canonical_tenant,
+                "tenantScope": tenant_scope,
+                "provenanceCounts": provenance_counts,
             }
         )
         if not request.includeContext:
             return response
 
-        focus_nodes = await graphiti_client.search_nodes(
-            tenant_id=request.tenantId,
-            user_id=request.userId,
-            query="current focus priority focused on right now today i need",
-            limit=3,
-            reference_time=reference_time
-        )
+        focus_query = _normalize_text(request.focusQuery) or "current focus priority focused on right now today i need"
+        focus_tasks = [
+            graphiti_client.search_nodes(
+                tenant_id=tenant_id,
+                user_id=request.userId,
+                query=focus_query,
+                limit=3,
+                reference_time=reference_time
+            )
+            for tenant_id in tenant_scope
+        ]
+        focus_results = await asyncio.gather(*focus_tasks, return_exceptions=True)
+        focus_nodes_raw: List[Dict[str, Any]] = []
+        for tenant_id, rows in zip(tenant_scope, focus_results):
+            if isinstance(rows, Exception):
+                logger.warning("memory_query focus search failed tenant=%s user=%s err=%s", tenant_id, request.userId, rows)
+                continue
+            for row in (rows or []):
+                if isinstance(row, dict):
+                    enriched = dict(row)
+                    enriched["tenant_id"] = tenant_id
+                    focus_nodes_raw.append(enriched)
+        focus_nodes = [node for node in (focus_nodes_raw or []) if _include_memory_query_node(node) and not _is_session_summary_node(node)]
 
         user_stated_state = None
         for text in fact_texts_raw:
@@ -3586,18 +7462,21 @@ async def memory_query(request: MemoryQueryRequest):
             texts=fact_texts + [e.summary for e in entity_models],
             limit=3
         )
-        latest_session_id = await _get_latest_session_id(request.tenantId, request.userId)
+        latest_session_id = await _get_latest_session_id(canonical_tenant, request.userId)
         last_interaction = None
-        try:
-            eps = await graphiti_client.get_recent_episode_summaries(
-                tenant_id=request.tenantId,
-                user_id=request.userId,
-                limit=1
-            )
-            if eps:
-                last_interaction = eps[0].get("reference_time")
-        except Exception:
-            last_interaction = None
+        for tenant_id in tenant_scope:
+            try:
+                eps = await graphiti_client.get_recent_episode_summaries(
+                    tenant_id=tenant_id,
+                    user_id=request.userId,
+                    limit=1
+                )
+                if eps:
+                    last_interaction = eps[0].get("reference_time")
+                    if last_interaction:
+                        break
+            except Exception:
+                continue
 
         anchors = {
             "timeOfDayLabel": _time_of_day_label(reference_time or datetime.utcnow()),
@@ -3709,20 +7588,21 @@ async def get_user_model(
     Return persistent structured user model and domain completeness scores.
     """
     try:
-        row = await db.fetchone(
-            """
-            SELECT model, version, created_at, updated_at, last_source
-            FROM user_model
-            WHERE tenant_id = $1 AND user_id = $2
-            """,
-            tenantId,
-            userId
-        )
+        canonical_tenant, tenant_scope = _resolve_tenant_scope(tenantId)
+        scoped_rows = await _fetch_user_model_rows_for_scope(tenant_scope=tenant_scope, user_id=userId)
+        row = scoped_rows[0] if scoped_rows else None
         exists = bool(row)
-        model = _normalize_user_model(row.get("model") if row else None)
+        model = _hydrate_user_model_narratives(
+            row.get("model") if row else None,
+            row=row if isinstance(row, dict) else None,
+        )
         metadata = _build_user_model_staleness_metadata(model)
+        if isinstance(metadata, dict):
+            metadata["tenantCanonical"] = canonical_tenant
+            metadata["tenantScope"] = tenant_scope
+            metadata["sourceTenant"] = _normalize_text(row.get("tenant_id")) if row else None
         return UserModelResponse(
-            tenantId=tenantId,
+            tenantId=canonical_tenant or tenantId,
             userId=userId,
             model=model,
             completenessScore=_compute_domain_completeness(model),
@@ -3755,7 +7635,7 @@ async def patch_user_model(request: UserModelPatchRequest):
 
         existing = await db.fetchone(
             """
-            SELECT model
+            SELECT model, narrative_stable, narrative_current
             FROM user_model
             WHERE tenant_id = $1 AND user_id = $2
             """,
@@ -3763,28 +7643,43 @@ async def patch_user_model(request: UserModelPatchRequest):
             request.userId
         )
 
-        current_model = _normalize_user_model(existing.get("model") if existing else None)
+        current_model = _hydrate_user_model_narratives(
+            existing.get("model") if existing else None,
+            row=existing if isinstance(existing, dict) else None,
+        )
         merged_model = _normalize_user_model(_deep_merge_patch(current_model, request.patch))
+        narrative_stable = _normalize_text(merged_model.get("narrative_stable")) or None
+        narrative_current = _normalize_text(merged_model.get("narrative_current")) or None
 
         row = await db.fetchone(
             """
-            INSERT INTO user_model (tenant_id, user_id, model, version, last_source, created_at, updated_at)
-            VALUES ($1, $2, $3::jsonb, 1, $4, NOW(), NOW())
+            INSERT INTO user_model (
+                tenant_id, user_id, model, version, last_source, created_at, updated_at,
+                narrative_stable, narrative_current
+            )
+            VALUES ($1, $2, $3::jsonb, 1, $4, NOW(), NOW(), $5, $6)
             ON CONFLICT (tenant_id, user_id)
             DO UPDATE SET
                 model = $3::jsonb,
                 version = user_model.version + 1,
                 last_source = COALESCE($4, user_model.last_source),
+                narrative_stable = COALESCE($5, user_model.narrative_stable),
+                narrative_current = COALESCE($6, user_model.narrative_current),
                 updated_at = NOW()
             RETURNING model, version, created_at, updated_at, last_source
             """,
             request.tenantId,
             request.userId,
             merged_model,
-            request.source
+            request.source,
+            narrative_stable,
+            narrative_current,
         )
 
-        normalized = _normalize_user_model(row.get("model") if row else merged_model)
+        normalized = _hydrate_user_model_narratives(
+            row.get("model") if row else merged_model,
+            row=row if isinstance(row, dict) else None,
+        )
         metadata = _build_user_model_staleness_metadata(normalized)
         return UserModelResponse(
             tenantId=request.tenantId,
@@ -3881,6 +7776,52 @@ async def get_daily_analysis(
         raise HTTPException(status_code=500, detail="Get daily analysis failed")
 
 
+@app.get("/signals/pack")
+async def signals_pack(
+    tenantId: str,
+    userId: str,
+    sessionId: Optional[str] = None,
+    now: Optional[str] = None,
+    capacity: Optional[str] = None,
+    tacticAppetite: Optional[str] = None,
+):
+    return await _build_signals_pack(
+        tenantId=tenantId,
+        userId=userId,
+        sessionId=sessionId,
+        now=now,
+        capacity=capacity,
+        tactic_appetite=tacticAppetite,
+    )
+
+
+@app.post("/internal/habits/daily-log/upsert", response_model=HabitDailyLogUpsertResponse)
+async def upsert_habit_daily_log(
+    request: HabitDailyLogUpsertRequest,
+    x_internal_token: str | None = Header(default=None)
+):
+    _require_internal_token(x_internal_token)
+    row = await _upsert_habit_daily_log_today(
+        tenant_id=request.tenantId,
+        user_id=request.userId,
+        habit_id=request.habitId,
+        completed=request.completed,
+        nudged=request.nudged,
+        user_response=request.userResponse,
+        inferred_from=request.inferredFrom,
+    )
+    return HabitDailyLogUpsertResponse(
+        status="ok",
+        userId=row.get("user_id"),
+        habitId=row.get("habit_id"),
+        date=row.get("date").isoformat() if row.get("date") else datetime.utcnow().date().isoformat(),
+        completed=bool(row.get("completed")),
+        nudged=bool(row.get("nudged")),
+        userResponse=_normalize_text(row.get("user_response")) or None,
+        inferredFrom=_normalize_text(row.get("inferred_from")) or None,
+    )
+
+
 @app.get("/session/brief", response_model=SessionBriefResponse)
 async def session_brief(
     tenantId: str,
@@ -3891,6 +7832,7 @@ async def session_brief(
     Generate a session start-brief from Graphiti narrative entities.
     """
     try:
+        tenantId = _normalize_text(_canonical_tenant_id(tenantId)) or tenantId
         reference_now = datetime.utcnow()
         if now:
             reference_now = datetime.fromisoformat(now.replace("Z", "+00:00"))
@@ -4113,6 +8055,7 @@ async def session_startbrief(
     Minimal start-brief: short bridgeText + durable items.
     """
     try:
+        tenantId = _normalize_text(_canonical_tenant_id(tenantId)) or tenantId
         logger.info(
             "startbrief input: tenant=%s user=%s session=%s persona=%s now=%s timezone=%s",
             tenantId,
@@ -4140,6 +8083,10 @@ async def session_startbrief(
         last_activity_time: Optional[datetime] = None
         recent_session_summaries: List[Dict[str, Any]] = []
         user_model_hints: List[str] = []
+        user_model_narrative: Optional[str] = None
+        user_model_narrative_stable: Optional[str] = None
+        user_model_narrative_current: Optional[str] = None
+        entity_profiles: List[SessionStartBriefEntityProfile] = []
         resume_bridge_text: Optional[str] = None
         resume_use_bridge = False
         summary_norm_stats: Dict[str, Any] = {
@@ -4152,6 +8099,13 @@ async def session_startbrief(
             "fallback_success": False,
         }
         fetched_summary_ids: List[str] = []
+        ingest_freshness: Dict[str, Any] = {
+            "has_pending_session_ingest_jobs": False,
+            "pending_raw_episode_jobs": 0,
+            "pending_post_ingest_hook_jobs": 0,
+            "oldest_pending_age_seconds": None,
+            "latest_pending_session_id": None,
+        }
 
         # Prefer session/message timestamps for time gap.
         session_id = sessionId or await _get_latest_session_id(tenantId, userId)
@@ -4411,6 +8365,7 @@ async def session_startbrief(
 
         loop_items: List[Dict[str, Any]] = []
         for loop_item in top_loops:
+            reason = _normalize_text((loop_item.metadata or {}).get("last_action_reason")) if isinstance(loop_item.metadata, dict) else ""
             loop_items.append({
                 "kind": "loop",
                 "type": loop_item.type,
@@ -4418,7 +8373,8 @@ async def session_startbrief(
                 "timeHorizon": loop_item.timeHorizon,
                 "dueDate": loop_item.dueDate,
                 "salience": loop_item.salience,
-                "lastSeenAt": loop_item.lastSeenAt
+                "lastSeenAt": loop_item.lastSeenAt,
+                "reason": reason or None,
             })
             if len(loop_items) >= 5:
                 break
@@ -4476,22 +8432,73 @@ async def session_startbrief(
             logger.error(f"startbrief yesterday analysis lookup failed: {e}")
 
         try:
-            user_model_row = await db.fetchone(
-                """
-                SELECT model
-                FROM user_model
-                WHERE tenant_id = $1 AND user_id = $2
-                LIMIT 1
-                """,
-                tenantId,
-                userId
-            )
+            _, tenant_scope = _resolve_tenant_scope(tenantId)
+            scoped_user_models = await _fetch_user_model_rows_for_scope(tenant_scope=tenant_scope, user_id=userId)
+            user_model_row = scoped_user_models[0] if scoped_user_models else None
             if user_model_row:
                 user_model = _normalize_user_model(user_model_row.get("model"))
+                user_model_narrative_stable = (
+                    _normalize_text(user_model.get("narrative_stable"))
+                    or _normalize_text(user_model_row.get("narrative_stable"))
+                    or None
+                )
+                user_model_narrative_current = (
+                    _normalize_text(user_model.get("narrative_current"))
+                    or _normalize_text(user_model_row.get("narrative_current"))
+                    or None
+                )
+                user_model_narrative = (
+                    _normalize_text(" ".join([x for x in [user_model_narrative_stable, user_model_narrative_current] if x]))
+                    or _normalize_text(user_model.get("narrative"))
+                    or None
+                )
                 user_model_hints = _extract_high_confidence_user_model_hints(
                     user_model,
                     threshold=float(settings.user_model_high_confidence)
                 )
+                relationship_entities = _extract_valid_relationship_entities(user_model)
+                if relationship_entities:
+                    fact_tasks = [
+                        graphiti_client.search_facts(
+                            tenant_id=tenantId,
+                            user_id=userId,
+                            query=entity.get("name"),
+                            limit=12,
+                            reference_time=reference_now,
+                        )
+                        for entity in relationship_entities
+                    ]
+                    fact_results = await asyncio.gather(*fact_tasks, return_exceptions=True)
+                    for entity, result in zip(relationship_entities, fact_results):
+                        entity_name = _normalize_text(entity.get("name"))
+                        relationship_type = _normalize_text(entity.get("who")).lower()
+                        if not entity_name:
+                            continue
+                        if isinstance(result, Exception):
+                            logger.warning("startbrief entity profile fact query failed name=%s error=%s", entity_name, result)
+                            continue
+                        rows = result if isinstance(result, list) else []
+                        raw_texts = [_normalize_text(r.get("text")) for r in rows if isinstance(r, dict) and r.get("text")]
+                        cleaned_facts = _dedupe_keep_order(
+                            [
+                                t for t in raw_texts
+                                if _allow_fact_text(t)
+                            ],
+                            limit=6
+                        )
+                        if not cleaned_facts:
+                            continue
+                        entity_profiles.append(
+                            SessionStartBriefEntityProfile(
+                                name=entity_name,
+                                profile_text=_build_entity_profile_text(
+                                    entity_name,
+                                    cleaned_facts,
+                                    relationship_type=relationship_type,
+                                ),
+                                facts=cleaned_facts,
+                            )
+                        )
         except Exception as e:
             logger.error(f"startbrief user model hint lookup failed: {e}")
 
@@ -4599,6 +8606,19 @@ async def session_startbrief(
 
         local_time = reference_now.strftime("%H:%M")
         first_session_today = sessions_today_count == 0
+        top_open_loops_for_prompt = sorted(
+            [
+                {
+                    "text": _normalize_text(item.get("text")),
+                    "reason": _normalize_text(item.get("reason")) or None,
+                    "salience": int(item.get("salience") or 0),
+                }
+                for item in loop_items
+                if _normalize_text(item.get("text"))
+            ],
+            key=lambda x: int(x.get("salience") or 0),
+            reverse=True,
+        )[:3]
         narrative_ingredients = {
             "now_local": ingredients.get("now_local"),
             "gap_human": ingredients.get("gap_human"),
@@ -4606,7 +8626,13 @@ async def session_startbrief(
             "last_thread": ingredients.get("last_thread"),
             "user_tone": ingredients.get("user_tone"),
             "open_threads": ingredients.get("open_threads", [])[:2],
+            "open_thread_reasons": ingredients.get("open_thread_reasons", [])[:2],
+            "open_loops": top_open_loops_for_prompt,
+            "yesterday_themes": ingredients.get("yesterday_themes", [])[:2],
+            "steering_note": ingredients.get("steering_note"),
             "continuation_hint": resume_bridge_text if ingredients.get("depth_label") == "continuation" else None,
+            "user_narrative_stable": user_model_narrative_stable,
+            "user_narrative_current": user_model_narrative_current,
         }
         depth_label = ingredients.get("depth_label") or "yesterday"
         handover_text = None
@@ -4666,9 +8692,19 @@ async def session_startbrief(
             summary_norm_stats.get("fallback_success"),
         )
         daily_analysis_date_used = _normalize_text(yesterday_analysis.get("date")) or None
+        try:
+            ingest_freshness = await _get_session_ingest_freshness(
+                tenant_id=tenantId,
+                user_id=userId,
+                reference_now_utc=reference_now_utc,
+                session_id=session_id,
+            )
+        except Exception as e:
+            logger.warning("startbrief ingest freshness lookup failed: %s", e)
 
         response = SessionStartBriefResponse(
             handover_text=_normalize_text(handover_text) or _sanitize_handover_tone(_fallback_handover_text(ingredients, depth_label)),
+            narrative=user_model_narrative,
             handover_depth=depth_label,
             time_context={
                 "local_time": local_time,
@@ -4691,7 +8727,9 @@ async def session_startbrief(
                 "fallback_used": bool(summary_norm_stats.get("fallback_used")),
                 "fallback_success": bool(summary_norm_stats.get("fallback_success")),
                 "daily_analysis_date_used": daily_analysis_date_used,
+                "freshness": ingest_freshness,
             },
+            entity_profiles=entity_profiles,
         )
         try:
             await _log_startbrief_history(
@@ -4806,10 +8844,9 @@ async def close_session(request: SessionCloseRequest):
 @app.post("/session/ingest", response_model=SessionIngestResponse)
 async def ingest_session(request: SessionIngestRequest):
     """
-    Session-only ingestion: send full transcript to Graphiti as one episode.
+    Session-only ingestion: durably enqueue full transcript for async processing.
     """
     try:
-        # Determine timestamps
         started_at = request.startedAt
         ended_at = request.endedAt
         if not started_at and request.messages:
@@ -4817,142 +8854,20 @@ async def ingest_session(request: SessionIngestRequest):
         if not ended_at and request.messages:
             ended_at = request.messages[-1].timestamp
 
-        episode_name = f"session_raw_{request.sessionId}"
-        reference_time = datetime.fromisoformat(ended_at.replace("Z", "+00:00")) if ended_at else datetime.utcnow()
         messages_payload = [m.model_dump() for m in request.messages]
-
-        def _parse_msg_ts(value: Any) -> Optional[datetime]:
-            if not value:
-                return None
-            try:
-                return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-            except Exception:
-                return None
-
-        episode_result = await graphiti_client.add_session_episode(
+        await session.enqueue_session_ingest(
             tenant_id=request.tenantId,
+            session_id=request.sessionId,
             user_id=request.userId,
             messages=messages_payload,
-            reference_time=reference_time,
-            episode_name=episode_name,
-            metadata={
-                "session_id": request.sessionId,
-                "started_at": started_at,
-                "ended_at": ended_at,
-                "episode_type": "session_raw"
-            }
-        )
-        episode_uuid = None
-        if isinstance(episode_result, dict):
-            episode_uuid = episode_result.get("episode_uuid")
-
-        # Create SessionSummary + bridge from full transcript
-        try:
-            summary_payload = await session.summarize_session_messages(messages_payload)
-            summary_text = summary_payload.get("summary_text")
-            bridge_text = summary_payload.get("bridge_text")
-            index_text = summary_payload.get("index_text")
-            salience = summary_payload.get("salience") or "low"
-            logger.info(
-                "Session ingest recap result tenant=%s user=%s session=%s summary_len=%s bridge_len=%s",
-                request.tenantId,
-                request.userId,
-                request.sessionId,
-                len(summary_text or ""),
-                len(bridge_text or "")
-            )
-            if summary_text:
-                await graphiti_client.add_session_summary(
-                    tenant_id=request.tenantId,
-                    user_id=request.userId,
-                    session_id=request.sessionId,
-                    summary_text=summary_text,
-                    bridge_text=bridge_text,
-                    reference_time=reference_time,
-                    episode_uuid=episode_uuid,
-                    extra_attributes={
-                        "summary_quality_tier": summary_payload.get("summary_quality_tier"),
-                        "summary_source": summary_payload.get("summary_source"),
-                        "summary_facts": summary_payload.get("summary_facts"),
-                        "tone": summary_payload.get("tone"),
-                        "moment": summary_payload.get("moment"),
-                        "decisions": summary_payload.get("decisions") or [],
-                        "unresolved": summary_payload.get("unresolved") or [],
-                        "index_text": index_text or "",
-                        "salience": salience,
-                    },
-                    replace_existing_session=True
-                )
-        except Exception as e:
-            logger.error(f"Session ingest summary failed: {e}")
-
-        # Extract loops from full transcript on session ingest (best-effort)
-        try:
-            if messages_payload:
-                # Loops are user-scoped; store under canonical default persona key.
-                effective_persona_id = "default"
-                last_user_text = next(
-                    (
-                        m.get("text")
-                        for m in reversed(messages_payload)
-                        if (m.get("role") or "").lower() == "user" and m.get("text")
-                    ),
-                    None
-                )
-                if not last_user_text:
-                    last_user_text = messages_payload[-1].get("text") if messages_payload[-1].get("text") else ""
-
-                ts_values = [_parse_msg_ts(m.get("timestamp")) for m in messages_payload]
-                ts_values = [t for t in ts_values if t]
-                start_ts = min(ts_values) if ts_values else None
-                end_ts = max(ts_values) if ts_values else reference_time
-
-                provenance = {
-                    "session_id": request.sessionId,
-                    "start_ts": start_ts.isoformat() if start_ts else None,
-                    "end_ts": end_ts.isoformat() if end_ts else None
-                }
-
-                if last_user_text:
-                    loop_result = await loops.extract_and_create_loops(
-                        tenant_id=request.tenantId,
-                        user_id=request.userId,
-                        persona_id=effective_persona_id,
-                        user_text=last_user_text,
-                        recent_turns=messages_payload,
-                        source_turn_ts=end_ts or datetime.utcnow(),
-                        session_id=request.sessionId,
-                        provenance=provenance
-                    )
-                    logger.info(
-                        "Session ingest loop extraction tenant=%s user=%s session=%s new_loops=%s completions=%s",
-                        request.tenantId,
-                        request.userId,
-                        request.sessionId,
-                        (loop_result or {}).get("new_loops"),
-                        (loop_result or {}).get("completions")
-                    )
-        except Exception as e:
-            logger.error(f"Session ingest loop extraction failed: {e}")
-
-        # Optional: store transcript for debug/audit
-        await db.execute(
-            """
-            INSERT INTO session_transcript (tenant_id, session_id, user_id, messages, updated_at)
-            VALUES ($1, $2, $3, $4::jsonb, NOW())
-            ON CONFLICT (tenant_id, session_id)
-            DO UPDATE SET messages = $4::jsonb, updated_at = NOW(), user_id = EXCLUDED.user_id
-            """,
-            request.tenantId,
-            request.sessionId,
-            request.userId,
-            messages_payload
+            started_at=started_at,
+            ended_at=ended_at,
         )
 
         return SessionIngestResponse(
             status="ingested",
             sessionId=request.sessionId,
-            graphitiAdded=True
+            graphitiAdded=False
         )
     except Exception as e:
         logger.error(f"Session ingest failed: {e}")
@@ -4963,6 +8878,7 @@ async def ingest_session(request: SessionIngestRequest):
 async def drain(
     limit: int = 200,
     tenant_id: str | None = None,
+    job_types: list[str] | None = Query(default=None),
     budget_seconds: float = 2.0,
     per_row_timeout_seconds: float = 8.0
 ):
@@ -4972,6 +8888,7 @@ async def drain(
             graphiti_client=graphiti_client,
             limit=limit,
             tenant_id=tenant_id,
+            job_types=job_types,
             budget_seconds=budget_seconds,
             per_row_timeout_seconds=per_row_timeout_seconds
         )
@@ -5074,8 +8991,8 @@ async def debug_outbox(
         if tenantId:
             rows = await db.fetch(
                 """
-                SELECT id, tenant_id, user_id, session_id, status, attempts,
-                       next_attempt_at, last_error, created_at, sent_at
+                SELECT id, tenant_id, user_id, session_id, job_type, dedupe_key, status, attempts,
+                       next_attempt_at, last_error, created_at, sent_at, payload
                 FROM graphiti_outbox
                 WHERE tenant_id = $1 AND status IN ('pending', 'failed')
                 ORDER BY id DESC
@@ -5087,8 +9004,8 @@ async def debug_outbox(
         else:
             rows = await db.fetch(
                 """
-                SELECT id, tenant_id, user_id, session_id, status, attempts,
-                       next_attempt_at, last_error, created_at, sent_at
+                SELECT id, tenant_id, user_id, session_id, job_type, dedupe_key, status, attempts,
+                       next_attempt_at, last_error, created_at, sent_at, payload
                 FROM graphiti_outbox
                 WHERE status IN ('pending', 'failed')
                 ORDER BY id DESC
@@ -5096,9 +9013,133 @@ async def debug_outbox(
                 """,
                 limit
             )
-        return {"rows": rows}
+        summarized: List[Dict[str, Any]] = []
+        for row in rows:
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            payload_summary = {
+                "keys": sorted([str(k) for k in payload.keys()])[:12],
+                "hook": _normalize_text(payload.get("hook")) or None,
+                "reference_time": _normalize_text(payload.get("reference_time")) or None,
+                "target_date": _normalize_text(payload.get("target_date")) or None,
+                "has_messages": isinstance(payload.get("messages"), list),
+                "message_count": len(payload.get("messages")) if isinstance(payload.get("messages"), list) else 0,
+            }
+            summarized.append(
+                {
+                    "id": row.get("id"),
+                    "tenant_id": row.get("tenant_id"),
+                    "user_id": row.get("user_id"),
+                    "session_id": row.get("session_id"),
+                    "job_type": row.get("job_type"),
+                    "dedupe_key": row.get("dedupe_key"),
+                    "status": row.get("status"),
+                    "attempts": row.get("attempts"),
+                    "next_attempt_at": row.get("next_attempt_at"),
+                    "last_error": row.get("last_error"),
+                    "created_at": row.get("created_at"),
+                    "sent_at": row.get("sent_at"),
+                    "payload_summary": payload_summary,
+                }
+            )
+        return {"rows": summarized}
     except Exception as e:
         logger.error(f"Debug outbox endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/internal/debug/session_ingest_status")
+async def debug_session_ingest_status(
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    x_internal_token: str | None = Header(default=None)
+):
+    _require_internal_token(x_internal_token)
+    try:
+        transcript_row = await db.fetchone(
+            """
+            SELECT updated_at, jsonb_array_length(messages) AS message_count
+            FROM session_transcript
+            WHERE tenant_id = $1 AND user_id = $2 AND session_id = $3
+            LIMIT 1
+            """,
+            tenant_id,
+            user_id,
+            session_id
+        )
+        outbox_rows = await db.fetch(
+            """
+            SELECT id, job_type, dedupe_key, status, attempts, next_attempt_at, last_error, created_at, sent_at, payload
+            FROM graphiti_outbox
+            WHERE tenant_id = $1 AND user_id = $2 AND session_id = $3
+              AND (
+                dedupe_key = $4
+                OR dedupe_key LIKE $5
+              )
+            ORDER BY id ASC
+            """,
+            tenant_id,
+            user_id,
+            session_id,
+            f"session_ingest_raw:{tenant_id}:{user_id}:{session_id}",
+            f"session_hook_%:{tenant_id}:{user_id}:{session_id}%"
+        )
+        items: List[Dict[str, Any]] = []
+        for row in outbox_rows:
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            items.append(
+                {
+                    "id": row.get("id"),
+                    "job_type": row.get("job_type"),
+                    "dedupe_key": row.get("dedupe_key"),
+                    "status": row.get("status"),
+                    "attempts": row.get("attempts"),
+                    "next_attempt_at": row.get("next_attempt_at"),
+                    "last_error": row.get("last_error"),
+                    "created_at": row.get("created_at"),
+                    "sent_at": row.get("sent_at"),
+                    "payload_summary": {
+                        "keys": sorted([str(k) for k in payload.keys()])[:12],
+                        "hook": _normalize_text(payload.get("hook")) or None,
+                        "reference_time": _normalize_text(payload.get("reference_time")) or None,
+                        "target_date": _normalize_text(payload.get("target_date")) or None,
+                    }
+                }
+            )
+        last_success = await db.fetch(
+            """
+            SELECT job_type, MAX(sent_at) AS last_success_at
+            FROM graphiti_outbox
+            WHERE tenant_id = $1 AND user_id = $2 AND session_id = $3
+              AND status = 'sent'
+              AND sent_at IS NOT NULL
+            GROUP BY job_type
+            ORDER BY job_type ASC
+            """,
+            tenant_id,
+            user_id,
+            session_id
+        )
+        return {
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "transcript": {
+                "exists": bool(transcript_row),
+                "updated_at": transcript_row.get("updated_at") if transcript_row else None,
+                "message_count": int((transcript_row or {}).get("message_count") or 0),
+            },
+            "jobs": items,
+            "last_success": [
+                {
+                    "job_type": row.get("job_type"),
+                    "last_success_at": row.get("last_success_at"),
+                }
+                for row in last_success
+            ],
+        }
+    except Exception as e:
+        logger.error(f"Debug session ingest status error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -5188,6 +9229,27 @@ async def debug_close_user_sessions(
         return {"closedCount": len(closed), "closedSessions": closed}
     except Exception as e:
         logger.error(f"Debug close_user_sessions error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/internal/debug/backfill/user_model_enrichment")
+async def debug_backfill_user_model_enrichment(
+    limit: int = 500,
+    x_internal_token: str | None = Header(default=None)
+):
+    """Run a bounded idempotent backfill for user model enrichment."""
+    _require_internal_token(x_internal_token)
+    settings = get_settings()
+    try:
+        counts = await _run_user_model_enrichment_backfill_once(
+            max_users=max(1, min(int(limit), 5000)),
+            min_confidence=float(settings.user_model_enrichment_min_confidence),
+            retry_backoff_seconds=int(settings.user_model_enrichment_retry_backoff_seconds),
+            retry_max_seconds=int(settings.user_model_enrichment_retry_max_seconds),
+        )
+        return {"ok": True, "counts": counts}
+    except Exception as e:
+        logger.error(f"Debug user model enrichment backfill failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

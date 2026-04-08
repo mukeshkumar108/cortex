@@ -64,7 +64,7 @@ async def test_memory_query_uses_graphiti():
             return [{"text": "User likes birds", "relevance": 0.9, "source": "graphiti"}]
 
         async def search_nodes(self, **_kwargs):
-            return [{"summary": "Ashley", "type": "person", "uuid": "u1"}]
+            return [{"summary": "Ashley", "type": "Entity", "labels": ["Entity"], "uuid": "u1"}]
 
     fake = _FakeGraph()
     graphiti_client.search_facts = fake.search_facts
@@ -78,7 +78,8 @@ async def test_memory_query_uses_graphiti():
         userId="u",
         query="Ashley",
         limit=5,
-        referenceTime=None
+        referenceTime=None,
+        includeContext=True
     )
     resp = await memory_query(req)
     assert len(resp.facts) == 1
@@ -91,23 +92,20 @@ async def test_memory_query_uses_graphiti():
 
 
 @pytest.mark.asyncio
-async def test_session_close_sends_raw_transcript_episode():
+async def test_session_close_is_enqueue_only():
     tenant = f"tenant-{uuid4().hex}"
     user = f"user-{uuid4().hex}"
     session_id = f"session-{uuid4().hex}"
 
-    sent = {}
+    called = {"raw_episode": 0}
 
-    async def _fake_add_episode(**kwargs):
-        sent.update(kwargs)
-        return {"ok": True}
+    async def _fake_add_session_episode(**_kwargs):
+        called["raw_episode"] += 1
+        return {"success": True, "episode_uuid": "ep1"}
 
-    fake_graphiti = type("G", (), {"add_episode": _fake_add_episode})
+    graphiti_client.add_session_episode = _fake_add_session_episode
 
     async with app.router.lifespan_context(app):
-        # Avoid LLM calls during close_session in tests
-        session_module._manager._summarize_session_close = lambda _self, _input=None: asyncio.sleep(0, result="summary")
-        session_module._manager._summarize_session_bridge = lambda _self, _summary: asyncio.sleep(0, result="bridge")
         await session_module.add_turn(
             tenant_id=tenant,
             session_id=session_id,
@@ -128,22 +126,36 @@ async def test_session_close_sends_raw_transcript_episode():
             tenant_id=tenant,
             session_id=session_id,
             user_id=user,
-            graphiti_client=fake_graphiti
+            graphiti_client=graphiti_client
         )
 
-    assert "text" in sent
-    assert "My name is Mukesh" in sent["text"]
-    assert sent.get("role") is None
+    assert called["raw_episode"] == 0
 
     conn = await asyncpg.connect(_db_url())
     try:
-        row = await conn.fetchrow(
+        buffer_row = await conn.fetchrow(
             "SELECT closed_at FROM session_buffer WHERE tenant_id=$1 AND session_id=$2",
             tenant,
             session_id
         )
-        assert row is not None
-        assert row["closed_at"] is not None
+        raw_row = await conn.fetchrow(
+            """
+            SELECT job_type, status, dedupe_key
+            FROM graphiti_outbox
+            WHERE tenant_id = $1 AND user_id = $2 AND session_id = $3
+              AND job_type = 'session_raw_episode'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            tenant,
+            user,
+            session_id
+        )
+        assert buffer_row is not None
+        assert buffer_row["closed_at"] is not None
+        assert raw_row is not None
+        assert raw_row["status"] == "pending"
+        assert raw_row["dedupe_key"] == f"session_ingest_raw:{tenant}:{user}:{session_id}"
     finally:
         await conn.close()
 
@@ -174,7 +186,7 @@ async def test_add_session_summary_sets_summary_field(monkeypatch):
     monkeypatch.setattr(EntityNode, "save", _fake_save, raising=True)
     async def _always_exists(**_kwargs):
         return True
-    monkeypatch.setattr(gc, "_session_summary_exists", _always_exists, raising=True)
+    monkeypatch.setattr(gc, "_session_summary_uuid_exists", _always_exists, raising=True)
 
     resp = await gc.add_session_summary(
         tenant_id="t",
@@ -215,7 +227,7 @@ async def test_add_session_summary_uses_index_text_for_summary_field(monkeypatch
     monkeypatch.setattr(EntityNode, "save", _fake_save, raising=True)
     async def _always_exists(**_kwargs):
         return True
-    monkeypatch.setattr(gc, "_session_summary_exists", _always_exists, raising=True)
+    monkeypatch.setattr(gc, "_session_summary_uuid_exists", _always_exists, raising=True)
 
     resp = await gc.add_session_summary(
         tenant_id="t",
@@ -529,7 +541,8 @@ async def test_memory_query_recall_sheet_filters_interpretive_language():
             tenantId="t",
             userId="u",
             query="launch",
-            referenceTime="2026-02-05T01:00:00Z"
+            referenceTime="2026-02-05T01:00:00Z",
+            includeContext=True
         )
     )
     assert resp.recallSheet is not None
@@ -540,8 +553,8 @@ async def test_memory_query_recall_sheet_filters_interpretive_language():
     assert "i feel anxious" not in " ".join(resp.facts).lower()
     assert "i feel anxious" not in " ".join(resp.openLoops).lower()
     assert "i feel anxious" not in " ".join(resp.commitments).lower()
-    assert "CURRENT_FOCUS:" in resp.recallSheet
-    assert resp.currentFocus is not None
+    assert "CURRENT_FOCUS:" not in resp.recallSheet
+    assert resp.currentFocus is None
 
 
 @pytest.mark.asyncio
@@ -568,7 +581,182 @@ async def test_current_focus_omitted_when_stale():
     from src.main import memory_query
     from src.models import MemoryQueryRequest
 
-    resp = await memory_query(MemoryQueryRequest(tenantId="t", userId="u", query="focus"))
+    resp = await memory_query(MemoryQueryRequest(tenantId="t", userId="u", query="focus", includeContext=True))
     assert resp.recallSheet is not None
     assert "CURRENT_FOCUS:" not in resp.recallSheet
     assert resp.currentFocus is None
+
+
+@pytest.mark.asyncio
+async def test_memory_query_focus_query_is_configurable():
+    captured_queries = []
+
+    class _FakeGraph:
+        async def search_facts(self, **_kwargs):
+            return []
+
+        async def search_nodes(self, **_kwargs):
+            query = _kwargs.get("query", "")
+            captured_queries.append(query)
+            return []
+
+    fake = _FakeGraph()
+    graphiti_client.search_facts = fake.search_facts
+    graphiti_client.search_nodes = fake.search_nodes
+
+    from src.main import memory_query
+    from src.models import MemoryQueryRequest
+
+    await memory_query(
+        MemoryQueryRequest(
+            tenantId="t",
+            userId="u",
+            query="focus",
+            includeContext=True,
+            focusQuery="my custom focus query terms",
+        )
+    )
+
+    assert "my custom focus query terms" in captured_queries
+
+
+@pytest.mark.asyncio
+async def test_memory_query_surfaces_session_summary_and_user_model_with_provenance(monkeypatch):
+    class _FakeGraph:
+        async def search_facts(self, **kwargs):
+            tenant_id = kwargs.get("tenant_id")
+            if tenant_id == "default":
+                return [{"text": "User recently left hospital", "relevance": 0.55, "source": "graphiti"}]
+            return []
+
+        async def search_nodes(self, **kwargs):
+            tenant_id = kwargs.get("tenant_id")
+            if tenant_id != "default":
+                return []
+            return [
+                {
+                    "summary": "session summary",
+                    "type": "SessionSummary",
+                    "labels": ["SessionSummary"],
+                    "attributes": {
+                        "summary_facts": "Recently out of hospital with kidney stones.",
+                        "reference_time": "2026-04-08T09:00:00Z",
+                    },
+                }
+            ]
+
+    async def _stub_db_fetch(query, *args, **_kwargs):
+        if "FROM user_model" in query:
+            return [
+                {
+                    "tenant_id": "default",
+                    "model": {
+                        "narrative_current": "Recently out of hospital with kidney stones.",
+                        "recent_signals": [{"text": "Hydration helps with kidney stone recovery."}],
+                    },
+                    "version": 3,
+                    "created_at": None,
+                    "updated_at": None,
+                    "last_source": "enrichment",
+                    "narrative_stable": None,
+                    "narrative_current": None,
+                }
+            ]
+        return []
+
+    fake = _FakeGraph()
+    graphiti_client.search_facts = fake.search_facts
+    graphiti_client.search_nodes = fake.search_nodes
+    monkeypatch.setattr("src.main.db.fetch", _stub_db_fetch, raising=False)
+
+    from src.main import memory_query
+    from src.models import MemoryQueryRequest
+
+    resp = await memory_query(
+        MemoryQueryRequest(
+            tenantId="default",
+            userId="u",
+            query="why did I go to hospital",
+            includeContext=False,
+            limit=5,
+        )
+    )
+
+    lower_facts = [f.lower() for f in resp.facts]
+    assert any("kidney stones" in text for text in lower_facts)
+    sources = {item.source for item in resp.factItems}
+    assert "graphiti_session_summary" in sources or "user_model" in sources
+    assert "provenanceCounts" in (resp.metadata or {})
+    assert not any((e.type or "").lower() == "sessionsummary" for e in resp.entities)
+
+
+@pytest.mark.asyncio
+async def test_memory_query_alias_scope_queries_canonical_and_alias(monkeypatch):
+    called_tenants = []
+    captured_scope = {"value": None}
+
+    class _FakeGraph:
+        async def search_facts(self, **kwargs):
+            called_tenants.append(kwargs.get("tenant_id"))
+            return []
+
+        async def search_nodes(self, **_kwargs):
+            return []
+
+    async def _stub_db_fetch(query, *args, **_kwargs):
+        if "FROM user_model" in query:
+            captured_scope["value"] = args[0]
+            return []
+        return []
+
+    fake = _FakeGraph()
+    graphiti_client.search_facts = fake.search_facts
+    graphiti_client.search_nodes = fake.search_nodes
+    monkeypatch.setattr("src.main.db.fetch", _stub_db_fetch, raising=False)
+
+    from src.main import memory_query
+    from src.models import MemoryQueryRequest
+
+    resp = await memory_query(
+        MemoryQueryRequest(
+            tenantId="sophie-prod",
+            userId="u",
+            query="hospital",
+            includeContext=False,
+            limit=3,
+        )
+    )
+
+    assert set(called_tenants) >= {"default", "sophie-prod"}
+    assert captured_scope["value"] and set(captured_scope["value"]) >= {"default", "sophie-prod"}
+    assert (resp.metadata or {}).get("tenantCanonical") == "default"
+
+
+@pytest.mark.asyncio
+async def test_get_user_model_reads_alias_scope(monkeypatch):
+    async def _stub_db_fetch(query, *args, **_kwargs):
+        if "FROM user_model" in query:
+            scope = args[0]
+            if set(scope) >= {"default", "sophie-prod"}:
+                return [
+                    {
+                        "tenant_id": "default",
+                        "model": {"current_focus": {"text": "Recover from kidney stones"}},
+                        "version": 2,
+                        "created_at": None,
+                        "updated_at": None,
+                        "last_source": "updater",
+                        "narrative_stable": None,
+                        "narrative_current": None,
+                    }
+                ]
+        return []
+
+    monkeypatch.setattr("src.main.db.fetch", _stub_db_fetch, raising=False)
+
+    from src.main import get_user_model
+
+    resp = await get_user_model(tenantId="sophie-prod", userId="u")
+    assert resp.exists is True
+    assert resp.tenantId == "default"
+    assert (resp.metadata or {}).get("sourceTenant") == "default"

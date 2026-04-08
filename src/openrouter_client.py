@@ -186,7 +186,7 @@ JSON:"""
         prompt: str,
         max_tokens: int = 500,
         temperature: float = 0.7,
-        task: Literal["summary", "loops", "session_episode", "identity", "daily_analysis", "startbrief_bridge", "generic"] = "generic"
+        task: Literal["summary", "loops", "session_episode", "identity", "daily_analysis", "startbrief_bridge", "user_model_enrichment", "generic"] = "generic"
     ) -> Optional[str]:
         """
         Make a request to OpenRouter API with timeout.
@@ -213,6 +213,8 @@ JSON:"""
                 model = self.model_summary
             elif task == "startbrief_bridge":
                 model = self.model_summary
+            elif task == "user_model_enrichment":
+                model = self.model_summary
             elif task == "generic":
                 model = self.model
 
@@ -226,7 +228,7 @@ JSON:"""
             }
             if self.reasoning_enabled:
                 payload["reasoning"] = {"enabled": True}
-            if task in {"loops", "identity", "daily_analysis"}:
+            if task in {"loops", "identity", "daily_analysis", "user_model_enrichment"}:
                 payload["response_format"] = {"type": "json_object"}
 
             async with httpx.AsyncClient(timeout=self.timeout) as client:

@@ -9,17 +9,17 @@ from src import session as session_module
 
 
 @pytest.mark.asyncio
-async def test_session_close_triggers_loop_extraction_with_provenance(monkeypatch):
+async def test_session_close_enqueues_and_drain_executes_loop_hook(monkeypatch):
     tenant = f"tenant-{uuid4().hex}"
     user = f"user-{uuid4().hex}"
     session_id = f"session-{uuid4().hex}"
     persona_id = "persona"
     now = datetime.utcnow().isoformat() + "Z"
 
-    async def _stub_add_episode(**_kwargs):
-        return {"success": False}
+    async def _stub_add_session_episode(**_kwargs):
+        return {"success": True, "episode_uuid": "ep1"}
 
-    graphiti_client.add_episode = _stub_add_episode
+    graphiti_client.add_session_episode = _stub_add_session_episode
 
     captured = {}
 
@@ -93,9 +93,27 @@ async def test_session_close_triggers_loop_extraction_with_provenance(monkeypatc
             assert resp.status_code == 200
             assert resp.json().get("closed") is True
 
+        # /session/close itself must not run hooks synchronously.
+        assert captured == {}
+
+        await session_module.drain_outbox(
+            graphiti_client=graphiti_client,
+            limit=20,
+            tenant_id=tenant,
+            budget_seconds=3.0,
+            per_row_timeout_seconds=5.0
+        )
+        await session_module.drain_outbox(
+            graphiti_client=graphiti_client,
+            limit=20,
+            tenant_id=tenant,
+            budget_seconds=3.0,
+            per_row_timeout_seconds=5.0
+        )
+
     assert captured["tenant_id"] == tenant
     assert captured["user_id"] == user
-    assert captured["persona_id"] == persona_id
+    assert captured["persona_id"] == "default"
     assert captured["session_id"] == session_id
     assert len(captured["recent_turns"]) == 2
     assert captured["user_text"]

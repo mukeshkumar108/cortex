@@ -535,12 +535,16 @@ class LoopManager:
                 "  (d) ongoing thread/project OR\n"
                 "  (e) durable decision affecting future actions.\n"
                 "- Do NOT create loops for one-off ephemeral actions like \"going for a walk today\" unless it is a habit/plan to repeat.\n"
-                "- type=\"habit\": require signals like \"often\", \"always\", \"every day/week\", \"I keep\", \"habit\", \"routine\".\n"
+                "- Never extract instructions about how the assistant should behave as loops. Only extract facts, commitments, habits, decisions, and patterns about the user's own life.\n"
+                "- type=\"habit\": strict gate — create only when the user explicitly states repeated intent or routine (e.g., \"I want to walk every day\", \"I'm trying to drink more water daily\").\n"
+                "- type=\"habit\": do NOT create from themes, aspirations, relationship goals, one-off mentions, or inferred patterns.\n"
+                "- type=\"habit\": if explicit repeated intent is not clearly present, do not create it.\n"
                 "- type=\"thread\": require multi-step or ongoing work (project).\n"
                 "- type=\"friction\": require repeated struggle/pattern language.\n"
                 "- type=\"decision\": must be a stable choice that affects future actions.\n"
                 "- \"text\" must be <= 12 words and start with a verb where possible.\n"
-                "- \"reason\" max 12 words.\n\n"
+                "- \"reason\" max 20 words.\n"
+                "- \"reason\" must capture WHY this loop matters — the specific trigger, context, or consequence that makes it significant. Not just what it is, but what caused it or what's at stake.\n\n"
                 "- Add domain from: general|health|career|relationships|family|finance|home|learning|spirituality.\n"
                 "- Set importance 1-5 (long-term significance), urgency 1-5 (time pressure).\n\n"
                 "INPUT:\n"
@@ -556,7 +560,7 @@ class LoopManager:
                 '"salience": 1-5, "time_horizon": "today|this_week|ongoing", '
                 '"due_date": "YYYY-MM-DD" | null, "importance": 1-5, "urgency": 1-5, '
                 '"domain": "general|health|career|relationships|family|finance|home|learning|spirituality", '
-                '"entity_refs": ["..."], "tags": ["..."], "reason": "max 12 words"}\n'
+                '"entity_refs": ["..."], "tags": ["..."], "reason": "max 20 words, capture the why"}\n'
                 "  ],\n"
                 '  "reinforced_loops": [ {"loop_id": "...", "confidence": 0-1, "reason": "max 12 words"} ],\n'
                 '  "completed_loops": [ {"loop_id": "...", "confidence": 0-1, "reason": "max 12 words", '
