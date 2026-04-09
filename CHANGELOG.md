@@ -56,3 +56,4 @@
   - `entity_hints` added to `/session/startbrief` (compact startup grounding)
   - `POST /entities/profile` for deep-dive identity cards (person/project/company/place/other)
   - shared internal entity-candidate builder reused by both surfaces
+  - `POST /internal/debug/entities/profile` for full entity profile diagnostics

@@ -227,6 +227,8 @@ Optional compatibility mode:
 - `GET /internal/debug/startbrief/ranking` (requires `x-internal-token`)
   - Returns full summary and loop candidate rankings with score components.
   - Use when diagnosing stale/contradictory startbrief context selection.
+- `POST /internal/debug/entities/profile` (requires `x-internal-token`)
+  - Returns computed entity profile plus candidate ranking, fact keep/drop reasons, and loop match diagnostics.
 
 **GET /memory/loops**
 ```bash

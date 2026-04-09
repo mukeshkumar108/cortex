@@ -10143,6 +10143,137 @@ async def entities_profile(request: EntityProfileRequest):
         raise HTTPException(status_code=500, detail="Entity profile failed")
 
 
+@app.post("/internal/debug/entities/profile")
+async def debug_entities_profile(
+    request: EntityProfileRequest,
+    x_internal_token: str | None = Header(default=None)
+):
+    _require_internal_token(x_internal_token)
+    try:
+        profile = await entities_profile(request)
+        profile_payload = profile.model_dump() if hasattr(profile, "model_dump") else profile.dict()
+
+        tenant_id = _normalize_text(_canonical_tenant_id(request.tenantId)) or request.tenantId
+        user_id = _normalize_text(request.userId)
+        entity_id = _normalize_text(request.entityId)
+        name = _normalize_text(request.name)
+
+        reference_time = datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+        if request.referenceTime:
+            value = _normalize_text(request.referenceTime)
+            if value.endswith("Z"):
+                value = value.replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(value)
+            reference_time = parsed if parsed.tzinfo else parsed.replace(tzinfo=dt_timezone.utc)
+
+        user_model: Dict[str, Any] = {}
+        try:
+            _, tenant_scope = _resolve_tenant_scope(tenant_id)
+            rows = await _fetch_user_model_rows_for_scope(tenant_scope=tenant_scope, user_id=user_id)
+            if rows:
+                user_model = _normalize_user_model(rows[0].get("model"))
+        except Exception:
+            user_model = {}
+
+        candidates = await _build_entity_candidates(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            reference_time=reference_time,
+            user_model=user_model,
+            context_texts=[name] if name else None,
+            max_hints=10,
+        )
+        selected = _resolve_entity_candidate(candidates, entity_id=entity_id, name=name)
+        canonical_name = (
+            _normalize_text((profile_payload or {}).get("entity", {}).get("canonicalName"))
+            or _normalize_text((selected or {}).get("name"))
+            or name
+        )
+
+        facts_limit = max(1, min(int(request.factsLimit or 6), 10))
+        raw_fact_rows = await graphiti_client.search_facts(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            query=canonical_name,
+            limit=max(facts_limit * 3, 12),
+            reference_time=reference_time,
+        )
+        entity_terms = _query_terms(canonical_name)
+        kept_facts: List[Dict[str, Any]] = []
+        dropped_facts: List[Dict[str, Any]] = []
+        seen = set()
+        for row in raw_fact_rows or []:
+            if not isinstance(row, dict):
+                continue
+            text = _normalize_text(row.get("text"))
+            if not text:
+                dropped_facts.append({"text": text, "reason": "empty_text"})
+                continue
+            if not _allow_fact_text(text):
+                dropped_facts.append({"text": text, "reason": "fact_quality_filter"})
+                continue
+            if entity_terms and _query_overlap_score(text, entity_terms) < 0.35 and canonical_name.lower() not in text.lower():
+                dropped_facts.append({"text": text, "reason": "entity_overlap_filter"})
+                continue
+            key = text.lower()
+            if key in seen:
+                dropped_facts.append({"text": text, "reason": "duplicate"})
+                continue
+            seen.add(key)
+            kept_facts.append({"text": text, "relevance": row.get("relevance")})
+            if len(kept_facts) >= facts_limit:
+                break
+
+        loop_matches: List[Dict[str, Any]] = []
+        if bool(request.includeOpenLoops):
+            top_loops = await loops.get_top_loops_for_startbrief(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                limit=20,
+                persona_id=None,
+            )
+            for item in top_loops or []:
+                text = _normalize_text(getattr(item, "text", ""))
+                if not text:
+                    continue
+                score = _query_overlap_score(text, entity_terms) if entity_terms else 0.0
+                if score < 0.35:
+                    continue
+                loop_matches.append(
+                    {
+                        "id": _normalize_text(getattr(item, "id", None)) or None,
+                        "type": _normalize_text(getattr(item, "type", "")) or None,
+                        "text": text,
+                        "status": _normalize_text(getattr(item, "status", "")) or None,
+                        "salience": int(getattr(item, "salience", 0) or 0),
+                        "entity_overlap_score": round(float(score), 4),
+                    }
+                )
+        loop_matches.sort(key=lambda x: (float(x.get("entity_overlap_score") or 0.0), int(x.get("salience") or 0)), reverse=True)
+
+        return {
+            "profile": profile_payload,
+            "debug": {
+                "request": request.model_dump() if hasattr(request, "model_dump") else request.dict(),
+                "selected_entity": selected,
+                "candidate_count": len(candidates),
+                "candidates": candidates[:10],
+                "facts": {
+                    "raw_count": len(raw_fact_rows or []),
+                    "kept_count": len(kept_facts),
+                    "kept": kept_facts,
+                    "dropped": dropped_facts[:20],
+                },
+                "loop_matches": loop_matches[:10],
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("debug entities/profile failed: %s", e)
+        raise HTTPException(status_code=500, detail="Debug entity profile failed")
+
+
 @app.post("/admin/purgeUser")
 async def purge_user(
     request: PurgeUserRequest,

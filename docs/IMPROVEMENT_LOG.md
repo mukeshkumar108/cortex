@@ -46,6 +46,9 @@ Purpose: running implementation log for memory quality and retrieval/startbrief 
 - Introduced shared internal entity candidate builder:
   - reused by both `/session/startbrief` and `/entities/profile`
   - uses existing Graphiti/user_model/loops surfaces (no new storage path)
+- Added `POST /internal/debug/entities/profile`:
+  - returns computed profile + entity candidate ranking
+  - includes fact keep/drop diagnostics and loop match diagnostics
 
 ### Why this matters
 - Prevents stale memories from overriding fresh corrections.

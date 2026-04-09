@@ -421,6 +421,24 @@ Use this endpoint to diagnose stale-memory precedence and ranking drift.
 
 ---
 
+### POST /internal/debug/entities/profile (internal)
+Debug-only entity profile diagnostics.
+
+Headers:
+```
+x-internal-token: <INTERNAL_TOKEN>
+```
+
+Body: same as `POST /entities/profile`.
+
+Returns:
+- resolved profile payload
+- candidate ranking from shared entity builder
+- fact filtering diagnostics (`kept` + `dropped` with reasons)
+- loop-entity match diagnostics
+
+---
+
 ### POST /entities/profile
 Deep-dive entity card for assistant runtime grounding.
 

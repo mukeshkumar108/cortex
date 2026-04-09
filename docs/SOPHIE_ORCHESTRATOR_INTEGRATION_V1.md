@@ -415,6 +415,11 @@ Response:
 `GET /internal/debug/startbrief/ranking` returns full candidate rankings (summary + loops) with score components and selected winners.
 Use this to investigate stale/contradictory memory surfacing.
 
+`POST /internal/debug/entities/profile` returns the computed entity card plus:
+- candidate ranking from the shared entity builder
+- raw/kept/dropped fact diagnostics (with reasons)
+- loop match diagnostics for entity relevance
+
 ### Tenant alias behavior
 - Known aliases are canonicalized at ingress for both query params and JSON payloads.
 - Current mapping includes `sophie-prod` -> `default`.
