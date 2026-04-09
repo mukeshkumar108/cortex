@@ -238,6 +238,7 @@ tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z&sessionId=<optional>&pe
 ```json
 {
   "handover_text": "string",
+  "narrative": "string|null",
   "handover_depth": "continuation|yesterday|weekly",
   "time_context": {
     "local_time": "HH:MM",
@@ -307,7 +308,19 @@ tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z&sessionId=<optional>&pe
       "oldest_pending_age_seconds": 0,
       "latest_pending_session_id": "string|null"
     }
-  }
+  },
+  "entity_hints": [
+    {
+      "entityId": "string|null",
+      "name": "string",
+      "type": "person|project|company|place|other",
+      "role": "string|null",
+      "importance": 0.0,
+      "salience": 0.0,
+      "lastSeenAt": "ISO-8601|null"
+    }
+  ],
+  "entity_profiles": []
 }
 ```
 
@@ -382,6 +395,8 @@ Notes:
 - Terminology:
   - `salience` = immediate urgency/intensity
   - `importance` = durable relevance across recurrence/persistence
+- `entity_hints` = compact ambient grounding surface (preferred for startup context).
+- `entity_profiles` is legacy compatibility and may be removed after entity_hints migration.
 
 ---
 
@@ -403,6 +418,47 @@ x-internal-token: <INTERNAL_TOKEN>
 - Includes selected winners and definitions for each scoring field.
 
 Use this endpoint to diagnose stale-memory precedence and ranking drift.
+
+---
+
+### POST /entities/profile
+Deep-dive entity card for assistant runtime grounding.
+
+**Request**
+```json
+{
+  "tenantId": "string",
+  "userId": "string",
+  "entityId": "string|null",
+  "name": "string|null",
+  "referenceTime": "ISO-8601|null",
+  "includeOpenLoops": true,
+  "factsLimit": 6,
+  "loopsLimit": 3
+}
+```
+Validation: at least one of `entityId` or `name` is required.
+
+**Response (shape)**
+```json
+{
+  "entity": {
+    "entityId": "string|null",
+    "canonicalName": "string",
+    "type": "person|project|company|place|other",
+    "aliases": [],
+    "summary": "string",
+    "role": "string|null",
+    "relationship": "string|null",
+    "importance": 0.0,
+    "salience": 0.0,
+    "recency": {"lastSeenAt": "ISO-8601|null", "daysSinceSeen": 0}
+  },
+  "keyFacts": [{"text": "string", "confidence": 0.0, "validAt": "ISO-8601|null", "invalidAt": "ISO-8601|null"}],
+  "openLoops": [{"id": "string", "type": "string", "text": "string", "status": "string|null", "salience": 0}],
+  "provenance": {"sources": [], "resolvedBy": "entityId|name", "queryUsed": "string", "generatedAt": "ISO-8601"}
+}
+```
 
 ---
 

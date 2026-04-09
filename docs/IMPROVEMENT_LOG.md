@@ -36,6 +36,17 @@ Purpose: running implementation log for memory quality and retrieval/startbrief 
   - `evidence.claim_ranking_defs`
   - `evidence.loop_ranking_defs`
 
+### Ambient Entity Grounding (v1)
+- Added `entity_hints` to `/session/startbrief`:
+  - compact fields only (`entityId`, `name`, `type`, `role`, `importance`, `salience`, `lastSeenAt`)
+  - max 10 hints
+- Added `POST /entities/profile`:
+  - request by `entityId` or `name`
+  - returns compact entity card + key facts + optional relevant loops + provenance
+- Introduced shared internal entity candidate builder:
+  - reused by both `/session/startbrief` and `/entities/profile`
+  - uses existing Graphiti/user_model/loops surfaces (no new storage path)
+
 ### Why this matters
 - Prevents stale memories from overriding fresh corrections.
 - Makes precedence decisions inspectable and testable.

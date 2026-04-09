@@ -66,6 +66,7 @@ Exact response payload shape:
 ```json
 {
   "handover_text": "string",
+  "narrative": "string|null",
   "handover_depth": "continuation|yesterday|weekly",
   "time_context": {
     "local_time": "HH:MM",
@@ -135,7 +136,54 @@ Exact response payload shape:
       "oldest_pending_age_seconds": 0,
       "latest_pending_session_id": "string|null"
     }
-  }
+  },
+  "entity_hints": [
+    {
+      "entityId": "string|null",
+      "name": "string",
+      "type": "person|project|company|place|other",
+      "role": "string|null",
+      "importance": 0.0,
+      "salience": 0.0,
+      "lastSeenAt": "ISO-8601|null"
+    }
+  ],
+  "entity_profiles": []
+}
+```
+
+`entity_hints` is the compact ambient grounding surface. `entity_profiles` is a legacy field kept temporarily for compatibility.
+
+**POST /entities/profile**
+```bash
+curl -s http://localhost:8000/entities/profile -H 'Content-Type: application/json' -d '{
+  "tenantId": "tenant_a",
+  "userId": "user_1",
+  "name": "Ashley",
+  "includeOpenLoops": true,
+  "factsLimit": 6,
+  "loopsLimit": 3
+}'
+```
+
+Response shape:
+```json
+{
+  "entity": {
+    "entityId": "string|null",
+    "canonicalName": "string",
+    "type": "person|project|company|place|other",
+    "aliases": [],
+    "summary": "string",
+    "role": "string|null",
+    "relationship": "string|null",
+    "importance": 0.0,
+    "salience": 0.0,
+    "recency": {"lastSeenAt": "ISO-8601|null", "daysSinceSeen": 0}
+  },
+  "keyFacts": [{"text": "string", "confidence": 0.0, "validAt": "ISO-8601|null", "invalidAt": "ISO-8601|null"}],
+  "openLoops": [{"id": "string", "type": "string", "text": "string", "status": "string|null", "salience": 0}],
+  "provenance": {"sources": [], "resolvedBy": "entityId|name", "queryUsed": "string", "generatedAt": "ISO-8601"}
 }
 ```
 

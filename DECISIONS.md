@@ -130,3 +130,18 @@ session_buffer (tenant_id, session_id)
 - Traceability:
   - `/session/startbrief` returns ranking evidence (`claim_ranking`, `loop_ranking`, and definitions)
   - `/internal/debug/startbrief/ranking` returns full candidate rankings for diagnostics
+
+## Entity Grounding Surfaces (2026-04-09)
+- Startup ambient grounding is provided via `/session/startbrief.entity_hints` (compact only).
+- Deep entity inspection is provided via `POST /entities/profile`.
+- Scope:
+  - supports person/project/company/place/other
+  - relationship detail remains inside person profile cards
+- Non-goals for now:
+  - no `/entities` list endpoint
+  - no `/memory/entities`
+  - no standalone `/relationship/summary`
+- Implementation reuses existing memory surfaces:
+  - Graphiti nodes/facts
+  - user_model relationship context
+  - loops for procedural relevance

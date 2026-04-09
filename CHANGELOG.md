@@ -52,3 +52,7 @@
   - `loop_ranking`
   - `claim_ranking_defs`
   - `loop_ranking_defs`
+- New ambient entity surfaces:
+  - `entity_hints` added to `/session/startbrief` (compact startup grounding)
+  - `POST /entities/profile` for deep-dive identity cards (person/project/company/place/other)
+  - shared internal entity-candidate builder reused by both surfaces

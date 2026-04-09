@@ -264,6 +264,17 @@ Exact response payload shape:
       "latest_pending_session_id": "string|null"
     }
   },
+  "entity_hints": [
+    {
+      "entityId": "string|null",
+      "name": "string",
+      "type": "person|project|company|place|other",
+      "role": "string|null",
+      "importance": "number",
+      "salience": "number",
+      "lastSeenAt": "ISO-8601|null"
+    }
+  ],
   "entity_profiles": [
     {
       "name": "string",
@@ -358,7 +369,47 @@ Notes:
 - `evidence` provides provenance and freshness diagnostics for trust/traceability.
 - `evidence.claim_ranking` and `evidence.loop_ranking` explain precedence decisions.
 - `salience` means immediate urgency/intensity; `importance` means durable relevance over time.
+- `entity_hints` is the compact ambient grounding surface for mentioned people/projects/places.
 - `entity_profiles` are relationship-focused profiles built from user model + Graphiti facts.
+
+### POST /entities/profile
+Compact entity identity card for assistant runtime use.
+
+Request:
+```json
+{
+  "tenantId": "string",
+  "userId": "string",
+  "entityId": "string|null",
+  "name": "string|null",
+  "referenceTime": "ISO-8601|null",
+  "includeOpenLoops": true,
+  "factsLimit": 6,
+  "loopsLimit": 3
+}
+```
+Validation: provide one of `entityId` or `name`.
+
+Response:
+```json
+{
+  "entity": {
+    "entityId": "string|null",
+    "canonicalName": "string",
+    "type": "person|project|company|place|other",
+    "aliases": [],
+    "summary": "string",
+    "role": "string|null",
+    "relationship": "string|null",
+    "importance": "number",
+    "salience": "number",
+    "recency": {"lastSeenAt": "ISO-8601|null", "daysSinceSeen": "number|null"}
+  },
+  "keyFacts": [{"text": "string", "confidence": "number", "validAt": "ISO-8601|null", "invalidAt": "ISO-8601|null"}],
+  "openLoops": [{"id": "string", "type": "string", "text": "string", "status": "string|null", "salience": "number"}],
+  "provenance": {"sources": [], "resolvedBy": "entityId|name", "queryUsed": "string", "generatedAt": "ISO-8601"}
+}
+```
 
 ### Internal debug ranking (for diagnostics)
 `GET /internal/debug/startbrief/ranking` returns full candidate rankings (summary + loops) with score components and selected winners.

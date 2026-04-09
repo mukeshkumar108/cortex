@@ -195,6 +195,16 @@ class SessionStartBriefEntityProfile(BaseModel):
     facts: List[str] = []
 
 
+class SessionStartBriefEntityHint(BaseModel):
+    entityId: Optional[str] = None
+    name: str
+    type: str = "other"
+    role: Optional[str] = None
+    importance: Optional[float] = None
+    salience: Optional[float] = None
+    lastSeenAt: Optional[str] = None
+
+
 class SessionStartBriefResponse(BaseModel):
     handover_text: str
     narrative: Optional[str] = None
@@ -203,7 +213,27 @@ class SessionStartBriefResponse(BaseModel):
     resume: Dict[str, Any] = {}
     ops_context: Dict[str, Any] = {}
     evidence: Dict[str, Any] = {}
+    entity_hints: List[SessionStartBriefEntityHint] = []
+    # Legacy surface; kept temporarily for compatibility.
     entity_profiles: List[SessionStartBriefEntityProfile] = []
+
+
+class EntityProfileRequest(BaseModel):
+    tenantId: str
+    userId: str
+    entityId: Optional[str] = None
+    name: Optional[str] = None
+    referenceTime: Optional[str] = None
+    includeOpenLoops: Optional[bool] = True
+    factsLimit: Optional[int] = 6
+    loopsLimit: Optional[int] = 3
+
+
+class EntityProfileResponse(BaseModel):
+    entity: Dict[str, Any]
+    keyFacts: List[Dict[str, Any]] = []
+    openLoops: List[Dict[str, Any]] = []
+    provenance: Dict[str, Any] = {}
 
 
 class SessionCloseRequest(BaseModel):

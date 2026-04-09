@@ -25,10 +25,13 @@ from .models import (
     SessionStartBriefResponse,
     SessionStartBriefItem,
     SessionStartBriefEntityProfile,
+    SessionStartBriefEntityHint,
     SessionCloseRequest,
     SessionIngestRequest,
     SessionIngestResponse,
     SessionBriefResponse,
+    EntityProfileRequest,
+    EntityProfileResponse,
     PurgeUserRequest,
     UserModelPatchRequest,
     UserModelResponse,
@@ -1241,6 +1244,359 @@ def _build_entity_profile_text(name: str, facts: List[str], relationship_type: O
         sentence_three = " ".join(sentence_three_parts)
         return _ensure_sentence_spacing(f"{lead} {sentence_two} {sentence_three}")
     return _ensure_sentence_spacing(f"{lead} {sentence_two}")
+
+
+def _entity_type_bucket(raw: Any) -> str:
+    lower = _normalize_text(raw).lower()
+    if not lower:
+        return "other"
+    if any(token in lower for token in ("person", "people", "human", "user")):
+        return "person"
+    if any(token in lower for token in ("project", "product", "startup", "app", "tool")):
+        return "project"
+    if any(token in lower for token in ("company", "organization", "org", "business")):
+        return "company"
+    if any(token in lower for token in ("place", "location", "city", "country", "environment")):
+        return "place"
+    return "other"
+
+
+_ENTITY_HINT_REJECT_TOKENS = {
+    "was", "is", "are", "be", "user", "assistant", "summary", "session", "update",
+}
+_ENTITY_HINT_PROPER_NOUN_STOPWORDS = {
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+    "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December",
+    "The", "This", "That",
+}
+
+
+def _allow_entity_hint_name(name: str, entity_type: str) -> bool:
+    clean = _normalize_text(name)
+    if not clean:
+        return False
+    lower = clean.lower()
+    if lower in _ENTITY_HINT_REJECT_TOKENS:
+        return False
+    if lower.startswith("session_summary_") or re.search(r"\bcm[a-z0-9]{8,}\b", lower):
+        return False
+    if re.fullmatch(r"[0-9a-f-]{16,}", lower):
+        return False
+    if "__" in clean or clean.count("_") >= 2:
+        return False
+    if entity_type != "person":
+        if len(re.findall(r"[A-Za-z0-9]+", clean)) < 2 and len(clean) < 8:
+            return False
+        if re.search(r"\b(quick update|major update|code base)\b", lower):
+            return False
+    return True
+
+
+def _extract_hints_from_summary_texts(
+    summaries: List[Dict[str, Any]],
+    existing_names: set[str],
+    relationship_names: set[str],
+    limit: int = 4,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in summaries or []:
+        summary_text = _normalize_text(row.get("summary_facts") or row.get("summary_text") or row.get("moment"))
+        if not summary_text:
+            continue
+        names = re.findall(r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?\b", summary_text)
+        for candidate in names:
+            clean = _normalize_text(candidate)
+            if not clean or clean in _ENTITY_HINT_PROPER_NOUN_STOPWORDS:
+                continue
+            lower = clean.lower()
+            if lower in existing_names:
+                continue
+            if lower in relationship_names:
+                entity_type = "person"
+            elif extract_location(clean):
+                entity_type = "place"
+            else:
+                entity_type = "other"
+            if not _allow_entity_hint_name(clean, entity_type):
+                continue
+            existing_names.add(lower)
+            out.append(
+                {
+                    "entityId": None,
+                    "name": clean,
+                    "type": entity_type,
+                    "role": None,
+                    "importance": 0.62,
+                    "salience": 0.62,
+                    "lastSeenAt": _normalize_text(row.get("created_at")) or None,
+                }
+            )
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _coerce_salience_float(raw: Any, default: float = 0.5) -> float:
+    text = _normalize_text(raw).lower()
+    if text in {"high", "h"}:
+        return 1.0
+    if text in {"medium", "med", "m"}:
+        return 0.7
+    if text in {"low", "l"}:
+        return 0.4
+    try:
+        v = float(raw)
+    except Exception:
+        return default
+    if v > 1.0:
+        v = v / 5.0 if v <= 5.0 else v / 10.0
+    return max(0.0, min(1.0, v))
+
+
+def _parse_entity_node_ts(node: Dict[str, Any]) -> Optional[datetime]:
+    for key in ("updated_at", "reference_time", "created_at"):
+        value = node.get(key)
+        dt = _parse_optional_dt(value)
+        if dt:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=dt_timezone.utc)
+            return dt.astimezone(dt_timezone.utc)
+    return None
+
+
+def _iso_or_none(value: Optional[datetime]) -> Optional[str]:
+    if not value:
+        return None
+    dt = value if value.tzinfo else value.replace(tzinfo=dt_timezone.utc)
+    return dt.astimezone(dt_timezone.utc).isoformat()
+
+
+def _entity_role_from_user_model(user_model: Dict[str, Any], entity_name: str) -> Optional[str]:
+    if not entity_name or not isinstance(user_model, dict):
+        return None
+    relationships = user_model.get("key_relationships")
+    if not isinstance(relationships, list):
+        return None
+    target = entity_name.lower()
+    for rel in relationships:
+        if not isinstance(rel, dict):
+            continue
+        name = _normalize_text(rel.get("name")).lower()
+        if not name or name != target:
+            continue
+        who = _normalize_text(rel.get("who")).lower()
+        return who or None
+    return None
+
+
+def _entity_importance_score(
+    entity_name: str,
+    entity_type: str,
+    role: Optional[str],
+    loop_texts: List[str],
+    candidate_texts: List[str],
+) -> float:
+    terms = _query_terms(entity_name)
+    recurrence_hits = 0
+    if terms:
+        for text in candidate_texts:
+            if _query_overlap_score(text, terms) >= 0.55:
+                recurrence_hits += 1
+    loop_hits = 0
+    for loop_text in loop_texts:
+        if terms and _query_overlap_score(loop_text, terms) >= 0.45:
+            loop_hits += 1
+    base = 0.3
+    if entity_type in {"person", "project"}:
+        base += 0.2
+    if role:
+        base += 0.2
+    base += min(0.2, recurrence_hits * 0.08)
+    base += min(0.2, loop_hits * 0.1)
+    return max(0.0, min(1.0, base))
+
+
+async def _build_entity_candidates(
+    tenant_id: str,
+    user_id: str,
+    reference_time: datetime,
+    user_model: Optional[Dict[str, Any]] = None,
+    context_texts: Optional[List[str]] = None,
+    max_hints: int = 8,
+) -> List[Dict[str, Any]]:
+    loop_rows = await loops.get_top_loops_for_startbrief(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        limit=12,
+        persona_id=None,
+    )
+    loop_texts: List[str] = [
+        _normalize_text(getattr(row, "text", ""))
+        for row in (loop_rows or [])
+        if _normalize_text(getattr(row, "text", ""))
+    ]
+    relationship_entities = _extract_valid_relationship_entities(user_model or {}, limit=10)
+    seed_names = [_normalize_text(x.get("name")) for x in relationship_entities if _normalize_text(x.get("name"))]
+    context_rows = [_normalize_text(x) for x in (context_texts or []) if _normalize_text(x)]
+    context_terms = _query_terms(" ".join(context_rows))
+    query_fragments = [
+        " ".join(context_rows[:2]),
+        " ".join(loop_texts[:2]),
+        " ".join(seed_names[:3]),
+    ]
+    queries = [q for q in query_fragments if _normalize_text(q)]
+    if not queries:
+        queries = [" ".join(loop_texts[:2]) or " ".join(seed_names[:2]) or "important person project"]
+
+    search_tasks = [
+        graphiti_client.search_nodes(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            query=q,
+            limit=10,
+            reference_time=reference_time,
+        )
+        for q in queries[:3]
+    ]
+    search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+    seen = set()
+    candidates: List[Dict[str, Any]] = []
+    text_pool: List[str] = []
+    for result in search_results:
+        if isinstance(result, Exception):
+            continue
+        for node in (result or []):
+            if not isinstance(node, dict):
+                continue
+            name = _normalize_text(node.get("summary"))
+            if not name:
+                continue
+            key = (_normalize_text(node.get("uuid")) or name).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            role = _entity_role_from_user_model(user_model or {}, name)
+            labels = node.get("labels") if isinstance(node.get("labels"), list) else []
+            raw_type = _normalize_text(node.get("type"))
+            if not raw_type and labels:
+                raw_type = " ".join([_normalize_text(x) for x in labels if _normalize_text(x)])
+            entity_type = _entity_type_bucket(raw_type)
+            if role:
+                entity_type = "person"
+            if not _allow_entity_hint_name(name, entity_type):
+                continue
+            if context_terms and _query_overlap_score(name, context_terms) < 0.2 and not role:
+                continue
+            ts = _parse_entity_node_ts(node)
+            salience = _coerce_salience_float((node.get("attributes") or {}).get("salience") if isinstance(node.get("attributes"), dict) else None)
+            recency = 0.3
+            if ts:
+                age_hours = max(0.0, (reference_time.astimezone(dt_timezone.utc) - ts).total_seconds() / 3600.0)
+                if age_hours <= 24:
+                    recency = 1.0
+                elif age_hours <= 72:
+                    recency = 0.75
+                elif age_hours <= 168:
+                    recency = 0.55
+            text_pool.append(name)
+            importance = _entity_importance_score(
+                entity_name=name,
+                entity_type=entity_type,
+                role=role,
+                loop_texts=loop_texts,
+                candidate_texts=text_pool,
+            )
+            confidence = 0.85 if _normalize_text(node.get("uuid")) else 0.6
+            score = (0.35 * recency) + (0.2 * salience) + (0.35 * importance) + (0.1 * confidence)
+            candidates.append(
+                {
+                    "entityId": _normalize_text(node.get("uuid")) or None,
+                    "name": name,
+                    "type": entity_type,
+                    "role": role,
+                    "importance": round(float(importance), 4),
+                    "salience": round(float(salience), 4),
+                    "lastSeenAt": _iso_or_none(ts),
+                    "score": round(float(score), 4),
+                    "raw": node,
+                }
+            )
+
+    for rel in relationship_entities:
+        name = _normalize_text(rel.get("name"))
+        role = _normalize_text(rel.get("who")).lower()
+        if not name:
+            continue
+        if not _allow_entity_hint_name(name, "person"):
+            continue
+        key = name.lower()
+        if any(_normalize_text(c.get("name")).lower() == key for c in candidates):
+            continue
+        importance = _entity_importance_score(
+            entity_name=name,
+            entity_type="person",
+            role=role,
+            loop_texts=loop_texts,
+            candidate_texts=text_pool,
+        )
+        salience = 0.7
+        score = (0.35 * 0.6) + (0.2 * salience) + (0.35 * importance) + (0.1 * 0.65)
+        candidates.append(
+            {
+                "entityId": None,
+                "name": name,
+                "type": "person",
+                "role": role or None,
+                "importance": round(float(importance), 4),
+                "salience": round(float(salience), 4),
+                "lastSeenAt": None,
+                "score": round(float(score), 4),
+                "raw": {},
+            }
+        )
+
+    candidates.sort(
+        key=lambda x: (
+            float(x.get("salience") or 0.0),
+            float(x.get("importance") or 0.0),
+            float(x.get("score") or 0.0),
+            _normalize_text(x.get("lastSeenAt")),
+        ),
+        reverse=True,
+    )
+    return candidates[: max(1, min(int(max_hints or 8), 10))]
+
+
+def _resolve_entity_candidate(
+    candidates: List[Dict[str, Any]],
+    entity_id: Optional[str],
+    name: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    normalized_id = _normalize_text(entity_id)
+    normalized_name = _normalize_text(name)
+    if normalized_id:
+        for row in candidates:
+            if _normalize_text(row.get("entityId")) == normalized_id:
+                return row
+    if normalized_name:
+        target = normalized_name.lower()
+        for row in candidates:
+            if _normalize_text(row.get("name")).lower() == target:
+                return row
+        for row in candidates:
+            if target in _normalize_text(row.get("name")).lower():
+                return row
+    return candidates[0] if candidates else None
+
+
+def _days_since_iso(iso_value: Optional[str], reference_time: datetime) -> Optional[int]:
+    dt = _parse_optional_dt(iso_value)
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=dt_timezone.utc)
+    ref = reference_time if reference_time.tzinfo else reference_time.replace(tzinfo=dt_timezone.utc)
+    return max(0, int((ref.astimezone(dt_timezone.utc) - dt.astimezone(dt_timezone.utc)).total_seconds() // 86400))
 
 
 def _merge_patterns(existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -8867,6 +9223,7 @@ async def session_startbrief(
         user_model_narrative: Optional[str] = None
         user_model_narrative_stable: Optional[str] = None
         user_model_narrative_current: Optional[str] = None
+        entity_hints: List[SessionStartBriefEntityHint] = []
         entity_profiles: List[SessionStartBriefEntityProfile] = []
         resume_bridge_text: Optional[str] = None
         resume_use_bridge = False
@@ -9284,6 +9641,70 @@ async def session_startbrief(
         except Exception as e:
             logger.error(f"startbrief user model hint lookup failed: {e}")
 
+        try:
+            raw_entity_hints = await _build_entity_candidates(
+                tenant_id=tenantId,
+                user_id=userId,
+                reference_time=reference_now,
+                user_model=user_model_data,
+                context_texts=[
+                    _normalize_text(x.get("summary_facts"))
+                    for x in recent_session_summaries[:4]
+                    if isinstance(x, dict) and _normalize_text(x.get("summary_facts"))
+                ],
+                max_hints=8,
+            )
+            entity_hints = [
+                SessionStartBriefEntityHint(
+                    entityId=_normalize_text(item.get("entityId")) or None,
+                    name=_normalize_text(item.get("name")) or "unknown",
+                    type=_normalize_text(item.get("type")) or "other",
+                    role=_normalize_text(item.get("role")) or None,
+                    importance=float(item.get("importance")) if item.get("importance") is not None else None,
+                    salience=float(item.get("salience")) if item.get("salience") is not None else None,
+                    lastSeenAt=_normalize_text(item.get("lastSeenAt")) or None,
+                )
+                for item in (raw_entity_hints or [])
+                if _normalize_text(item.get("name"))
+            ][:10]
+            if len(entity_hints) < 3:
+                relationship_names = {
+                    _normalize_text(x.get("name")).lower()
+                    for x in _extract_valid_relationship_entities(user_model_data, limit=20)
+                    if _normalize_text(x.get("name"))
+                }
+                existing_names = {_normalize_text(x.name).lower() for x in entity_hints if _normalize_text(x.name)}
+                fallback_rows = _extract_hints_from_summary_texts(
+                    summaries=recent_session_summaries[:6],
+                    existing_names=existing_names,
+                    relationship_names=relationship_names,
+                    limit=6,
+                )
+                for item in fallback_rows:
+                    entity_hints.append(
+                        SessionStartBriefEntityHint(
+                            entityId=None,
+                            name=_normalize_text(item.get("name")) or "unknown",
+                            type=_normalize_text(item.get("type")) or "other",
+                            role=None,
+                            importance=float(item.get("importance") or 0.0),
+                            salience=float(item.get("salience") or 0.0),
+                            lastSeenAt=_normalize_text(item.get("lastSeenAt")) or None,
+                        )
+                    )
+                entity_hints = sorted(
+                    entity_hints,
+                    key=lambda x: (
+                        float(x.salience or 0.0),
+                        float(x.importance or 0.0),
+                        _normalize_text(x.lastSeenAt),
+                    ),
+                    reverse=True,
+                )[:10]
+        except Exception as e:
+            logger.error("startbrief entity hints build failed: %s", e)
+            entity_hints = []
+
         sessions_today_count = 0
         local_day = reference_now.date()
         try:
@@ -9532,6 +9953,7 @@ async def session_startbrief(
                 "daily_analysis_date_used": daily_analysis_date_used,
                 "freshness": ingest_freshness,
             },
+            entity_hints=entity_hints,
             entity_profiles=entity_profiles,
         )
         try:
@@ -9557,6 +9979,168 @@ async def session_startbrief(
     except Exception as e:
         logger.error(f"Session startbrief failed: {e}")
         raise HTTPException(status_code=500, detail="Session startbrief failed")
+
+
+@app.post("/entities/profile", response_model=EntityProfileResponse)
+async def entities_profile(request: EntityProfileRequest):
+    try:
+        tenant_id = _normalize_text(_canonical_tenant_id(request.tenantId)) or request.tenantId
+        user_id = _normalize_text(request.userId)
+        entity_id = _normalize_text(request.entityId)
+        name = _normalize_text(request.name)
+        if not entity_id and not name:
+            raise HTTPException(status_code=400, detail="Provide entityId or name")
+
+        reference_time = datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+        if request.referenceTime:
+            value = _normalize_text(request.referenceTime)
+            if value.endswith("Z"):
+                value = value.replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(value)
+            reference_time = parsed if parsed.tzinfo else parsed.replace(tzinfo=dt_timezone.utc)
+
+        user_model: Dict[str, Any] = {}
+        try:
+            _, tenant_scope = _resolve_tenant_scope(tenant_id)
+            rows = await _fetch_user_model_rows_for_scope(tenant_scope=tenant_scope, user_id=user_id)
+            if rows:
+                user_model = _normalize_user_model(rows[0].get("model"))
+        except Exception:
+            user_model = {}
+
+        candidates = await _build_entity_candidates(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            reference_time=reference_time,
+            user_model=user_model,
+            context_texts=[name] if name else None,
+            max_hints=10,
+        )
+        selected = _resolve_entity_candidate(candidates, entity_id=entity_id, name=name)
+        if not selected and entity_id:
+            raise HTTPException(status_code=404, detail="Entity not found")
+        if not selected:
+            selected = {
+                "entityId": None,
+                "name": name or "unknown",
+                "type": "other",
+                "role": None,
+                "importance": 0.5,
+                "salience": 0.5,
+                "lastSeenAt": None,
+                "score": 0.5,
+                "raw": {},
+            }
+
+        canonical_name = _normalize_text(selected.get("name"))
+        aliases: List[str] = []
+        raw_attrs = selected.get("raw", {}).get("attributes") if isinstance(selected.get("raw"), dict) else {}
+        if isinstance(raw_attrs, dict):
+            aliases_raw = raw_attrs.get("aliases")
+            if isinstance(aliases_raw, list):
+                aliases = _dedupe_keep_order([_normalize_text(x) for x in aliases_raw if _normalize_text(x)], limit=8)
+
+        facts_limit = max(1, min(int(request.factsLimit or 6), 10))
+        loops_limit = max(0, min(int(request.loopsLimit or 3), 8))
+        facts_rows = await graphiti_client.search_facts(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            query=canonical_name,
+            limit=max(facts_limit * 2, 8),
+            reference_time=reference_time,
+        )
+        entity_terms = _query_terms(canonical_name)
+        key_facts: List[Dict[str, Any]] = []
+        seen_facts = set()
+        for row in facts_rows or []:
+            if not isinstance(row, dict):
+                continue
+            text = _normalize_text(row.get("text"))
+            if not text or not _allow_fact_text(text):
+                continue
+            if entity_terms and _query_overlap_score(text, entity_terms) < 0.35 and canonical_name.lower() not in text.lower():
+                continue
+            key = text.lower()
+            if key in seen_facts:
+                continue
+            seen_facts.add(key)
+            valid_at = row.get("valid_at")
+            invalid_at = row.get("invalid_at")
+            key_facts.append(
+                {
+                    "text": _shorten_line(text, 220),
+                    "confidence": _normalize_confidence(row.get("relevance"), default=0.6),
+                    "validAt": valid_at.isoformat() if isinstance(valid_at, datetime) else _normalize_text(valid_at) or None,
+                    "invalidAt": invalid_at.isoformat() if isinstance(invalid_at, datetime) else _normalize_text(invalid_at) or None,
+                }
+            )
+            if len(key_facts) >= facts_limit:
+                break
+
+        open_loops: List[Dict[str, Any]] = []
+        if bool(request.includeOpenLoops) and loops_limit > 0:
+            top_loops = await loops.get_top_loops_for_startbrief(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                limit=18,
+                persona_id=None,
+            )
+            for item in top_loops or []:
+                text = _normalize_text(getattr(item, "text", ""))
+                if not text:
+                    continue
+                if entity_terms and _query_overlap_score(text, entity_terms) < 0.45:
+                    continue
+                open_loops.append(
+                    {
+                        "id": _normalize_text(getattr(item, "id", None)) or "",
+                        "type": _normalize_text(getattr(item, "type", "")) or None,
+                        "text": _shorten_line(text, 180),
+                        "status": _normalize_text(getattr(item, "status", "")) or None,
+                        "salience": int(getattr(item, "salience", 0) or 0),
+                    }
+                )
+                if len(open_loops) >= loops_limit:
+                    break
+
+        summary_parts: List[str] = []
+        if key_facts:
+            summary_parts.append(_shorten_line(key_facts[0].get("text") or "", 180))
+        if len(key_facts) > 1:
+            summary_parts.append(_shorten_line(key_facts[1].get("text") or "", 180))
+        summary = " ".join([p for p in summary_parts if p]) or f"{canonical_name} appears in memory context."
+        last_seen = _normalize_text(selected.get("lastSeenAt")) or None
+        response_payload = EntityProfileResponse(
+            entity={
+                "entityId": _normalize_text(selected.get("entityId")) or None,
+                "canonicalName": canonical_name,
+                "type": _normalize_text(selected.get("type")) or "other",
+                "aliases": aliases,
+                "summary": summary,
+                "role": _normalize_text(selected.get("role")) or None,
+                "relationship": _normalize_text(selected.get("role")) or None,
+                "importance": float(selected.get("importance") or 0.0),
+                "salience": float(selected.get("salience") or 0.0),
+                "recency": {
+                    "lastSeenAt": last_seen,
+                    "daysSinceSeen": _days_since_iso(last_seen, reference_time),
+                },
+            },
+            keyFacts=key_facts,
+            openLoops=open_loops,
+            provenance={
+                "sources": ["graphiti_nodes", "graphiti_facts", "user_model", "loops"],
+                "resolvedBy": "entityId" if entity_id else "name",
+                "queryUsed": canonical_name,
+                "generatedAt": reference_time.isoformat(),
+            },
+        )
+        return response_payload
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("entities/profile failed: %s", e)
+        raise HTTPException(status_code=500, detail="Entity profile failed")
 
 
 @app.post("/admin/purgeUser")
