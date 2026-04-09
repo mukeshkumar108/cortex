@@ -370,7 +370,8 @@ Notes:
 - `evidence.claim_ranking` and `evidence.loop_ranking` explain precedence decisions.
 - `salience` means immediate urgency/intensity; `importance` means durable relevance over time.
 - `entity_hints` is the compact ambient grounding surface for mentioned people/projects/places.
-- `entity_profiles` are relationship-focused profiles built from user model + Graphiti facts.
+- `entity_hints.role` is inferred from user-model relationships first, then recent summary relationship mentions.
+- `entity_profiles` is legacy compatibility (internal-only) and not the canonical startup grounding surface.
 
 ### POST /entities/profile
 Compact entity identity card for assistant runtime use.

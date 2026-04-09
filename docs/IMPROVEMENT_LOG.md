@@ -49,6 +49,10 @@ Purpose: running implementation log for memory quality and retrieval/startbrief 
 - Added `POST /internal/debug/entities/profile`:
   - returns computed profile + entity candidate ranking
   - includes fact keep/drop diagnostics and loop match diagnostics
+- Tightened relationship identity typing in the shared entity builder:
+  - role evidence is merged from user model + recent summary mentions
+  - known relationship names are promoted to `person` (instead of drifting to `other`)
+  - fallback startbrief `entity_hints` now carry role when available
 
 ### Why this matters
 - Prevents stale memories from overriding fresh corrections.

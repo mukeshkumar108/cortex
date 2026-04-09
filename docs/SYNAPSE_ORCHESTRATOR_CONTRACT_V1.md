@@ -396,6 +396,7 @@ Notes:
   - `salience` = immediate urgency/intensity
   - `importance` = durable relevance across recurrence/persistence
 - `entity_hints` = compact ambient grounding surface (preferred for startup context).
+- `entity_hints.role` resolves from user-model relationship evidence first, then recent summary mentions.
 - `entity_profiles` is legacy compatibility and may be removed after entity_hints migration.
 
 ---

@@ -1269,6 +1269,14 @@ _ENTITY_HINT_PROPER_NOUN_STOPWORDS = {
     "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December",
     "The", "This", "That",
 }
+_RELATIONSHIP_ROLE_MENTION_RE = re.compile(
+    r"\b(partner|wife|husband|girlfriend|boyfriend|daughter|son|mother|father|mom|dad|sister|brother|friend)\s+([A-Z][a-z]+)\b",
+    flags=re.IGNORECASE,
+)
+_RELATIONSHIP_ROLE_ALIASES = {
+    "mom": "mother",
+    "dad": "father",
+}
 
 
 def _allow_entity_hint_name(name: str, entity_type: str) -> bool:
@@ -1296,9 +1304,11 @@ def _extract_hints_from_summary_texts(
     summaries: List[Dict[str, Any]],
     existing_names: set[str],
     relationship_names: set[str],
+    relationship_roles: Optional[Dict[str, str]] = None,
     limit: int = 4,
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
+    role_index = relationship_roles if isinstance(relationship_roles, dict) else {}
     for row in summaries or []:
         summary_text = _normalize_text(row.get("summary_facts") or row.get("summary_text") or row.get("moment"))
         if not summary_text:
@@ -1311,7 +1321,8 @@ def _extract_hints_from_summary_texts(
             lower = clean.lower()
             if lower in existing_names:
                 continue
-            if lower in relationship_names:
+            role = _normalize_text(role_index.get(lower)).lower() or None
+            if lower in relationship_names or role:
                 entity_type = "person"
             elif extract_location(clean):
                 entity_type = "place"
@@ -1325,15 +1336,48 @@ def _extract_hints_from_summary_texts(
                     "entityId": None,
                     "name": clean,
                     "type": entity_type,
-                    "role": None,
-                    "importance": 0.62,
-                    "salience": 0.62,
+                    "role": role,
+                    "importance": 0.72 if role else 0.62,
+                    "salience": 0.72 if role else 0.62,
                     "lastSeenAt": _normalize_text(row.get("created_at")) or None,
                 }
             )
             if len(out) >= limit:
                 return out
     return out
+
+
+def _normalize_relationship_role(value: Any) -> str:
+    role = _normalize_text(value).lower()
+    if not role:
+        return ""
+    return _RELATIONSHIP_ROLE_ALIASES.get(role, role)
+
+
+def _extract_relationship_roles_from_texts(
+    texts: List[str],
+) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for raw in texts or []:
+        text = _normalize_text(raw)
+        if not text:
+            continue
+        for role, name in _RELATIONSHIP_ROLE_MENTION_RE.findall(text):
+            clean_name = _normalize_text(name)
+            clean_role = _normalize_relationship_role(role)
+            if not clean_name or not clean_role:
+                continue
+            out.setdefault(clean_name.lower(), clean_role)
+    return out
+
+
+def _extract_relationship_roles_from_summaries(
+    summaries: List[Dict[str, Any]],
+) -> Dict[str, str]:
+    texts: List[str] = []
+    for row in summaries or []:
+        texts.append(_normalize_text(row.get("summary_facts") or row.get("summary_text") or row.get("moment")))
+    return _extract_relationship_roles_from_texts(texts)
 
 
 def _coerce_salience_float(raw: Any, default: float = 0.5) -> float:
@@ -1438,6 +1482,16 @@ async def _build_entity_candidates(
     relationship_entities = _extract_valid_relationship_entities(user_model or {}, limit=10)
     seed_names = [_normalize_text(x.get("name")) for x in relationship_entities if _normalize_text(x.get("name"))]
     context_rows = [_normalize_text(x) for x in (context_texts or []) if _normalize_text(x)]
+    relationship_role_index: Dict[str, str] = {}
+    for rel in relationship_entities:
+        rel_name = _normalize_text(rel.get("name")).lower()
+        rel_role = _normalize_relationship_role(rel.get("who"))
+        if rel_name and rel_role:
+            relationship_role_index.setdefault(rel_name, rel_role)
+    for rel_name, rel_role in _extract_relationship_roles_from_texts(context_rows).items():
+        if rel_name and rel_role:
+            relationship_role_index.setdefault(rel_name, rel_role)
+
     context_terms = _query_terms(" ".join(context_rows))
     query_fragments = [
         " ".join(context_rows[:2]),
@@ -1475,7 +1529,10 @@ async def _build_entity_candidates(
             if key in seen:
                 continue
             seen.add(key)
-            role = _entity_role_from_user_model(user_model or {}, name)
+            role = (
+                relationship_role_index.get(name.lower())
+                or _entity_role_from_user_model(user_model or {}, name)
+            )
             labels = node.get("labels") if isinstance(node.get("labels"), list) else []
             raw_type = _normalize_text(node.get("type"))
             if not raw_type and labels:
@@ -1524,7 +1581,7 @@ async def _build_entity_candidates(
 
     for rel in relationship_entities:
         name = _normalize_text(rel.get("name"))
-        role = _normalize_text(rel.get("who")).lower()
+        role = _normalize_relationship_role(rel.get("who"))
         if not name:
             continue
         if not _allow_entity_hint_name(name, "person"):
@@ -9668,6 +9725,15 @@ async def session_startbrief(
                 if _normalize_text(item.get("name"))
             ][:10]
             if len(entity_hints) < 3:
+                relationship_roles = {
+                    _normalize_text(x.get("name")).lower(): _normalize_relationship_role(x.get("who"))
+                    for x in _extract_valid_relationship_entities(user_model_data, limit=20)
+                    if _normalize_text(x.get("name"))
+                }
+                summary_role_hints = _extract_relationship_roles_from_summaries(recent_session_summaries[:6])
+                for rel_name, rel_role in summary_role_hints.items():
+                    if rel_name and rel_role:
+                        relationship_roles.setdefault(rel_name, rel_role)
                 relationship_names = {
                     _normalize_text(x.get("name")).lower()
                     for x in _extract_valid_relationship_entities(user_model_data, limit=20)
@@ -9678,6 +9744,7 @@ async def session_startbrief(
                     summaries=recent_session_summaries[:6],
                     existing_names=existing_names,
                     relationship_names=relationship_names,
+                    relationship_roles=relationship_roles,
                     limit=6,
                 )
                 for item in fallback_rows:
@@ -9686,7 +9753,7 @@ async def session_startbrief(
                             entityId=None,
                             name=_normalize_text(item.get("name")) or "unknown",
                             type=_normalize_text(item.get("type")) or "other",
-                            role=None,
+                            role=_normalize_text(item.get("role")) or None,
                             importance=float(item.get("importance") or 0.0),
                             salience=float(item.get("salience") or 0.0),
                             lastSeenAt=_normalize_text(item.get("lastSeenAt")) or None,
@@ -10020,11 +10087,14 @@ async def entities_profile(request: EntityProfileRequest):
         if not selected and entity_id:
             raise HTTPException(status_code=404, detail="Entity not found")
         if not selected:
+            fallback_name = name or "unknown"
+            fallback_role = _entity_role_from_user_model(user_model, fallback_name)
+            fallback_type = "person" if fallback_role else "other"
             selected = {
                 "entityId": None,
-                "name": name or "unknown",
-                "type": "other",
-                "role": None,
+                "name": fallback_name,
+                "type": fallback_type,
+                "role": fallback_role,
                 "importance": 0.5,
                 "salience": 0.5,
                 "lastSeenAt": None,

@@ -29,3 +29,21 @@ Backend-facing rule of thumb: one canonical startup packet, then call targeted s
 - Call `/user/model` for durable user picture at startup (or cache per session and refresh as needed).
 - Use `/session/startbrief.entity_hints` for ambient grounding, then call `/entities/profile` only for entities you need to reason about deeply.
 - Call `/session/ingest` as canonical write-back/finalization for full transcript persistence.
+
+## Startup packet fields to forward to the LLM
+From `/session/startbrief`, backend should forward:
+- `handover_text`: concise continuity context.
+- `narrative`: filtered current/stable narrative context.
+- `resume`: bridge-mode controls and bridge text.
+- `time_context`: local temporal grounding.
+- `ops_context`: structured steering context.
+- `evidence`: ranking/freshness provenance (`claim_ranking`, `loop_ranking`, defs, freshness info).
+- `entity_hints`: compact ambient entity grounding (`entityId`, `name`, `type`, `role`, `importance`, `salience`, `lastSeenAt`).
+
+`entity_profiles` is legacy compatibility and should not be the primary startup grounding surface.
+
+## Backend change note (2026-04-09)
+- `/session/startbrief` now contains explicit ranking evidence and freshness diagnostics.
+- Ambient entity grounding is now first-class via `entity_hints`.
+- Entity deep-dive is available via `POST /entities/profile`.
+- Relationship identity handling in shared entity builder now promotes known relationship names to `person` with role when reliable role evidence exists in user model or recent summaries.

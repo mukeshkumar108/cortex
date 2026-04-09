@@ -32,6 +32,10 @@
   - drops stale relative-time drift unless currently evidenced
   - removes contradiction lines against newer relationship evidence
   - falls back to top scored evidence when generated narrative is over-filtered
+- Shared entity builder relationship handling tightened:
+  - known relationship names are promoted to `person` with role when role evidence exists
+  - role evidence now merges user-model relationships with recent summary relationship mentions
+  - startbrief fallback `entity_hints` now preserve detected relationship role
 
 ### Validation Outcomes
 - v1 eval pack (`10` cases): `improved=6`, `regressed=0`, `unchanged=4`
