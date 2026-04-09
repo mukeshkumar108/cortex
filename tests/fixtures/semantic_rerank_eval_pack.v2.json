@@ -1,0 +1,859 @@
+{
+  "version": "v2",
+  "description": "Expanded pressure pack with indirect, mixed-language, shame/self-image, and overlapping-domain cases.",
+  "cases": [
+    {
+      "id": "c1_relationship_finance_emotional",
+      "query": "what is stressing him most with his partner right now",
+      "tags": [
+        "emotional",
+        "mixed_domain",
+        "relationship",
+        "finance"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u5"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "My partner says she is carrying me financially and it hit hard."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "I avoid opening the rent app because my chest tightens."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "I promised to wake by 7 and walk daily."
+        },
+        {
+          "id": "u4",
+          "source": "user_model",
+          "text": "Current focus: shipping onboarding for the release."
+        },
+        {
+          "id": "u5",
+          "source": "graphiti_session_summary",
+          "text": "They argued late about money and feeling unsupported."
+        },
+        {
+          "id": "u6",
+          "source": "graphiti_fact",
+          "text": "I made lentil soup and watched a movie."
+        }
+      ]
+    },
+    {
+      "id": "c2_multilingual_spanish_sleep",
+      "query": "sleep and stress pattern this week",
+      "tags": [
+        "multilingual",
+        "spanish",
+        "wellness",
+        "routines"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u4"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "Duermo fatal, me despierto a las 3 y luego no regreso."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "Cuando no duermo me pongo irritable con todos."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "Client demo moved to Friday."
+        },
+        {
+          "id": "u4",
+          "source": "graphiti_session_summary",
+          "text": "Routine slipped all week: late phone scrolling, short sleep, high stress."
+        },
+        {
+          "id": "u5",
+          "source": "graphiti_fact",
+          "text": "I want to learn Rust in the evenings."
+        },
+        {
+          "id": "u6",
+          "source": "user_model",
+          "text": "Work context: preparing investor update deck."
+        }
+      ]
+    },
+    {
+      "id": "c3_multilingual_german_work_anxiety",
+      "query": "what work pressure is he feeling",
+      "tags": [
+        "multilingual",
+        "german",
+        "work",
+        "worries"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u4"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "Im Job fuehle ich mich gehetzt, alles ist dringend."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "Der Kunde droht abzuspringen wenn wir den Termin reissen."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "My sister visited and we cooked."
+        },
+        {
+          "id": "u4",
+          "source": "graphiti_session_summary",
+          "text": "Deadline fear plus uncertainty about team capacity."
+        },
+        {
+          "id": "u5",
+          "source": "graphiti_fact",
+          "text": "I should drink more water."
+        },
+        {
+          "id": "u6",
+          "source": "user_model",
+          "text": "Pattern: Juggles multiple active commitments and threads."
+        }
+      ]
+    },
+    {
+      "id": "c4_indirect_emotion",
+      "query": "how is he feeling emotionally",
+      "tags": [
+        "indirect",
+        "emotional",
+        "worries"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u4"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "Everything feels loud and bright and I cannot settle."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "My body is tired but my mind keeps sprinting."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "Need to buy detergent and eggs."
+        },
+        {
+          "id": "u4",
+          "source": "graphiti_session_summary",
+          "text": "Overwhelm and restlessness dominated the evening."
+        },
+        {
+          "id": "u5",
+          "source": "user_model",
+          "text": "Current focus: finalize release notes."
+        },
+        {
+          "id": "u6",
+          "source": "graphiti_fact",
+          "text": "I read 20 pages of a novel."
+        }
+      ]
+    },
+    {
+      "id": "c5_mixed_domain_health_work",
+      "query": "what is blocking consistency with workouts",
+      "tags": [
+        "mixed_domain",
+        "health",
+        "work",
+        "routines"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u5"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "I skip workouts when meetings spill into the night."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "My knee flared up again after the run."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "I sent the investor memo."
+        },
+        {
+          "id": "u4",
+          "source": "user_model",
+          "text": "north star health goal: move daily and sleep on time."
+        },
+        {
+          "id": "u5",
+          "source": "graphiti_session_summary",
+          "text": "Intent to train is high but work spillover and pain interrupt routine."
+        },
+        {
+          "id": "u6",
+          "source": "graphiti_fact",
+          "text": "My partner likes the new couch color."
+        }
+      ]
+    },
+    {
+      "id": "c6_multilingual_arabic_romanized_relationship",
+      "query": "relationship tension pattern",
+      "tags": [
+        "multilingual",
+        "relationship",
+        "emotional",
+        "mixed_domain"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u4"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "Ana daiman baskut waqt el khena2 w ba3den andam."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "She says I disappear into work when things get hard."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "Need to renew hosting and domain."
+        },
+        {
+          "id": "u4",
+          "source": "graphiti_session_summary",
+          "text": "Repeated rupture-repair cycle: withdrawal during conflict, remorse later."
+        },
+        {
+          "id": "u5",
+          "source": "user_model",
+          "text": "Work context: pushing API reliability fixes."
+        },
+        {
+          "id": "u6",
+          "source": "graphiti_fact",
+          "text": "I enjoyed mint tea after dinner."
+        }
+      ]
+    },
+    {
+      "id": "c7_goal_vs_state",
+      "query": "is this a commitment or just reflection",
+      "tags": [
+        "intent",
+        "goal",
+        "state"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u4"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "I will send the apology message tonight."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "I keep rehearsing it and freezing."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "The weather is nicer now."
+        },
+        {
+          "id": "u4",
+          "source": "graphiti_session_summary",
+          "text": "Clear commitment stated, but fear-based delay pattern remains."
+        },
+        {
+          "id": "u5",
+          "source": "user_model",
+          "text": "Pattern: avoids high-stakes conversations when dysregulated."
+        },
+        {
+          "id": "u6",
+          "source": "graphiti_fact",
+          "text": "I fixed a small CSS issue."
+        }
+      ]
+    },
+    {
+      "id": "c8_finance_multilingual_french",
+      "query": "money anxiety and rent risk",
+      "tags": [
+        "multilingual",
+        "french",
+        "finance",
+        "worries"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u5"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "Je stresse pour le loyer, le compte baisse trop vite."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "I keep delaying the budget sheet because it makes me panic."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "Morning walk felt good today."
+        },
+        {
+          "id": "u4",
+          "source": "user_model",
+          "text": "Current focus: close onboarding bug backlog."
+        },
+        {
+          "id": "u5",
+          "source": "graphiti_session_summary",
+          "text": "Financial pressure is tightly linked to avoidance and shame."
+        },
+        {
+          "id": "u6",
+          "source": "graphiti_fact",
+          "text": "I watched a football match."
+        }
+      ]
+    },
+    {
+      "id": "c9_learning_vs_work_noise",
+      "query": "what learning goal is active",
+      "tags": [
+        "learning",
+        "work",
+        "mixed_domain"
+      ],
+      "expected_ids": [
+        "u1",
+        "u3",
+        "u5"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "I want to practice SQL joins every morning for 20 minutes."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "Production incidents keep eating my evenings."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "I enrolled in a short systems design course."
+        },
+        {
+          "id": "u4",
+          "source": "user_model",
+          "text": "Work context: stabilizing release pipeline."
+        },
+        {
+          "id": "u5",
+          "source": "graphiti_session_summary",
+          "text": "Learning goals exist but are fragile under work load."
+        },
+        {
+          "id": "u6",
+          "source": "graphiti_fact",
+          "text": "I cleaned the kitchen counter."
+        }
+      ]
+    },
+    {
+      "id": "c10_home_health_overlap",
+      "query": "which home factors affect his health habits",
+      "tags": [
+        "home",
+        "health",
+        "mixed_domain"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u5"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "When the apartment is cluttered I stop cooking and order junk."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "Noisy neighbors at night wreck my sleep."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "Client asked for another analytics chart."
+        },
+        {
+          "id": "u4",
+          "source": "user_model",
+          "text": "north star work goal: ship reliable weekly cadence."
+        },
+        {
+          "id": "u5",
+          "source": "graphiti_session_summary",
+          "text": "Home environment cues are tightly coupled with food and sleep behavior."
+        },
+        {
+          "id": "u6",
+          "source": "graphiti_fact",
+          "text": "I replied to two emails."
+        }
+      ]
+    },
+    {
+      "id": "c11_indirect_shame_self_image",
+      "query": "what shame or self-image pattern is showing up lately",
+      "tags": [
+        "indirect",
+        "shame",
+        "self_image",
+        "emotional",
+        "overlapping_domain"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u5"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "I keep dodging voice notes because I sound small in my own head."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "When I miss one task I start feeling like a fraud all day."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "I replaced a broken charger and reorganized my desk."
+        },
+        {
+          "id": "u4",
+          "source": "user_model",
+          "text": "Current focus: wrap sprint tickets and prepare handoff."
+        },
+        {
+          "id": "u5",
+          "source": "graphiti_session_summary",
+          "text": "Self-image drops quickly after minor slips, then avoidance expands."
+        },
+        {
+          "id": "u6",
+          "source": "graphiti_fact",
+          "text": "I watched highlights and made tea before bed."
+        }
+      ]
+    },
+    {
+      "id": "c12_mixed_language_ar_fr_finance_identity",
+      "query": "where is money shame leaking into identity",
+      "tags": [
+        "multilingual",
+        "arabic_romanized",
+        "french",
+        "finance",
+        "shame",
+        "self_image",
+        "mixed_domain"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u5"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "Je fais semblant que ca va, mais la facture du loyer me fait me sentir nul."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "Lama ashoof hesab banki bahess enni fail, fa batjanab el mawdoo3."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "I merged two pull requests and fixed CI."
+        },
+        {
+          "id": "u4",
+          "source": "user_model",
+          "text": "Current focus: improve onboarding funnel conversion."
+        },
+        {
+          "id": "u5",
+          "source": "graphiti_session_summary",
+          "text": "Financial stress repeatedly turns into identity shame and withdrawal."
+        },
+        {
+          "id": "u6",
+          "source": "graphiti_fact",
+          "text": "I cleaned the balcony and watered plants."
+        }
+      ]
+    },
+    {
+      "id": "c13_overlap_work_relationship_selfworth",
+      "query": "how are work setbacks affecting his self-worth and relationship behavior",
+      "tags": [
+        "overlapping_domain",
+        "work",
+        "relationships",
+        "self_image",
+        "emotional"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u5"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "After the demo failed, I went quiet with my partner all night."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "When work slips, I feel unlovable and pull away from everyone."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "Need to renew SSL certificates this week."
+        },
+        {
+          "id": "u4",
+          "source": "user_model",
+          "text": "Work context: stabilizing release pipeline."
+        },
+        {
+          "id": "u5",
+          "source": "graphiti_session_summary",
+          "text": "Work disappointment repeatedly spills into relationship withdrawal and self-worth collapse."
+        },
+        {
+          "id": "u6",
+          "source": "graphiti_fact",
+          "text": "I changed my keyboard switches."
+        }
+      ]
+    },
+    {
+      "id": "c14_indirect_mixed_language_planning_mask",
+      "query": "what feeling is underneath all the planning talk",
+      "tags": [
+        "indirect",
+        "multilingual",
+        "spanish",
+        "emotional",
+        "mixed_domain"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u5"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "Hablo de planes todo el dia para no sentir el nudo en el pecho."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "I keep making lists because stopping makes the fear louder."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "Bought detergent, eggs, and batteries."
+        },
+        {
+          "id": "u4",
+          "source": "user_model",
+          "text": "Current focus: finalize release notes."
+        },
+        {
+          "id": "u5",
+          "source": "graphiti_session_summary",
+          "text": "Planning behavior appears to function as protection from fear and overwhelm."
+        },
+        {
+          "id": "u6",
+          "source": "graphiti_fact",
+          "text": "I read 15 pages and slept early."
+        }
+      ]
+    },
+    {
+      "id": "c15_german_english_shame_performance",
+      "query": "what shame signal appears around performance",
+      "tags": [
+        "multilingual",
+        "german",
+        "english",
+        "shame",
+        "self_image",
+        "work"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u5"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "Wenn ich einen Fehler mache fuehle ich mich sofort wertlos im Team."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "I over-explain every delay because I assume they think I am incompetent."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "The weather is cooler and I walked to the store."
+        },
+        {
+          "id": "u4",
+          "source": "user_model",
+          "text": "Current focus: close onboarding bug backlog."
+        },
+        {
+          "id": "u5",
+          "source": "graphiti_session_summary",
+          "text": "Performance pressure quickly translates into shame and defensive communication."
+        },
+        {
+          "id": "u6",
+          "source": "graphiti_fact",
+          "text": "I switched to a new note-taking app."
+        }
+      ]
+    },
+    {
+      "id": "c16_overlap_home_body_image",
+      "query": "which home factors are worsening body-image anxiety",
+      "tags": [
+        "overlapping_domain",
+        "home",
+        "health",
+        "self_image",
+        "emotional"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u5"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "When the apartment is messy I avoid mirrors and skip meals."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "No sleep from noisy neighbors makes me judge my body harsher next day."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "Client requested another dashboard variant."
+        },
+        {
+          "id": "u4",
+          "source": "user_model",
+          "text": "north star work goal: ship reliable weekly cadence."
+        },
+        {
+          "id": "u5",
+          "source": "graphiti_session_summary",
+          "text": "Home chaos and poor sleep amplify body-image anxiety and avoidance routines."
+        },
+        {
+          "id": "u6",
+          "source": "graphiti_fact",
+          "text": "I replied to two emails and archived old screenshots."
+        }
+      ]
+    },
+    {
+      "id": "c17_mixed_language_commitment_vs_fear",
+      "query": "is there real commitment or fear-driven delay",
+      "tags": [
+        "mixed_domain",
+        "commitment",
+        "emotional",
+        "multilingual",
+        "arabic_romanized"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u5"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "I will send the message tonight, khalas."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "Bas kul ma ajee ab3at, batjammad w arja3 a2ra el masage."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "I updated dependencies and bumped package versions."
+        },
+        {
+          "id": "u4",
+          "source": "user_model",
+          "text": "Pattern: avoids high-stakes conversations when dysregulated."
+        },
+        {
+          "id": "u5",
+          "source": "graphiti_session_summary",
+          "text": "Explicit commitment appears, but repeated fear-based freezing delays execution."
+        },
+        {
+          "id": "u6",
+          "source": "graphiti_fact",
+          "text": "I fixed spacing in the footer."
+        }
+      ]
+    },
+    {
+      "id": "c18_indirect_self_image_social",
+      "query": "how is self-image affecting social behavior",
+      "tags": [
+        "indirect",
+        "self_image",
+        "relationships",
+        "emotional",
+        "mixed_domain"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u5"
+      ],
+      "utterances": [
+        {
+          "id": "u1",
+          "source": "graphiti_fact",
+          "text": "I ghost close friends when I feel behind in life."
+        },
+        {
+          "id": "u2",
+          "source": "graphiti_fact",
+          "text": "If I feel like a burden I cancel plans at the last minute."
+        },
+        {
+          "id": "u3",
+          "source": "graphiti_fact",
+          "text": "Need to buy detergent and recharge metro card."
+        },
+        {
+          "id": "u4",
+          "source": "user_model",
+          "text": "Current focus: shipping onboarding for the release."
+        },
+        {
+          "id": "u5",
+          "source": "graphiti_session_summary",
+          "text": "Negative self-image repeatedly drives social withdrawal and cancellation behavior."
+        },
+        {
+          "id": "u6",
+          "source": "graphiti_fact",
+          "text": "I watched a football match and slept late."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1893 @@
+{
+  "pack": "tests/fixtures/semantic_rerank_eval_pack.v1.json",
+  "settings": {
+    "limit": 5,
+    "semantic_enabled": true,
+    "embedding_enabled": true,
+    "embedding_model": "text-embedding-3-small"
+  },
+  "summary": {
+    "cases_total": 10,
+    "improved": 6,
+    "regressed": 0,
+    "unchanged": 4,
+    "method_counts": {
+      "embeddings": 60
+    },
+    "fallback_rate": 0.0,
+    "embedding_failure_rate": 0.0
+  },
+  "confidence_calibration": {
+    "buckets": {
+      "0_50_to_0_69": {
+        "total": 4,
+        "correct": 4,
+        "accuracy": 1.0
+      },
+      "0_70_to_0_84": {
+        "total": 6,
+        "correct": 6,
+        "accuracy": 1.0
+      }
+    }
+  },
+  "noisy_patterns": [],
+  "cases": [
+    {
+      "id": "c1_relationship_finance_emotional",
+      "query": "what is stressing him most with his partner right now",
+      "tags": [
+        "emotional",
+        "mixed_domain",
+        "relationship",
+        "finance"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u5"
+      ],
+      "semantic_query": {
+        "domain": "relationships",
+        "intent": "express_emotion",
+        "memory_type": "state",
+        "domain_scores": {
+          "health": 0.055,
+          "wellness": 0.126,
+          "work": 0.07,
+          "goals": 0.049,
+          "worries": 0.163,
+          "relationships": 0.196,
+          "routines": 0.051,
+          "finance": 0.082,
+          "learning": 0.046,
+          "spirituality": 0.054,
+          "home": 0.051,
+          "general": 0.058
+        }
+      },
+      "audit": {
+        "item_count": 6,
+        "semantic_enabled": true,
+        "embedding_enabled": true,
+        "embedding_attempted": true,
+        "embedding_success": true,
+        "embedding_failed": false,
+        "llm_attempted": false,
+        "llm_success": false,
+        "llm_failed": false,
+        "embedding_model": "text-embedding-3-small",
+        "classification_method_counts": {
+          "embeddings": 6
+        }
+      },
+      "before": {
+        "top": [
+          {
+            "id": "u1",
+            "score": 0.58,
+            "text": "My partner says she is carrying me financially and it hit hard.",
+            "source": "graphiti_fact",
+            "domain": "relationships",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.5699194805085325,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.23,
+            "text": "I avoid opening the rent app because my chest tightens.",
+            "source": "graphiti_fact",
+            "domain": "worries",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.700966200083968,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u3",
+            "score": 0.23,
+            "text": "I promised to wake by 7 and walk daily.",
+            "source": "graphiti_fact",
+            "domain": "routines",
+            "intent": "make_commitment",
+            "memory_type": "habit",
+            "confidence": 0.7012148790534667,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u5",
+            "score": 0.23,
+            "text": "They argued late about money and feeling unsupported.",
+            "source": "graphiti_session_summary",
+            "domain": "relationships",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.6851492069131867,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u6",
+            "score": 0.23,
+            "text": "I made lentil soup and watched a movie.",
+            "source": "graphiti_fact",
+            "domain": "home",
+            "intent": "share_update",
+            "memory_type": "event",
+            "confidence": 0.6361804443858456,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 1.8333
+      },
+      "after": {
+        "top": [
+          {
+            "id": "u1",
+            "score": 1.0779,
+            "text": "My partner says she is carrying me financially and it hit hard.",
+            "source": "graphiti_fact",
+            "domain": "relationships",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.5699194805085325,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u5",
+            "score": 0.7427,
+            "text": "They argued late about money and feeling unsupported.",
+            "source": "graphiti_session_summary",
+            "domain": "relationships",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.6851492069131867,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.6387,
+            "text": "I avoid opening the rent app because my chest tightens.",
+            "source": "graphiti_fact",
+            "domain": "worries",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.700966200083968,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u3",
+            "score": 0.3771,
+            "text": "I promised to wake by 7 and walk daily.",
+            "source": "graphiti_fact",
+            "domain": "routines",
+            "intent": "make_commitment",
+            "memory_type": "habit",
+            "confidence": 0.7012148790534667,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u6",
+            "score": 0.1905,
+            "text": "I made lentil soup and watched a movie.",
+            "source": "graphiti_fact",
+            "domain": "home",
+            "intent": "share_update",
+            "memory_type": "event",
+            "confidence": 0.6361804443858456,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 2.0
+      },
+      "delta": {
+        "hits_at_k": 0,
+        "dcg_at_k": 0.1667
+      },
+      "status": "improved"
+    },
+    {
+      "id": "c2_multilingual_spanish_sleep",
+      "query": "sleep and stress pattern this week",
+      "tags": [
+        "multilingual",
+        "spanish",
+        "wellness",
+        "routines"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u4"
+      ],
+      "semantic_query": {
+        "domain": "wellness",
+        "intent": "express_emotion",
+        "memory_type": "habit",
+        "domain_scores": {
+          "health": 0.061,
+          "wellness": 0.283,
+          "work": 0.058,
+          "goals": 0.044,
+          "worries": 0.1,
+          "relationships": 0.054,
+          "routines": 0.105,
+          "finance": 0.076,
+          "learning": 0.063,
+          "spirituality": 0.046,
+          "home": 0.047,
+          "general": 0.062
+        }
+      },
+      "audit": {
+        "item_count": 6,
+        "semantic_enabled": true,
+        "embedding_enabled": true,
+        "embedding_attempted": true,
+        "embedding_success": true,
+        "embedding_failed": false,
+        "llm_attempted": false,
+        "llm_success": false,
+        "llm_failed": false,
+        "embedding_model": "text-embedding-3-small",
+        "classification_method_counts": {
+          "embeddings": 6
+        }
+      },
+      "before": {
+        "top": [
+          {
+            "id": "u4",
+            "score": 0.98,
+            "text": "Routine slipped all week: late phone scrolling, short sleep, high stress.",
+            "source": "graphiti_session_summary",
+            "domain": "wellness",
+            "intent": "express_emotion",
+            "memory_type": "habit",
+            "confidence": 0.7698082358611912,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u1",
+            "score": 0.23,
+            "text": "Duermo fatal, me despierto a las 3 y luego no regreso.",
+            "source": "graphiti_fact",
+            "domain": "wellness",
+            "intent": "express_emotion",
+            "memory_type": "habit",
+            "confidence": 0.6064316876335265,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.23,
+            "text": "Cuando no duermo me pongo irritable con todos.",
+            "source": "graphiti_fact",
+            "domain": "wellness",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.69447221671207,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u3",
+            "score": 0.23,
+            "text": "Client demo moved to Friday.",
+            "source": "graphiti_fact",
+            "domain": "work",
+            "intent": "share_update",
+            "memory_type": "event",
+            "confidence": 0.8039045466381225,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u5",
+            "score": 0.23,
+            "text": "I want to learn Rust in the evenings.",
+            "source": "graphiti_fact",
+            "domain": "learning",
+            "intent": "ask_help",
+            "memory_type": "goal",
+            "confidence": 0.441936039357528,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 2.0
+      },
+      "after": {
+        "top": [
+          {
+            "id": "u4",
+            "score": 1.5121,
+            "text": "Routine slipped all week: late phone scrolling, short sleep, high stress.",
+            "source": "graphiti_session_summary",
+            "domain": "wellness",
+            "intent": "express_emotion",
+            "memory_type": "habit",
+            "confidence": 0.7698082358611912,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u1",
+            "score": 0.7389,
+            "text": "Duermo fatal, me despierto a las 3 y luego no regreso.",
+            "source": "graphiti_fact",
+            "domain": "wellness",
+            "intent": "express_emotion",
+            "memory_type": "habit",
+            "confidence": 0.6064316876335265,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.7001,
+            "text": "Cuando no duermo me pongo irritable con todos.",
+            "source": "graphiti_fact",
+            "domain": "wellness",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.69447221671207,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u3",
+            "score": 0.2142,
+            "text": "Client demo moved to Friday.",
+            "source": "graphiti_fact",
+            "domain": "work",
+            "intent": "share_update",
+            "memory_type": "event",
+            "confidence": 0.8039045466381225,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u5",
+            "score": 0.1753,
+            "text": "I want to learn Rust in the evenings.",
+            "source": "graphiti_fact",
+            "domain": "learning",
+            "intent": "ask_help",
+            "memory_type": "goal",
+            "confidence": 0.441936039357528,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 2.0
+      },
+      "delta": {
+        "hits_at_k": 0,
+        "dcg_at_k": 0.0
+      },
+      "status": "unchanged"
+    },
+    {
+      "id": "c3_multilingual_german_work_anxiety",
+      "query": "what work pressure is he feeling",
+      "tags": [
+        "multilingual",
+        "german",
+        "work",
+        "worries"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u4"
+      ],
+      "semantic_query": {
+        "domain": "worries",
+        "intent": "express_emotion",
+        "memory_type": "state",
+        "domain_scores": {
+          "health": 0.096,
+          "wellness": 0.121,
+          "work": 0.103,
+          "goals": 0.052,
+          "worries": 0.15,
+          "relationships": 0.085,
+          "routines": 0.061,
+          "finance": 0.11,
+          "learning": 0.048,
+          "spirituality": 0.052,
+          "home": 0.051,
+          "general": 0.07
+        }
+      },
+      "audit": {
+        "item_count": 6,
+        "semantic_enabled": true,
+        "embedding_enabled": true,
+        "embedding_attempted": true,
+        "embedding_success": true,
+        "embedding_failed": false,
+        "llm_attempted": false,
+        "llm_success": false,
+        "llm_failed": false,
+        "embedding_model": "text-embedding-3-small",
+        "classification_method_counts": {
+          "embeddings": 6
+        }
+      },
+      "before": {
+        "top": [
+          {
+            "id": "u1",
+            "score": 0.23,
+            "text": "Im Job fuehle ich mich gehetzt, alles ist dringend.",
+            "source": "graphiti_fact",
+            "domain": "worries",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.6467219412936602,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.23,
+            "text": "Der Kunde droht abzuspringen wenn wir den Termin reissen.",
+            "source": "graphiti_fact",
+            "domain": "work",
+            "intent": "make_commitment",
+            "memory_type": "event",
+            "confidence": 0.660317776840676,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u3",
+            "score": 0.23,
+            "text": "My sister visited and we cooked.",
+            "source": "graphiti_fact",
+            "domain": "home",
+            "intent": "share_update",
+            "memory_type": "event",
+            "confidence": 0.6869961243547524,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u4",
+            "score": 0.23,
+            "text": "Deadline fear plus uncertainty about team capacity.",
+            "source": "graphiti_session_summary",
+            "domain": "work",
+            "intent": "express_emotion",
+            "memory_type": "event",
+            "confidence": 0.5321219248183235,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u5",
+            "score": 0.23,
+            "text": "I should drink more water.",
+            "source": "graphiti_fact",
+            "domain": "wellness",
+            "intent": "ask_help",
+            "memory_type": "habit",
+            "confidence": 0.4355386381053185,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 1.8333
+      },
+      "after": {
+        "top": [
+          {
+            "id": "u1",
+            "score": 0.7361,
+            "text": "Im Job fuehle ich mich gehetzt, alles ist dringend.",
+            "source": "graphiti_fact",
+            "domain": "worries",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.6467219412936602,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u4",
+            "score": 0.4153,
+            "text": "Deadline fear plus uncertainty about team capacity.",
+            "source": "graphiti_session_summary",
+            "domain": "work",
+            "intent": "express_emotion",
+            "memory_type": "event",
+            "confidence": 0.5321219248183235,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u6",
+            "score": 0.3427,
+            "text": "Pattern: Juggles multiple active commitments and threads.",
+            "source": "user_model",
+            "domain": "routines",
+            "intent": "make_commitment",
+            "memory_type": "habit",
+            "confidence": 0.6433157578653061,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u5",
+            "score": 0.3269,
+            "text": "I should drink more water.",
+            "source": "graphiti_fact",
+            "domain": "wellness",
+            "intent": "ask_help",
+            "memory_type": "habit",
+            "confidence": 0.4355386381053185,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u2",
+            "score": 0.2671,
+            "text": "Der Kunde droht abzuspringen wenn wir den Termin reissen.",
+            "source": "graphiti_fact",
+            "domain": "work",
+            "intent": "make_commitment",
+            "memory_type": "event",
+            "confidence": 0.660317776840676,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 1.8333
+      },
+      "delta": {
+        "hits_at_k": 0,
+        "dcg_at_k": 0.0
+      },
+      "status": "unchanged"
+    },
+    {
+      "id": "c4_indirect_emotion",
+      "query": "how is he feeling emotionally",
+      "tags": [
+        "indirect",
+        "emotional",
+        "worries"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u4"
+      ],
+      "semantic_query": {
+        "domain": "wellness",
+        "intent": "express_emotion",
+        "memory_type": "state",
+        "domain_scores": {
+          "health": 0.088,
+          "wellness": 0.154,
+          "work": 0.043,
+          "goals": 0.059,
+          "worries": 0.139,
+          "relationships": 0.103,
+          "routines": 0.053,
+          "finance": 0.081,
+          "learning": 0.043,
+          "spirituality": 0.066,
+          "home": 0.045,
+          "general": 0.127
+        }
+      },
+      "audit": {
+        "item_count": 6,
+        "semantic_enabled": true,
+        "embedding_enabled": true,
+        "embedding_attempted": true,
+        "embedding_success": true,
+        "embedding_failed": false,
+        "llm_attempted": false,
+        "llm_success": false,
+        "llm_failed": false,
+        "embedding_model": "text-embedding-3-small",
+        "classification_method_counts": {
+          "embeddings": 6
+        }
+      },
+      "before": {
+        "top": [
+          {
+            "id": "u1",
+            "score": 0.23,
+            "text": "Everything feels loud and bright and I cannot settle.",
+            "source": "graphiti_fact",
+            "domain": "worries",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.7743560139350181,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.23,
+            "text": "My body is tired but my mind keeps sprinting.",
+            "source": "graphiti_fact",
+            "domain": "wellness",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.7121893281097873,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u3",
+            "score": 0.23,
+            "text": "Need to buy detergent and eggs.",
+            "source": "graphiti_fact",
+            "domain": "home",
+            "intent": "ask_help",
+            "memory_type": "event",
+            "confidence": 0.5874907412587455,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u4",
+            "score": 0.23,
+            "text": "Overwhelm and restlessness dominated the evening.",
+            "source": "graphiti_session_summary",
+            "domain": "worries",
+            "intent": "express_emotion",
+            "memory_type": "habit",
+            "confidence": 0.7272746275858526,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u6",
+            "score": 0.23,
+            "text": "I read 20 pages of a novel.",
+            "source": "graphiti_fact",
+            "domain": "general",
+            "intent": "share_update",
+            "memory_type": "goal",
+            "confidence": 0.5026809848281343,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 1.8333
+      },
+      "after": {
+        "top": [
+          {
+            "id": "u2",
+            "score": 0.746,
+            "text": "My body is tired but my mind keeps sprinting.",
+            "source": "graphiti_fact",
+            "domain": "wellness",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.7121893281097873,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u1",
+            "score": 0.651,
+            "text": "Everything feels loud and bright and I cannot settle.",
+            "source": "graphiti_fact",
+            "domain": "worries",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.7743560139350181,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u4",
+            "score": 0.598,
+            "text": "Overwhelm and restlessness dominated the evening.",
+            "source": "graphiti_session_summary",
+            "domain": "worries",
+            "intent": "express_emotion",
+            "memory_type": "habit",
+            "confidence": 0.7272746275858526,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u3",
+            "score": 0.1842,
+            "text": "Need to buy detergent and eggs.",
+            "source": "graphiti_fact",
+            "domain": "home",
+            "intent": "ask_help",
+            "memory_type": "event",
+            "confidence": 0.5874907412587455,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u6",
+            "score": 0.1757,
+            "text": "I read 20 pages of a novel.",
+            "source": "graphiti_fact",
+            "domain": "general",
+            "intent": "share_update",
+            "memory_type": "goal",
+            "confidence": 0.5026809848281343,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 2.0
+      },
+      "delta": {
+        "hits_at_k": 0,
+        "dcg_at_k": 0.1667
+      },
+      "status": "improved"
+    },
+    {
+      "id": "c5_mixed_domain_health_work",
+      "query": "what is blocking consistency with workouts",
+      "tags": [
+        "mixed_domain",
+        "health",
+        "work",
+        "routines"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u5"
+      ],
+      "semantic_query": {
+        "domain": "routines",
+        "intent": "share_update",
+        "memory_type": "habit",
+        "domain_scores": {
+          "health": 0.073,
+          "wellness": 0.081,
+          "work": 0.067,
+          "goals": 0.074,
+          "worries": 0.1,
+          "relationships": 0.07,
+          "routines": 0.164,
+          "finance": 0.058,
+          "learning": 0.08,
+          "spirituality": 0.086,
+          "home": 0.052,
+          "general": 0.094
+        }
+      },
+      "audit": {
+        "item_count": 6,
+        "semantic_enabled": true,
+        "embedding_enabled": true,
+        "embedding_attempted": true,
+        "embedding_success": true,
+        "embedding_failed": false,
+        "llm_attempted": false,
+        "llm_success": false,
+        "llm_failed": false,
+        "embedding_model": "text-embedding-3-small",
+        "classification_method_counts": {
+          "embeddings": 6
+        }
+      },
+      "before": {
+        "top": [
+          {
+            "id": "u1",
+            "score": 0.58,
+            "text": "I skip workouts when meetings spill into the night.",
+            "source": "graphiti_fact",
+            "domain": "routines",
+            "intent": "make_commitment",
+            "memory_type": "habit",
+            "confidence": 0.6184201549418491,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.23,
+            "text": "My knee flared up again after the run.",
+            "source": "graphiti_fact",
+            "domain": "health",
+            "intent": "share_update",
+            "memory_type": "habit",
+            "confidence": 0.563712731880083,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u3",
+            "score": 0.23,
+            "text": "I sent the investor memo.",
+            "source": "graphiti_fact",
+            "domain": "work",
+            "intent": "share_update",
+            "memory_type": "preference",
+            "confidence": 0.5380315710836777,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u5",
+            "score": 0.23,
+            "text": "Intent to train is high but work spillover and pain interrupt routine.",
+            "source": "graphiti_session_summary",
+            "domain": "routines",
+            "intent": "express_emotion",
+            "memory_type": "habit",
+            "confidence": 0.6485656577024651,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u6",
+            "score": 0.23,
+            "text": "My partner likes the new couch color.",
+            "source": "graphiti_fact",
+            "domain": "relationships",
+            "intent": "share_update",
+            "memory_type": "preference",
+            "confidence": 0.5416117309914751,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 1.8333
+      },
+      "after": {
+        "top": [
+          {
+            "id": "u1",
+            "score": 0.8124,
+            "text": "I skip workouts when meetings spill into the night.",
+            "source": "graphiti_fact",
+            "domain": "routines",
+            "intent": "make_commitment",
+            "memory_type": "habit",
+            "confidence": 0.6184201549418491,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u5",
+            "score": 0.467,
+            "text": "Intent to train is high but work spillover and pain interrupt routine.",
+            "source": "graphiti_session_summary",
+            "domain": "routines",
+            "intent": "express_emotion",
+            "memory_type": "habit",
+            "confidence": 0.6485656577024651,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.4029,
+            "text": "My knee flared up again after the run.",
+            "source": "graphiti_fact",
+            "domain": "health",
+            "intent": "share_update",
+            "memory_type": "habit",
+            "confidence": 0.563712731880083,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u6",
+            "score": 0.3484,
+            "text": "My partner likes the new couch color.",
+            "source": "graphiti_fact",
+            "domain": "relationships",
+            "intent": "share_update",
+            "memory_type": "preference",
+            "confidence": 0.5416117309914751,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u3",
+            "score": 0.3476,
+            "text": "I sent the investor memo.",
+            "source": "graphiti_fact",
+            "domain": "work",
+            "intent": "share_update",
+            "memory_type": "preference",
+            "confidence": 0.5380315710836777,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 2.0
+      },
+      "delta": {
+        "hits_at_k": 0,
+        "dcg_at_k": 0.1667
+      },
+      "status": "improved"
+    },
+    {
+      "id": "c6_multilingual_arabic_romanized_relationship",
+      "query": "relationship tension pattern",
+      "tags": [
+        "multilingual",
+        "relationship",
+        "emotional",
+        "mixed_domain"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u4"
+      ],
+      "semantic_query": {
+        "domain": "relationships",
+        "intent": "express_emotion",
+        "memory_type": "relationship",
+        "domain_scores": {
+          "health": 0.043,
+          "wellness": 0.082,
+          "work": 0.064,
+          "goals": 0.067,
+          "worries": 0.107,
+          "relationships": 0.246,
+          "routines": 0.095,
+          "finance": 0.07,
+          "learning": 0.053,
+          "spirituality": 0.048,
+          "home": 0.049,
+          "general": 0.074
+        }
+      },
+      "audit": {
+        "item_count": 6,
+        "semantic_enabled": true,
+        "embedding_enabled": true,
+        "embedding_attempted": true,
+        "embedding_success": true,
+        "embedding_failed": false,
+        "llm_attempted": false,
+        "llm_success": false,
+        "llm_failed": false,
+        "embedding_model": "text-embedding-3-small",
+        "classification_method_counts": {
+          "embeddings": 6
+        }
+      },
+      "before": {
+        "top": [
+          {
+            "id": "u1",
+            "score": 0.23,
+            "text": "Ana daiman baskut waqt el khena2 w ba3den andam.",
+            "source": "graphiti_fact",
+            "domain": "relationships",
+            "intent": "share_update",
+            "memory_type": "event",
+            "confidence": 0.4743383773030008,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.23,
+            "text": "She says I disappear into work when things get hard.",
+            "source": "graphiti_fact",
+            "domain": "wellness",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.6228399616341196,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u3",
+            "score": 0.23,
+            "text": "Need to renew hosting and domain.",
+            "source": "graphiti_fact",
+            "domain": "work",
+            "intent": "ask_help",
+            "memory_type": "event",
+            "confidence": 0.5134326524664173,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u4",
+            "score": 0.23,
+            "text": "Repeated rupture-repair cycle: withdrawal during conflict, remorse later.",
+            "source": "graphiti_session_summary",
+            "domain": "relationships",
+            "intent": "reflect",
+            "memory_type": "habit",
+            "confidence": 0.7990303463887608,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u6",
+            "score": 0.23,
+            "text": "I enjoyed mint tea after dinner.",
+            "source": "graphiti_fact",
+            "domain": "wellness",
+            "intent": "share_update",
+            "memory_type": "preference",
+            "confidence": 0.50607124454978,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 1.8333
+      },
+      "after": {
+        "top": [
+          {
+            "id": "u4",
+            "score": 0.6618,
+            "text": "Repeated rupture-repair cycle: withdrawal during conflict, remorse later.",
+            "source": "graphiti_session_summary",
+            "domain": "relationships",
+            "intent": "reflect",
+            "memory_type": "habit",
+            "confidence": 0.7990303463887608,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.5867,
+            "text": "She says I disappear into work when things get hard.",
+            "source": "graphiti_fact",
+            "domain": "wellness",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.6228399616341196,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u1",
+            "score": 0.3286,
+            "text": "Ana daiman baskut waqt el khena2 w ba3den andam.",
+            "source": "graphiti_fact",
+            "domain": "relationships",
+            "intent": "share_update",
+            "memory_type": "event",
+            "confidence": 0.4743383773030008,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u6",
+            "score": 0.2295,
+            "text": "I enjoyed mint tea after dinner.",
+            "source": "graphiti_fact",
+            "domain": "wellness",
+            "intent": "share_update",
+            "memory_type": "preference",
+            "confidence": 0.50607124454978,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u3",
+            "score": 0.181,
+            "text": "Need to renew hosting and domain.",
+            "source": "graphiti_fact",
+            "domain": "work",
+            "intent": "ask_help",
+            "memory_type": "event",
+            "confidence": 0.5134326524664173,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 2.0
+      },
+      "delta": {
+        "hits_at_k": 0,
+        "dcg_at_k": 0.1667
+      },
+      "status": "improved"
+    },
+    {
+      "id": "c7_goal_vs_state",
+      "query": "is this a commitment or just reflection",
+      "tags": [
+        "intent",
+        "goal",
+        "state"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u4"
+      ],
+      "semantic_query": {
+        "domain": "spirituality",
+        "intent": "make_commitment",
+        "memory_type": "state",
+        "domain_scores": {
+          "health": 0.037,
+          "wellness": 0.076,
+          "work": 0.07,
+          "goals": 0.102,
+          "worries": 0.083,
+          "relationships": 0.089,
+          "routines": 0.096,
+          "finance": 0.062,
+          "learning": 0.074,
+          "spirituality": 0.149,
+          "home": 0.05,
+          "general": 0.112
+        }
+      },
+      "audit": {
+        "item_count": 6,
+        "semantic_enabled": true,
+        "embedding_enabled": true,
+        "embedding_attempted": true,
+        "embedding_success": true,
+        "embedding_failed": false,
+        "llm_attempted": false,
+        "llm_success": false,
+        "llm_failed": false,
+        "embedding_model": "text-embedding-3-small",
+        "classification_method_counts": {
+          "embeddings": 6
+        }
+      },
+      "before": {
+        "top": [
+          {
+            "id": "u4",
+            "score": 0.58,
+            "text": "Clear commitment stated, but fear-based delay pattern remains.",
+            "source": "graphiti_session_summary",
+            "domain": "worries",
+            "intent": "make_commitment",
+            "memory_type": "habit",
+            "confidence": 0.7890593772722454,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u1",
+            "score": 0.23,
+            "text": "I will send the apology message tonight.",
+            "source": "graphiti_fact",
+            "domain": "general",
+            "intent": "share_update",
+            "memory_type": "event",
+            "confidence": 0.6072629401881234,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.23,
+            "text": "I keep rehearsing it and freezing.",
+            "source": "graphiti_fact",
+            "domain": "routines",
+            "intent": "express_emotion",
+            "memory_type": "habit",
+            "confidence": 0.5958375258104582,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u3",
+            "score": 0.23,
+            "text": "The weather is nicer now.",
+            "source": "graphiti_fact",
+            "domain": "general",
+            "intent": "share_update",
+            "memory_type": "state",
+            "confidence": 0.6377360411095669,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u6",
+            "score": 0.23,
+            "text": "I fixed a small CSS issue.",
+            "source": "graphiti_fact",
+            "domain": "general",
+            "intent": "share_update",
+            "memory_type": "fact",
+            "confidence": 0.6166400620936554,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 2.0
+      },
+      "after": {
+        "top": [
+          {
+            "id": "u4",
+            "score": 0.8495,
+            "text": "Clear commitment stated, but fear-based delay pattern remains.",
+            "source": "graphiti_session_summary",
+            "domain": "worries",
+            "intent": "make_commitment",
+            "memory_type": "habit",
+            "confidence": 0.7890593772722454,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u1",
+            "score": 0.4382,
+            "text": "I will send the apology message tonight.",
+            "source": "graphiti_fact",
+            "domain": "general",
+            "intent": "share_update",
+            "memory_type": "event",
+            "confidence": 0.6072629401881234,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.4264,
+            "text": "I keep rehearsing it and freezing.",
+            "source": "graphiti_fact",
+            "domain": "routines",
+            "intent": "express_emotion",
+            "memory_type": "habit",
+            "confidence": 0.5958375258104582,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u5",
+            "score": 0.3571,
+            "text": "Pattern: avoids high-stakes conversations when dysregulated.",
+            "source": "user_model",
+            "domain": "routines",
+            "intent": "reflect",
+            "memory_type": "habit",
+            "confidence": 0.690879330633546,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u3",
+            "score": 0.2607,
+            "text": "The weather is nicer now.",
+            "source": "graphiti_fact",
+            "domain": "general",
+            "intent": "share_update",
+            "memory_type": "state",
+            "confidence": 0.6377360411095669,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 2.0
+      },
+      "delta": {
+        "hits_at_k": 0,
+        "dcg_at_k": 0.0
+      },
+      "status": "unchanged"
+    },
+    {
+      "id": "c8_finance_multilingual_french",
+      "query": "money anxiety and rent risk",
+      "tags": [
+        "multilingual",
+        "french",
+        "finance",
+        "worries"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u5"
+      ],
+      "semantic_query": {
+        "domain": "finance",
+        "intent": "express_emotion",
+        "memory_type": "state",
+        "domain_scores": {
+          "health": 0.04,
+          "wellness": 0.092,
+          "work": 0.042,
+          "goals": 0.037,
+          "worries": 0.161,
+          "relationships": 0.051,
+          "routines": 0.035,
+          "finance": 0.363,
+          "learning": 0.037,
+          "spirituality": 0.033,
+          "home": 0.069,
+          "general": 0.039
+        }
+      },
+      "audit": {
+        "item_count": 6,
+        "semantic_enabled": true,
+        "embedding_enabled": true,
+        "embedding_attempted": true,
+        "embedding_success": true,
+        "embedding_failed": false,
+        "llm_attempted": false,
+        "llm_success": false,
+        "llm_failed": false,
+        "embedding_model": "text-embedding-3-small",
+        "classification_method_counts": {
+          "embeddings": 6
+        }
+      },
+      "before": {
+        "top": [
+          {
+            "id": "u4",
+            "score": 0.55,
+            "text": "Current focus: close onboarding bug backlog.",
+            "source": "user_model",
+            "domain": "work",
+            "intent": "share_update",
+            "memory_type": "event",
+            "confidence": 0.63949666130842,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u1",
+            "score": 0.23,
+            "text": "Je stresse pour le loyer, le compte baisse trop vite.",
+            "source": "graphiti_fact",
+            "domain": "finance",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.7009371288395904,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.23,
+            "text": "I keep delaying the budget sheet because it makes me panic.",
+            "source": "graphiti_fact",
+            "domain": "finance",
+            "intent": "express_emotion",
+            "memory_type": "habit",
+            "confidence": 0.6988307373055608,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u3",
+            "score": 0.23,
+            "text": "Morning walk felt good today.",
+            "source": "graphiti_fact",
+            "domain": "routines",
+            "intent": "share_update",
+            "memory_type": "state",
+            "confidence": 0.5547629483734539,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u5",
+            "score": 0.23,
+            "text": "Financial pressure is tightly linked to avoidance and shame.",
+            "source": "graphiti_session_summary",
+            "domain": "worries",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.7747927232794207,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 1.3333
+      },
+      "after": {
+        "top": [
+          {
+            "id": "u5",
+            "score": 1.0268,
+            "text": "Financial pressure is tightly linked to avoidance and shame.",
+            "source": "graphiti_session_summary",
+            "domain": "worries",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.7747927232794207,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u1",
+            "score": 1.0197,
+            "text": "Je stresse pour le loyer, le compte baisse trop vite.",
+            "source": "graphiti_fact",
+            "domain": "finance",
+            "intent": "express_emotion",
+            "memory_type": "state",
+            "confidence": 0.7009371288395904,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.9662,
+            "text": "I keep delaying the budget sheet because it makes me panic.",
+            "source": "graphiti_fact",
+            "domain": "finance",
+            "intent": "express_emotion",
+            "memory_type": "habit",
+            "confidence": 0.6988307373055608,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u3",
+            "score": 0.3847,
+            "text": "Morning walk felt good today.",
+            "source": "graphiti_fact",
+            "domain": "routines",
+            "intent": "share_update",
+            "memory_type": "state",
+            "confidence": 0.5547629483734539,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u6",
+            "score": 0.1985,
+            "text": "I watched a football match.",
+            "source": "graphiti_fact",
+            "domain": "learning",
+            "intent": "share_update",
+            "memory_type": "event",
+            "confidence": 0.6645674133482775,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 2.0
+      },
+      "delta": {
+        "hits_at_k": 0,
+        "dcg_at_k": 0.6667
+      },
+      "status": "improved"
+    },
+    {
+      "id": "c9_learning_vs_work_noise",
+      "query": "what learning goal is active",
+      "tags": [
+        "learning",
+        "work",
+        "mixed_domain"
+      ],
+      "expected_ids": [
+        "u1",
+        "u3",
+        "u5"
+      ],
+      "semantic_query": {
+        "domain": "learning",
+        "intent": "set_goal",
+        "memory_type": "goal",
+        "domain_scores": {
+          "health": 0.045,
+          "wellness": 0.051,
+          "work": 0.072,
+          "goals": 0.166,
+          "worries": 0.05,
+          "relationships": 0.044,
+          "routines": 0.079,
+          "finance": 0.041,
+          "learning": 0.228,
+          "spirituality": 0.074,
+          "home": 0.051,
+          "general": 0.098
+        }
+      },
+      "audit": {
+        "item_count": 6,
+        "semantic_enabled": true,
+        "embedding_enabled": true,
+        "embedding_attempted": true,
+        "embedding_success": true,
+        "embedding_failed": false,
+        "llm_attempted": false,
+        "llm_success": false,
+        "llm_failed": false,
+        "embedding_model": "text-embedding-3-small",
+        "classification_method_counts": {
+          "embeddings": 6
+        }
+      },
+      "before": {
+        "top": [
+          {
+            "id": "u5",
+            "score": 0.78,
+            "text": "Learning goals exist but are fragile under work load.",
+            "source": "graphiti_session_summary",
+            "domain": "learning",
+            "intent": "reflect",
+            "memory_type": "goal",
+            "confidence": 0.5433838543880722,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u1",
+            "score": 0.23,
+            "text": "I want to practice SQL joins every morning for 20 minutes.",
+            "source": "graphiti_fact",
+            "domain": "routines",
+            "intent": "set_goal",
+            "memory_type": "habit",
+            "confidence": 0.5747738833885757,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.23,
+            "text": "Production incidents keep eating my evenings.",
+            "source": "graphiti_fact",
+            "domain": "routines",
+            "intent": "share_update",
+            "memory_type": "event",
+            "confidence": 0.6999787814583229,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u3",
+            "score": 0.23,
+            "text": "I enrolled in a short systems design course.",
+            "source": "graphiti_fact",
+            "domain": "learning",
+            "intent": "reflect",
+            "memory_type": "event",
+            "confidence": 0.5640840265999525,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u6",
+            "score": 0.23,
+            "text": "I cleaned the kitchen counter.",
+            "source": "graphiti_fact",
+            "domain": "home",
+            "intent": "share_update",
+            "memory_type": "habit",
+            "confidence": 0.6668627239771129,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 1.8333
+      },
+      "after": {
+        "top": [
+          {
+            "id": "u5",
+            "score": 1.0123,
+            "text": "Learning goals exist but are fragile under work load.",
+            "source": "graphiti_session_summary",
+            "domain": "learning",
+            "intent": "reflect",
+            "memory_type": "goal",
+            "confidence": 0.5433838543880722,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u3",
+            "score": 0.4158,
+            "text": "I enrolled in a short systems design course.",
+            "source": "graphiti_fact",
+            "domain": "learning",
+            "intent": "reflect",
+            "memory_type": "event",
+            "confidence": 0.5640840265999525,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u1",
+            "score": 0.3625,
+            "text": "I want to practice SQL joins every morning for 20 minutes.",
+            "source": "graphiti_fact",
+            "domain": "routines",
+            "intent": "set_goal",
+            "memory_type": "habit",
+            "confidence": 0.5747738833885757,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.3213,
+            "text": "Production incidents keep eating my evenings.",
+            "source": "graphiti_fact",
+            "domain": "routines",
+            "intent": "share_update",
+            "memory_type": "event",
+            "confidence": 0.6999787814583229,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u6",
+            "score": 0.3163,
+            "text": "I cleaned the kitchen counter.",
+            "source": "graphiti_fact",
+            "domain": "home",
+            "intent": "share_update",
+            "memory_type": "habit",
+            "confidence": 0.6668627239771129,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 2.0
+      },
+      "delta": {
+        "hits_at_k": 0,
+        "dcg_at_k": 0.1667
+      },
+      "status": "improved"
+    },
+    {
+      "id": "c10_home_health_overlap",
+      "query": "which home factors affect his health habits",
+      "tags": [
+        "home",
+        "health",
+        "mixed_domain"
+      ],
+      "expected_ids": [
+        "u1",
+        "u2",
+        "u5"
+      ],
+      "semantic_query": {
+        "domain": "routines",
+        "intent": "ask_help",
+        "memory_type": "habit",
+        "domain_scores": {
+          "health": 0.104,
+          "wellness": 0.116,
+          "work": 0.039,
+          "goals": 0.052,
+          "worries": 0.066,
+          "relationships": 0.058,
+          "routines": 0.15,
+          "finance": 0.083,
+          "learning": 0.067,
+          "spirituality": 0.054,
+          "home": 0.14,
+          "general": 0.072
+        }
+      },
+      "audit": {
+        "item_count": 6,
+        "semantic_enabled": true,
+        "embedding_enabled": true,
+        "embedding_attempted": true,
+        "embedding_success": true,
+        "embedding_failed": false,
+        "llm_attempted": false,
+        "llm_success": false,
+        "llm_failed": false,
+        "embedding_model": "text-embedding-3-small",
+        "classification_method_counts": {
+          "embeddings": 6
+        }
+      },
+      "before": {
+        "top": [
+          {
+            "id": "u5",
+            "score": 0.58,
+            "text": "Home environment cues are tightly coupled with food and sleep behavior.",
+            "source": "graphiti_session_summary",
+            "domain": "wellness",
+            "intent": "reflect",
+            "memory_type": "habit",
+            "confidence": 0.7319711119715239,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u1",
+            "score": 0.23,
+            "text": "When the apartment is cluttered I stop cooking and order junk.",
+            "source": "graphiti_fact",
+            "domain": "home",
+            "intent": "express_emotion",
+            "memory_type": "habit",
+            "confidence": 0.6682766054063585,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.23,
+            "text": "Noisy neighbors at night wreck my sleep.",
+            "source": "graphiti_fact",
+            "domain": "wellness",
+            "intent": "express_emotion",
+            "memory_type": "habit",
+            "confidence": 0.6568964991429466,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u3",
+            "score": 0.23,
+            "text": "Client asked for another analytics chart.",
+            "source": "graphiti_fact",
+            "domain": "work",
+            "intent": "share_update",
+            "memory_type": "relationship",
+            "confidence": 0.6046615194833271,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u6",
+            "score": 0.23,
+            "text": "I replied to two emails.",
+            "source": "graphiti_fact",
+            "domain": "general",
+            "intent": "share_update",
+            "memory_type": "preference",
+            "confidence": 0.6588128659562893,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 2.0
+      },
+      "after": {
+        "top": [
+          {
+            "id": "u5",
+            "score": 0.7262,
+            "text": "Home environment cues are tightly coupled with food and sleep behavior.",
+            "source": "graphiti_session_summary",
+            "domain": "wellness",
+            "intent": "reflect",
+            "memory_type": "habit",
+            "confidence": 0.7319711119715239,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u1",
+            "score": 0.3661,
+            "text": "When the apartment is cluttered I stop cooking and order junk.",
+            "source": "graphiti_fact",
+            "domain": "home",
+            "intent": "express_emotion",
+            "memory_type": "habit",
+            "confidence": 0.6682766054063585,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u2",
+            "score": 0.3651,
+            "text": "Noisy neighbors at night wreck my sleep.",
+            "source": "graphiti_fact",
+            "domain": "wellness",
+            "intent": "express_emotion",
+            "memory_type": "habit",
+            "confidence": 0.6568964991429466,
+            "classification_method": "embeddings",
+            "expected_relevant": true
+          },
+          {
+            "id": "u6",
+            "score": 0.3134,
+            "text": "I replied to two emails.",
+            "source": "graphiti_fact",
+            "domain": "general",
+            "intent": "share_update",
+            "memory_type": "preference",
+            "confidence": 0.6588128659562893,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          },
+          {
+            "id": "u3",
+            "score": 0.3072,
+            "text": "Client asked for another analytics chart.",
+            "source": "graphiti_fact",
+            "domain": "work",
+            "intent": "share_update",
+            "memory_type": "relationship",
+            "confidence": 0.6046615194833271,
+            "classification_method": "embeddings",
+            "expected_relevant": false
+          }
+        ],
+        "hits_at_k": 3,
+        "dcg_at_k": 2.0
+      },
+      "delta": {
+        "hits_at_k": 0,
+        "dcg_at_k": 0.0
+      },
+      "status": "unchanged"
+    }
+  ]
+}

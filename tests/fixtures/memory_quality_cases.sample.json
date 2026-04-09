@@ -1,0 +1,24 @@
+{
+  "cases": [
+    {
+      "name": "hospital_reason_precision",
+      "tenantId": "default",
+      "userId": "<replace_user_id>",
+      "query": "why did I go to hospital",
+      "limit": 6,
+      "must_contain_any": ["hospital", "kidney stone", "kidney stones"],
+      "must_include_sources": ["graphiti", "user_model"],
+      "max_latency_ms": 1800
+    },
+    {
+      "name": "relationship_recall",
+      "tenantId": "default",
+      "userId": "<replace_user_id>",
+      "query": "what is happening with my relationship",
+      "limit": 6,
+      "must_contain_any": ["relationship", "partner", "broke up", "reconnect"],
+      "must_include_sources": ["user_model"],
+      "max_latency_ms": 1800
+    }
+  ]
+}

@@ -244,6 +244,43 @@ Docs:
 - `docs/SOPHIE_ORCHESTRATOR_INTEGRATION_V1.md`
 - `AUDIT_MEMORY_V1.md`
 - `DECISIONS.md`
+- `CHANGELOG.md`
+- `docs/MEMORY_ARCHITECTURE_V1.md`
+- `docs/MEMORY_RETRIEVAL_CONTRACT_V1.md`
+- `docs/MEMORY_QUALITY_SCORECARD.md`
+- `docs/SEMANTIC_RERANK_DIAGNOSTICS.md`
+- `docs/DERIVED_MODEL_AND_STEERING_SCHEMA.md`
+
+## Tenant Alias Canonicalization
+- Runtime canonicalizes known tenant aliases at request ingress (query + JSON body).
+- Current alias mapping includes:
+  - `sophie-prod` -> `default`
+- Read-path compatibility:
+  - `/memory/query` and `/user/model` fan out across canonical + alias scope to avoid historical split loss.
+- Physical consolidation:
+  - Migration `025_tenant_alias_consolidation.sql` consolidates historical rows from `sophie-prod` into `default`.
+
+Run migrations against local docker Postgres:
+```bash
+cd /opt/synapse
+set -a && source .env && set +a
+export DATABASE_URL="postgresql://synapse:${POSTGRES_PASSWORD}@127.0.0.1:5432/synapse"
+.venv/bin/python - <<'PY'
+import asyncio
+from src.db import Database
+from src.migrate import run_migrations
+
+async def main():
+    db = Database()
+    try:
+        await run_migrations(db)
+        print("migrations_applied_ok")
+    finally:
+        await db.close()
+
+asyncio.run(main())
+PY
+```
 
 Memory surface audit (cross-check `default` and `sophie-prod` for one user/fact):
 ```bash
@@ -252,6 +289,13 @@ python3 scripts/audit_memory_surfaces.py \
   --user-id <user_id> \
   --needle "kidney stones" \
   --tenant default --tenant sophie-prod
+```
+
+Memory quality evaluator (fixture-driven):
+```bash
+python3 scripts/evaluate_memory_quality.py \
+  --base-url http://localhost:8000 \
+  --cases tests/fixtures/memory_quality_cases.sample.json
 ```
 
 ## Key concepts

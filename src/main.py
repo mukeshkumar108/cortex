@@ -50,6 +50,12 @@ from .ingestion import ingest as process_ingest
 from .briefing import build_briefing
 from .migrate import run_migrations
 from .openrouter_client import get_llm_client
+from .memory_taxonomy import (
+    classify_memory_semantic_fallback,
+    classify_memory_candidates_semantic,
+    summarize_domain_distribution,
+    summarize_label_distribution,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -7369,16 +7375,239 @@ async def memory_query(request: MemoryQueryRequest):
         )
         deduped_fact_rows = deduped_fact_rows[:fact_limit]
 
-        fact_models = [
-            Fact(
-                text=_normalize_text(row.get("text")),
-                relevance=row.get("relevance"),
-                source=row.get("source"),
-                relevance_tier=row.get("relevance_tier"),
-            )
+        semantic_items = [
+            {
+                "text": _normalize_text(row.get("text")),
+                "source": _normalize_text(row.get("source")),
+            }
             for row in deduped_fact_rows
             if _normalize_text(row.get("text"))
         ]
+        semantic_audit: Dict[str, Any] = {}
+        semantic_enabled = bool(get_settings().memory_semantic_enabled)
+        semantic_results = await classify_memory_candidates_semantic(
+            semantic_items,
+            llm_client=get_llm_client(),
+            semantic_enabled=semantic_enabled,
+            enable_embedding_fallback=bool(get_settings().memory_semantic_embedding_enabled),
+            embedding_model=get_settings().memory_semantic_embedding_model,
+            audit_stats=semantic_audit,
+        )
+        fallback_semantic_results = [
+            classify_memory_semantic_fallback(
+                item.get("text"),
+                source_hint=item.get("source"),
+            )
+            for item in semantic_items
+        ]
+
+        query_semantic_rows = await classify_memory_candidates_semantic(
+            [{"text": _normalize_text(request.query), "source": "query"}],
+            llm_client=get_llm_client(),
+            semantic_enabled=semantic_enabled,
+            enable_embedding_fallback=bool(get_settings().memory_semantic_embedding_enabled),
+            embedding_model=get_settings().memory_semantic_embedding_model,
+            audit_stats=None,
+        )
+        query_semantic = (
+            query_semantic_rows[0]
+            if query_semantic_rows
+            else classify_memory_semantic_fallback(request.query, source_hint="query")
+        )
+        query_domain = _normalize_text(query_semantic.domain)
+        query_intent = _normalize_text(query_semantic.intent)
+        query_memory_type = _normalize_text(query_semantic.memory_type)
+        query_domain_scores = query_semantic.domain_scores or {}
+        ranked_query_domains = sorted(
+            (query_domain_scores or {}).items(),
+            key=lambda kv: float(kv[1]),
+            reverse=True,
+        )
+        query_domain_peak = float(ranked_query_domains[0][1]) if ranked_query_domains else 0.0
+        query_domain_focus: set[str] = set()
+        for idx, (key, raw_score) in enumerate(ranked_query_domains):
+            score = float(raw_score or 0.0)
+            # Keep focus sparse so weak query-domain probabilities do not add noise.
+            if idx >= 2 and score < 0.22:
+                continue
+            normalized = _normalize_text(key)
+            if normalized:
+                query_domain_focus.add(normalized)
+            if len(query_domain_focus) >= 4:
+                break
+        if query_domain_peak < 0.20:
+            # Low-certainty query domain outputs are treated as weak evidence.
+            query_domain_focus.clear()
+        if query_domain and not query_domain_focus:
+            query_domain_focus.add(query_domain)
+
+        emotion_signal = max(
+            float(query_domain_scores.get("worries") or 0.0),
+            float(query_domain_scores.get("wellness") or 0.0),
+            float(query_domain_scores.get("relationships") or 0.0),
+        )
+        finance_signal = float(query_domain_scores.get("finance") or 0.0)
+        emotion_focus_query = (
+            query_intent in {"express_emotion", "reflect"}
+            or emotion_signal >= 0.34
+        )
+        finance_focus_query = (
+            query_domain == "finance"
+            or finance_signal >= 0.34
+            or ("finance" in query_domain_focus and query_intent in {"express_emotion", "reflect", "share_update"})
+        )
+
+        def _semantic_rank_bonus(
+            semantic: Optional[Any],
+            row_source: Optional[str] = None,
+            fallback_semantic: Optional[Any] = None,
+        ) -> float:
+            if not semantic_enabled:
+                return 0.0
+            if not semantic:
+                return 0.0
+            score = 0.0
+            source = _normalize_text(row_source)
+            domain = _normalize_text(getattr(semantic, "domain", None))
+            if domain and domain in query_domain_focus:
+                score += 0.10
+            domain_scores = getattr(semantic, "domain_scores", None) or {}
+            if isinstance(domain_scores, dict):
+                for domain_key in query_domain_focus:
+                    score += min(0.03, float(domain_scores.get(domain_key) or 0.0) * 0.06)
+            intent = _normalize_text(getattr(semantic, "intent", None))
+            if query_intent and intent and intent == query_intent:
+                score += 0.05
+            memory_type = _normalize_text(getattr(semantic, "memory_type", None))
+            if (
+                query_intent not in {"make_commitment", "reflect"}
+                and query_memory_type
+                and memory_type
+                and memory_type == query_memory_type
+            ):
+                score += 0.05
+            if query_intent == "make_commitment":
+                if intent in {"make_commitment", "reflect", "express_emotion"}:
+                    score += 0.06
+                if memory_type in {"habit", "goal", "event", "relationship"}:
+                    score += 0.06
+                if intent == "ask_help" and memory_type in {"relationship", "state", "habit"}:
+                    score += 0.03
+                if intent == "share_update" and memory_type in {"state", "fact"}:
+                    score -= 0.05
+            elif query_intent == "reflect":
+                if intent in {"reflect", "express_emotion", "make_commitment"}:
+                    score += 0.05
+                if memory_type in {"state", "habit", "relationship", "goal"}:
+                    score += 0.05
+            if (
+                source == "user_model"
+                and query_intent in {"make_commitment", "reflect"}
+                and intent in {"reflect", "share_update"}
+                and memory_type in {"habit", "state", "fact"}
+            ):
+                score -= 0.05
+            fallback_intent = _normalize_text(getattr(fallback_semantic, "intent", None))
+            fallback_memory_type = _normalize_text(getattr(fallback_semantic, "memory_type", None))
+            # Soft tie-break: if the semantic classifier is generic but fallback carries
+            # a stronger intent signal, use it as a small nudge (never as primary logic).
+            if (
+                query_intent in {"make_commitment", "reflect", "express_emotion"}
+                and intent == "share_update"
+                and fallback_intent
+                and fallback_intent != "share_update"
+            ):
+                score += 0.04
+                if fallback_intent == query_intent:
+                    score += 0.03
+                if fallback_memory_type in {"habit", "goal", "relationship", "state"}:
+                    score += 0.02
+            confidence = float(getattr(semantic, "confidence", 0.0) or 0.0)
+            score += min(0.12, max(0.0, confidence) * 0.12)
+
+            # Query-text guardrails to reduce broad share_update/event over-ranking on
+            # emotional and finance retrieval asks when query semantic fallback is noisy.
+            if emotion_focus_query:
+                if intent in {"express_emotion", "reflect"}:
+                    score += 0.11
+                if memory_type in {"state", "habit", "relationship"}:
+                    score += 0.06
+                if domain in {"worries", "wellness", "relationships", "finance"}:
+                    score += 0.05
+                if intent in {"share_update", "ask_help"}:
+                    score -= 0.07
+                if memory_type in {"event", "goal", "preference"}:
+                    score -= 0.05
+                if source == "user_model" and intent == "share_update" and memory_type == "event":
+                    score -= 0.08
+
+            if finance_focus_query:
+                if domain in {"finance", "worries"}:
+                    score += 0.14
+                if intent == "express_emotion":
+                    score += 0.08
+                if memory_type in {"state", "habit", "relationship"}:
+                    score += 0.04
+                if domain == "work" and intent == "share_update" and memory_type == "event":
+                    score -= 0.14
+                if source == "user_model" and domain not in {"finance", "worries"} and memory_type == "event":
+                    score -= 0.10
+            return score
+
+        reranked_rows: List[Tuple[float, int, Dict[str, Any], Optional[Any]]] = []
+        for idx, row in enumerate(deduped_fact_rows):
+            semantic = semantic_results[idx] if idx < len(semantic_results) else None
+            fallback_semantic = (
+                fallback_semantic_results[idx]
+                if idx < len(fallback_semantic_results)
+                else None
+            )
+            base_score = float(row.get("relevance") or 0.0)
+            semantic_bonus = _semantic_rank_bonus(
+                semantic,
+                row_source=row.get("source"),
+                fallback_semantic=fallback_semantic,
+            )
+            source_bonus = 0.03 if str(row.get("source")).startswith("graphiti") else 0.0
+            final_score = base_score + semantic_bonus + source_bonus
+            reranked_rows.append((final_score, idx, row, semantic))
+        reranked_rows.sort(key=lambda item: item[0], reverse=True)
+        reranked_rows = reranked_rows[:fact_limit]
+
+        fact_models: List[Fact] = []
+        memory_candidates: List[Dict[str, Any]] = []
+        for final_score, _idx, row, semantic in reranked_rows:
+            text = _normalize_text(row.get("text"))
+            if not text:
+                continue
+            fact_models.append(
+                Fact(
+                    text=text,
+                    relevance=round(final_score, 4),
+                    source=row.get("source"),
+                    relevance_tier=row.get("relevance_tier"),
+                    domain=(semantic.domain if semantic else None),
+                    intent=(semantic.intent if semantic else None),
+                    memoryType=(semantic.memory_type if semantic else None),
+                    domainScores=(semantic.domain_scores if semantic else None),
+                    confidence=(semantic.confidence if semantic else None),
+                    classificationMethod=(semantic.classification_method if semantic else None),
+                    sourceTenant=_normalize_text(row.get("tenant_id")) or canonical_tenant,
+                )
+            )
+            if semantic:
+                memory_candidates.append(
+                    {
+                        "text": text,
+                        "domain": semantic.domain,
+                        "domain_scores": semantic.domain_scores,
+                        "intent": semantic.intent,
+                        "memory_type": semantic.memory_type,
+                        "confidence": semantic.confidence,
+                        "classification_method": semantic.classification_method,
+                        "source": _normalize_text(row.get("source")) or "unknown",
+                    }
+                )
         fact_texts = [item.text for item in fact_models]
         fact_texts_raw = fact_texts[:]
 
@@ -7396,6 +7625,36 @@ async def memory_query(request: MemoryQueryRequest):
             source = _normalize_text(item.source) or "unknown"
             provenance_counts[source] = int(provenance_counts.get(source) or 0) + 1
 
+        confidence_bucket_counts = {"lt_0_50": 0, "0_50_to_0_69": 0, "0_70_to_0_84": 0, "ge_0_85": 0}
+        for item in fact_models:
+            conf = float(item.confidence or 0.0)
+            if conf < 0.50:
+                confidence_bucket_counts["lt_0_50"] += 1
+            elif conf < 0.70:
+                confidence_bucket_counts["0_50_to_0_69"] += 1
+            elif conf < 0.85:
+                confidence_bucket_counts["0_70_to_0_84"] += 1
+            else:
+                confidence_bucket_counts["ge_0_85"] += 1
+
+        method_breakdown = summarize_label_distribution(
+            [{"classification_method": item.classificationMethod} for item in fact_models],
+            key="classification_method",
+            default="unknown",
+        )
+        total_classified = max(1, len(fact_models))
+        fallback_rate = float(method_breakdown.get("fallback", 0)) / float(total_classified)
+        embedding_failure_rate = 1.0 if bool(semantic_audit.get("embedding_failed")) else 0.0
+        logger.info(
+            "memory_query_semantic_metrics tenant=%s user=%s methods=%s fallback_rate=%.3f embedding_failure_rate=%.3f confidence_buckets=%s",
+            canonical_tenant,
+            request.userId,
+            method_breakdown,
+            fallback_rate,
+            embedding_failure_rate,
+            confidence_bucket_counts,
+        )
+
         response = MemoryQueryResponse(
             facts=fact_texts,
             factItems=fact_models,
@@ -7409,6 +7668,29 @@ async def memory_query(request: MemoryQueryRequest):
                 "tenantCanonical": canonical_tenant,
                 "tenantScope": tenant_scope,
                 "provenanceCounts": provenance_counts,
+                "domainBreakdown": summarize_domain_distribution(
+                    [{"domain": item.domain} for item in fact_models]
+                ),
+                "intentBreakdown": summarize_label_distribution(
+                    [{"intent": item.intent} for item in fact_models],
+                    key="intent",
+                ),
+                "memoryTypeBreakdown": summarize_label_distribution(
+                    [{"memory_type": item.memoryType} for item in fact_models],
+                    key="memory_type",
+                ),
+                "memoryCandidates": memory_candidates,
+                "classificationMethodBreakdown": method_breakdown,
+                "semanticClassificationAudit": semantic_audit,
+                "semanticFallbackRate": fallback_rate,
+                "embeddingFailureRate": embedding_failure_rate,
+                "confidenceDistribution": confidence_bucket_counts,
+                "rankingSignals": {
+                    "queryDomain": query_domain,
+                    "queryIntent": query_intent,
+                    "queryMemoryType": query_memory_type,
+                    "queryDomainFocus": sorted([x for x in query_domain_focus if x]),
+                },
             }
         )
         if not request.includeContext:

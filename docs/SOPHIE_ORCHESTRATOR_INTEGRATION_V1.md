@@ -183,7 +183,7 @@ Example response:
 ```
 
 ### GET /session/startbrief
-Returns a minimal start‑brief (small bridge + durable items).
+Returns a structured start‑brief packet for stateless runtime continuity.
 Exact request shape (query params):
 ```
 tenantId=<string>&userId=<string>&now=<ISO-8601 optional>&sessionId=<optional>&personaId=<optional>&timezone=<IANA optional>
@@ -191,18 +191,49 @@ tenantId=<string>&userId=<string>&now=<ISO-8601 optional>&sessionId=<optional>&p
 Exact response payload shape:
 ```json
 {
-  "timeOfDayLabel": "MORNING|AFTERNOON|EVENING|NIGHT|null",
-  "timeGapHuman": "string|null",
-  "bridgeText": "string|null",
-  "items": [
+  "handover_text": "string",
+  "narrative": "string|null",
+  "handover_depth": "continuation|yesterday|weekly",
+  "time_context": {
+    "local_time": "HH:MM",
+    "time_of_day": "MORNING|AFTERNOON|EVENING|NIGHT",
+    "gap_minutes": "number|null",
+    "sessions_today": "number",
+    "first_session_today": "boolean"
+  },
+  "resume": {
+    "use_bridge": "boolean",
+    "bridge_text": "string|null"
+  },
+  "ops_context": {
+    "top_loops_today": [],
+    "waiting_on": [],
+    "user_model_hints": [],
+    "yesterday_themes": [],
+    "steering_note": "string|null"
+  },
+  "evidence": {
+    "session_summary_ids_used": ["string"],
+    "session_summary_ids_fetched": ["string"],
+    "summary_fetch_count": "number",
+    "summary_used_count": "number",
+    "summary_content_quality": "ok|none_fetched|empty_after_normalization",
+    "fallback_used": "boolean",
+    "fallback_success": "boolean",
+    "daily_analysis_date_used": "YYYY-MM-DD|null",
+    "freshness": {
+      "has_pending_session_ingest_jobs": "boolean",
+      "pending_raw_episode_jobs": "number",
+      "pending_post_ingest_hook_jobs": "number",
+      "oldest_pending_age_seconds": "number|null",
+      "latest_pending_session_id": "string|null"
+    }
+  },
+  "entity_profiles": [
     {
-      "kind": "loop|tension",
-      "text": "string",
-      "type": "string|null",
-      "timeHorizon": "string|null",
-      "dueDate": "ISO-8601 string|null",
-      "salience": "number|null",
-      "lastSeenAt": "ISO-8601 string|null"
+      "name": "string",
+      "profile_text": "string",
+      "facts": ["string"]
     }
   ]
 }
@@ -210,23 +241,61 @@ Exact response payload shape:
 Example response:
 ```json
 {
-  "timeOfDayLabel": "AFTERNOON",
-  "timeGapHuman": "8 hours since last spoke",
-  "bridgeText": "Last time you spoke, you were focused on the portfolio refresh.",
-  "items": [
-    {"kind": "loop", "type": "thread", "text": "Finish portfolio site", "timeHorizon": "this_week", "salience": 4, "lastSeenAt": "2026-02-06T10:15:00Z"},
-    {"kind": "tension", "text": "Flaky tests in release pipeline"}
-  ]
+  "handover_text": "You last left with a clear commitment to send the message, but fear kept interrupting execution.",
+  "narrative": "The user is navigating relationship repair while managing work pressure.",
+  "handover_depth": "yesterday",
+  "time_context": {
+    "local_time": "14:20",
+    "time_of_day": "AFTERNOON",
+    "gap_minutes": 480,
+    "sessions_today": 1,
+    "first_session_today": false
+  },
+  "resume": {
+    "use_bridge": true,
+    "bridge_text": "Last time you spoke, the open thread was unresolved conflict repair."
+  },
+  "ops_context": {
+    "top_loops_today": ["Send apology message", "Follow up on release checklist"],
+    "waiting_on": [],
+    "user_model_hints": ["Relationship: Ashley (partner), currently active"],
+    "yesterday_themes": ["Avoidance under emotional load"],
+    "steering_note": "Anchor in one concrete action before expanding reflection."
+  },
+  "evidence": {
+    "session_summary_ids_used": ["session-abc"],
+    "session_summary_ids_fetched": ["session-abc", "session-def"],
+    "summary_fetch_count": 2,
+    "summary_used_count": 1,
+    "summary_content_quality": "ok",
+    "fallback_used": false,
+    "fallback_success": false,
+    "daily_analysis_date_used": "2026-04-08",
+    "freshness": {
+      "has_pending_session_ingest_jobs": false,
+      "pending_raw_episode_jobs": 0,
+      "pending_post_ingest_hook_jobs": 0,
+      "oldest_pending_age_seconds": null,
+      "latest_pending_session_id": null
+    }
+  },
+  "entity_profiles": []
 }
 ```
 Notes:
-- `bridgeText` is fact‑only, <= 280 chars, and excludes environment/observation by default.
-- `bridgeText` may be prefixed with one steering line from latest prior daily analysis:
-  - `Steering note: ...`
-- `bridgeText` is sourced from the latest Graphiti `SessionSummary` node (fallback: legacy episode summary).
-- Items come primarily from Postgres loops (salience + recency), with optional unresolved tensions from Graphiti.
-- `timeGapHuman` is derived from session/message timestamps when available, otherwise Graphiti episode time.
-- `timeOfDayLabel` uses `timezone` when provided (fallback UTC).
+- `handover_text` is generated from session summaries + loops + daily analysis + user model hints, with validation and safe fallback.
+- `resume.bridge_text` is sourced from the latest Graphiti `SessionSummary.bridge_text` when within TTL.
+- `ops_context` is structured runtime steering context (non-user-facing).
+- `evidence` provides provenance and freshness diagnostics for trust/traceability.
+- `entity_profiles` are relationship-focused profiles built from user model + Graphiti facts.
+
+### Tenant alias behavior
+- Known aliases are canonicalized at ingress for both query params and JSON payloads.
+- Current mapping includes `sophie-prod` -> `default`.
+- Read-path compatibility:
+  - `/memory/query` and `/user/model` fan out over canonical + alias scope to avoid historical split loss.
+- Physical consolidation:
+  - migration `025_tenant_alias_consolidation.sql` consolidates historical alias rows.
 
 ### POST /ingest
 Stores the turn in the session transcript and buffer.

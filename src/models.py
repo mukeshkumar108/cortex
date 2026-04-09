@@ -48,6 +48,13 @@ class Fact(BaseModel):
     relevance: Optional[float] = None
     source: Optional[str] = None
     relevance_tier: Optional[str] = None
+    domain: Optional[str] = None
+    intent: Optional[str] = None
+    memoryType: Optional[str] = None
+    domainScores: Optional[Dict[str, float]] = None
+    confidence: Optional[float] = None
+    classificationMethod: Optional[str] = None
+    sourceTenant: Optional[str] = None
 
 
 class Entity(BaseModel):
@@ -280,3 +287,41 @@ class HabitDailyLogUpsertResponse(BaseModel):
     nudged: bool
     userResponse: Optional[str] = None
     inferredFrom: Optional[str] = None
+
+
+class DerivedSignal(BaseModel):
+    key: str
+    value: Optional[float] = None
+    label: Optional[str] = None
+    confidence: Optional[float] = None
+    evidence: List[str] = []
+
+
+class DerivedUserModel(BaseModel):
+    schemaVersion: str = "v0.1"
+    generatedAt: str
+    userId: str
+    tenantId: Optional[str] = None
+    focusDomains: List[str] = []
+    dominantIntents: List[str] = []
+    activeSignals: List[DerivedSignal] = []
+    confidence: float = 0.0
+    provenance: Dict[str, Any] = {}
+    metadata: Dict[str, Any] = {}
+
+
+class RuntimeSteeringPacket(BaseModel):
+    schemaVersion: str = "v0.1"
+    generatedAt: str
+    userId: str
+    tenantId: Optional[str] = None
+    query: Optional[str] = None
+    queryDomain: Optional[str] = None
+    queryIntent: Optional[str] = None
+    queryMemoryType: Optional[str] = None
+    queryDomainFocus: List[str] = []
+    retrievalConfidence: Optional[float] = None
+    riskFlags: List[str] = []
+    steeringHints: List[str] = []
+    constraints: Dict[str, Any] = {}
+    metadata: Dict[str, Any] = {}

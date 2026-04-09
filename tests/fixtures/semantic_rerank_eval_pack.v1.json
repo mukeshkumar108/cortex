@@ -1,0 +1,146 @@
+{
+  "version": "v1",
+  "description": "Curated realistic utterance pool for semantic rerank pressure testing.",
+  "cases": [
+    {
+      "id": "c1_relationship_finance_emotional",
+      "query": "what is stressing him most with his partner right now",
+      "tags": ["emotional", "mixed_domain", "relationship", "finance"],
+      "expected_ids": ["u1", "u2", "u5"],
+      "utterances": [
+        {"id": "u1", "source": "graphiti_fact", "text": "My partner says she is carrying me financially and it hit hard."},
+        {"id": "u2", "source": "graphiti_fact", "text": "I avoid opening the rent app because my chest tightens."},
+        {"id": "u3", "source": "graphiti_fact", "text": "I promised to wake by 7 and walk daily."},
+        {"id": "u4", "source": "user_model", "text": "Current focus: shipping onboarding for the release."},
+        {"id": "u5", "source": "graphiti_session_summary", "text": "They argued late about money and feeling unsupported."},
+        {"id": "u6", "source": "graphiti_fact", "text": "I made lentil soup and watched a movie."}
+      ]
+    },
+    {
+      "id": "c2_multilingual_spanish_sleep",
+      "query": "sleep and stress pattern this week",
+      "tags": ["multilingual", "spanish", "wellness", "routines"],
+      "expected_ids": ["u1", "u2", "u4"],
+      "utterances": [
+        {"id": "u1", "source": "graphiti_fact", "text": "Duermo fatal, me despierto a las 3 y luego no regreso."},
+        {"id": "u2", "source": "graphiti_fact", "text": "Cuando no duermo me pongo irritable con todos."},
+        {"id": "u3", "source": "graphiti_fact", "text": "Client demo moved to Friday."},
+        {"id": "u4", "source": "graphiti_session_summary", "text": "Routine slipped all week: late phone scrolling, short sleep, high stress."},
+        {"id": "u5", "source": "graphiti_fact", "text": "I want to learn Rust in the evenings."},
+        {"id": "u6", "source": "user_model", "text": "Work context: preparing investor update deck."}
+      ]
+    },
+    {
+      "id": "c3_multilingual_german_work_anxiety",
+      "query": "what work pressure is he feeling",
+      "tags": ["multilingual", "german", "work", "worries"],
+      "expected_ids": ["u1", "u2", "u4"],
+      "utterances": [
+        {"id": "u1", "source": "graphiti_fact", "text": "Im Job fuehle ich mich gehetzt, alles ist dringend."},
+        {"id": "u2", "source": "graphiti_fact", "text": "Der Kunde droht abzuspringen wenn wir den Termin reissen."},
+        {"id": "u3", "source": "graphiti_fact", "text": "My sister visited and we cooked."},
+        {"id": "u4", "source": "graphiti_session_summary", "text": "Deadline fear plus uncertainty about team capacity."},
+        {"id": "u5", "source": "graphiti_fact", "text": "I should drink more water."},
+        {"id": "u6", "source": "user_model", "text": "Pattern: Juggles multiple active commitments and threads."}
+      ]
+    },
+    {
+      "id": "c4_indirect_emotion",
+      "query": "how is he feeling emotionally",
+      "tags": ["indirect", "emotional", "worries"],
+      "expected_ids": ["u1", "u2", "u4"],
+      "utterances": [
+        {"id": "u1", "source": "graphiti_fact", "text": "Everything feels loud and bright and I cannot settle."},
+        {"id": "u2", "source": "graphiti_fact", "text": "My body is tired but my mind keeps sprinting."},
+        {"id": "u3", "source": "graphiti_fact", "text": "Need to buy detergent and eggs."},
+        {"id": "u4", "source": "graphiti_session_summary", "text": "Overwhelm and restlessness dominated the evening."},
+        {"id": "u5", "source": "user_model", "text": "Current focus: finalize release notes."},
+        {"id": "u6", "source": "graphiti_fact", "text": "I read 20 pages of a novel."}
+      ]
+    },
+    {
+      "id": "c5_mixed_domain_health_work",
+      "query": "what is blocking consistency with workouts",
+      "tags": ["mixed_domain", "health", "work", "routines"],
+      "expected_ids": ["u1", "u2", "u5"],
+      "utterances": [
+        {"id": "u1", "source": "graphiti_fact", "text": "I skip workouts when meetings spill into the night."},
+        {"id": "u2", "source": "graphiti_fact", "text": "My knee flared up again after the run."},
+        {"id": "u3", "source": "graphiti_fact", "text": "I sent the investor memo."},
+        {"id": "u4", "source": "user_model", "text": "north star health goal: move daily and sleep on time."},
+        {"id": "u5", "source": "graphiti_session_summary", "text": "Intent to train is high but work spillover and pain interrupt routine."},
+        {"id": "u6", "source": "graphiti_fact", "text": "My partner likes the new couch color."}
+      ]
+    },
+    {
+      "id": "c6_multilingual_arabic_romanized_relationship",
+      "query": "relationship tension pattern",
+      "tags": ["multilingual", "relationship", "emotional", "mixed_domain"],
+      "expected_ids": ["u1", "u2", "u4"],
+      "utterances": [
+        {"id": "u1", "source": "graphiti_fact", "text": "Ana daiman baskut waqt el khena2 w ba3den andam."},
+        {"id": "u2", "source": "graphiti_fact", "text": "She says I disappear into work when things get hard."},
+        {"id": "u3", "source": "graphiti_fact", "text": "Need to renew hosting and domain."},
+        {"id": "u4", "source": "graphiti_session_summary", "text": "Repeated rupture-repair cycle: withdrawal during conflict, remorse later."},
+        {"id": "u5", "source": "user_model", "text": "Work context: pushing API reliability fixes."},
+        {"id": "u6", "source": "graphiti_fact", "text": "I enjoyed mint tea after dinner."}
+      ]
+    },
+    {
+      "id": "c7_goal_vs_state",
+      "query": "is this a commitment or just reflection",
+      "tags": ["intent", "goal", "state"],
+      "expected_ids": ["u1", "u2", "u4"],
+      "utterances": [
+        {"id": "u1", "source": "graphiti_fact", "text": "I will send the apology message tonight."},
+        {"id": "u2", "source": "graphiti_fact", "text": "I keep rehearsing it and freezing."},
+        {"id": "u3", "source": "graphiti_fact", "text": "The weather is nicer now."},
+        {"id": "u4", "source": "graphiti_session_summary", "text": "Clear commitment stated, but fear-based delay pattern remains."},
+        {"id": "u5", "source": "user_model", "text": "Pattern: avoids high-stakes conversations when dysregulated."},
+        {"id": "u6", "source": "graphiti_fact", "text": "I fixed a small CSS issue."}
+      ]
+    },
+    {
+      "id": "c8_finance_multilingual_french",
+      "query": "money anxiety and rent risk",
+      "tags": ["multilingual", "french", "finance", "worries"],
+      "expected_ids": ["u1", "u2", "u5"],
+      "utterances": [
+        {"id": "u1", "source": "graphiti_fact", "text": "Je stresse pour le loyer, le compte baisse trop vite."},
+        {"id": "u2", "source": "graphiti_fact", "text": "I keep delaying the budget sheet because it makes me panic."},
+        {"id": "u3", "source": "graphiti_fact", "text": "Morning walk felt good today."},
+        {"id": "u4", "source": "user_model", "text": "Current focus: close onboarding bug backlog."},
+        {"id": "u5", "source": "graphiti_session_summary", "text": "Financial pressure is tightly linked to avoidance and shame."},
+        {"id": "u6", "source": "graphiti_fact", "text": "I watched a football match."}
+      ]
+    },
+    {
+      "id": "c9_learning_vs_work_noise",
+      "query": "what learning goal is active",
+      "tags": ["learning", "work", "mixed_domain"],
+      "expected_ids": ["u1", "u3", "u5"],
+      "utterances": [
+        {"id": "u1", "source": "graphiti_fact", "text": "I want to practice SQL joins every morning for 20 minutes."},
+        {"id": "u2", "source": "graphiti_fact", "text": "Production incidents keep eating my evenings."},
+        {"id": "u3", "source": "graphiti_fact", "text": "I enrolled in a short systems design course."},
+        {"id": "u4", "source": "user_model", "text": "Work context: stabilizing release pipeline."},
+        {"id": "u5", "source": "graphiti_session_summary", "text": "Learning goals exist but are fragile under work load."},
+        {"id": "u6", "source": "graphiti_fact", "text": "I cleaned the kitchen counter."}
+      ]
+    },
+    {
+      "id": "c10_home_health_overlap",
+      "query": "which home factors affect his health habits",
+      "tags": ["home", "health", "mixed_domain"],
+      "expected_ids": ["u1", "u2", "u5"],
+      "utterances": [
+        {"id": "u1", "source": "graphiti_fact", "text": "When the apartment is cluttered I stop cooking and order junk."},
+        {"id": "u2", "source": "graphiti_fact", "text": "Noisy neighbors at night wreck my sleep."},
+        {"id": "u3", "source": "graphiti_fact", "text": "Client asked for another analytics chart."},
+        {"id": "u4", "source": "user_model", "text": "north star work goal: ship reliable weekly cadence."},
+        {"id": "u5", "source": "graphiti_session_summary", "text": "Home environment cues are tightly coupled with food and sleep behavior."},
+        {"id": "u6", "source": "graphiti_fact", "text": "I replied to two emails."}
+      ]
+    }
+  ]
+}

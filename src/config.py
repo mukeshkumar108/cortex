@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     openrouter_model_identity: str = "amazon/nova-micro-v1"
     openrouter_model_fallback: str = "mistral/ministral-3b"
     openrouter_reasoning_enabled: bool = False
+    memory_semantic_enabled: bool = True
+    memory_semantic_embedding_enabled: bool = True
+    memory_semantic_embedding_model: str = "text-embedding-3-small"
 
     # Session settings
     session_close_gap_minutes: int = 30

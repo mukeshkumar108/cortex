@@ -1,6 +1,6 @@
 # Synapse Architecture Decisions (Source of Truth)
 
-Last updated: 2026-02-05
+Last updated: 2026-04-09
 
 ## Core Principles
 
@@ -16,6 +16,12 @@ Last updated: 2026-02-05
 ### 3) Tenant Isolation
 - All Postgres queries filter by `tenant_id`
 - Graphiti group_id = `f"{tenant_id}__{user_id}"`
+- Tenant aliases are canonicalized at ingress (query + JSON body), currently:
+  - `sophie-prod` -> `default`
+- Read-path compatibility fan-out:
+  - `/memory/query` and `/user/model` read canonical + known aliases
+- Physical consolidation:
+  - migration `025_tenant_alias_consolidation.sql` merges historical alias rows to canonical
 
 ### 4) Cost Discipline
 - Sliding window keeps hot context bounded (last 12 messages)
@@ -96,3 +102,14 @@ session_buffer (tenant_id, session_id)
 - No local semantic extraction; Graphiti is required for semantic memory
 - No automatic recall; orchestrator must call /memory/query
 - No metrics/alerts (logging only)
+
+## Recent Validation Decisions (2026-04-09)
+- Semantic rerank stays semantic-first:
+  - lexical query guardrails are not primary logic
+  - query semantics come from semantic classifier path, not keyword fallback
+- Confidence calibration improvements were made in semantic classification scoring
+  to reduce confidence compression and improve bucket spread.
+- Draft schemas were added for:
+  - `DerivedUserModel`
+  - `RuntimeSteeringPacket`
+  These are schema-only and not runtime-critical dependencies yet.
