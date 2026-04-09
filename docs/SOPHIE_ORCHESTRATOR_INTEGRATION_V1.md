@@ -17,7 +17,10 @@ Synapse is a memory backend. It stores operational session state in Postgres and
 ## How to use it (recommended)
 
 ### 1) Session start
-Optionally call `/brief` once to seed time + working memory.
+Call `/session/startbrief` as the canonical startup packet.
+
+`/brief` is internal minimal/fallback mode (time + working memory only).
+`/session/brief` is legacy/internal compatibility mode.
 
 ### 2) On‑demand memory
 Call `/memory/query` for targeted questions when needed:
@@ -27,19 +30,17 @@ Call `/memory/query` for targeted questions when needed:
 
 Call `/memory/loops` when you need prioritized procedural loops directly (commitments/habits/frictions/threads/decisions), optionally filtered by domain.
 
-### 2b) Start‑brief (optional)
-Call `/session/brief` to get a short narrative start‑brief derived from Graphiti’s
-custom entities (MentalState, Tension, Environment).
-Facts are filtered for quality (no single‑token/vague fragments). `narrativeSummary`
-is derived from Graphiti episode summaries and de‑duplicated from facts.
-Use `/session/startbrief` if you want a smaller bridgeText + durable items.
+### 2b) Startup packet modes
+- Canonical backend startup packet: `/session/startbrief`
+- Internal minimal/fallback: `/brief`
+- Legacy/internal compatibility: `/session/brief`
 
 ### 3) Ingest turns
 Send both user and assistant turns to `/ingest`.
 
 ## Endpoints
 
-### POST /brief (optional, minimal)
+### POST /brief (internal minimal/fallback)
 Returns temporal authority + working memory + rolling summary.
 
 ### POST /memory/query (Graphiti)
@@ -151,7 +152,7 @@ Runtime usage:
   - writes `north_star.*.goal` from loops/sessions (low confidence when inferred)
   - writes `north_star.*.vision` only from explicit user-stated signals (high confidence)
 
-### GET /session/brief
+### GET /session/brief (legacy/internal compatibility)
 Returns a structured start‑brief:
 - time gap since last episode
 - last 3 episode summaries
@@ -183,7 +184,7 @@ Example response:
 ```
 
 ### GET /session/startbrief
-Returns a structured start‑brief packet for stateless runtime continuity.
+Canonical startup packet for stateless runtime continuity.
 Exact request shape (query params):
 ```
 tenantId=<string>&userId=<string>&now=<ISO-8601 optional>&sessionId=<optional>&personaId=<optional>&timezone=<IANA optional>
@@ -215,6 +216,40 @@ Exact response payload shape:
   "evidence": {
     "session_summary_ids_used": ["string"],
     "session_summary_ids_fetched": ["string"],
+    "claim_ranking": [
+      {
+        "session_id": "string",
+        "score": "number",
+        "recency": "number",
+        "salience": "number",
+        "importance": "number",
+        "confidence": "number",
+        "contradiction_penalty": "number"
+      }
+    ],
+    "claim_ranking_defs": {
+      "salience": "Immediate intensity/urgency of a session claim (short-horizon prominence).",
+      "importance": "Durable relevance inferred from recurrence across recent sessions and alignment with active loops.",
+      "confidence": "Trust in claim quality based on summary quality and salience band."
+    },
+    "loop_ranking": [
+      {
+        "id": "string|null",
+        "text": "string",
+        "type": "string|null",
+        "score": "number",
+        "recency": "number",
+        "salience": "number",
+        "importance": "number",
+        "confidence": "number",
+        "contradiction_penalty": "number"
+      }
+    ],
+    "loop_ranking_defs": {
+      "salience": "Immediate urgency/intensity of the loop signal.",
+      "importance": "Durable relevance by loop type/time horizon and commitment durability.",
+      "confidence": "Trust in loop signal quality derived from explicit confidence or salience proxy."
+    },
     "summary_fetch_count": "number",
     "summary_used_count": "number",
     "summary_content_quality": "ok|none_fetched|empty_after_normalization",
@@ -265,6 +300,40 @@ Example response:
   "evidence": {
     "session_summary_ids_used": ["session-abc"],
     "session_summary_ids_fetched": ["session-abc", "session-def"],
+    "claim_ranking": [
+      {
+        "session_id": "session-abc",
+        "score": 0.92,
+        "recency": 1.0,
+        "salience": 1.0,
+        "importance": 0.9,
+        "confidence": 0.85,
+        "contradiction_penalty": 0.0
+      }
+    ],
+    "claim_ranking_defs": {
+      "salience": "Immediate intensity/urgency of a session claim (short-horizon prominence).",
+      "importance": "Durable relevance inferred from recurrence across recent sessions and alignment with active loops.",
+      "confidence": "Trust in claim quality based on summary quality and salience band."
+    },
+    "loop_ranking": [
+      {
+        "id": null,
+        "text": "Repair relationship with Jasmine",
+        "type": "thread",
+        "score": 0.74,
+        "recency": 0.55,
+        "salience": 1.0,
+        "importance": 0.72,
+        "confidence": 0.9,
+        "contradiction_penalty": 0.0
+      }
+    ],
+    "loop_ranking_defs": {
+      "salience": "Immediate urgency/intensity of the loop signal.",
+      "importance": "Durable relevance by loop type/time horizon and commitment durability.",
+      "confidence": "Trust in loop signal quality derived from explicit confidence or salience proxy."
+    },
     "summary_fetch_count": 2,
     "summary_used_count": 1,
     "summary_content_quality": "ok",
@@ -287,7 +356,13 @@ Notes:
 - `resume.bridge_text` is sourced from the latest Graphiti `SessionSummary.bridge_text` when within TTL.
 - `ops_context` is structured runtime steering context (non-user-facing).
 - `evidence` provides provenance and freshness diagnostics for trust/traceability.
+- `evidence.claim_ranking` and `evidence.loop_ranking` explain precedence decisions.
+- `salience` means immediate urgency/intensity; `importance` means durable relevance over time.
 - `entity_profiles` are relationship-focused profiles built from user model + Graphiti facts.
+
+### Internal debug ranking (for diagnostics)
+`GET /internal/debug/startbrief/ranking` returns full candidate rankings (summary + loops) with score components and selected winners.
+Use this to investigate stale/contradictory memory surfacing.
 
 ### Tenant alias behavior
 - Known aliases are canonicalized at ingress for both query params and JSON payloads.
@@ -342,8 +417,9 @@ Notes:
 - Memory query fails → orchestrator proceeds without semantic memory.
 
 ## Practical heuristics
-- Call `/brief` only at session start.
-- Use `/session/brief` when you want a narrative “start‑brief” in one call.
+- Prefer `/session/startbrief` as the only backend startup call.
+- Use `/brief` only as internal minimal/fallback mode.
+- Use `/session/brief` only for legacy/internal compatibility.
 - Cache memory query results per session to avoid repeated calls.
 - Ask Graphiti only when the user mentions a person, project, or asks for recall.
 - Close sessions after 15 minutes of user inactivity via `/session/close`.

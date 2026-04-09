@@ -113,3 +113,20 @@ session_buffer (tenant_id, session_id)
   - `DerivedUserModel`
   - `RuntimeSteeringPacket`
   These are schema-only and not runtime-critical dependencies yet.
+
+## Startbrief Precedence and Freshness Policy (2026-04-09)
+- `/session/startbrief` selection is score-based and evidence-driven.
+- Both session-summary claims and loop claims use explicit components:
+  - `recency`: newer evidence is weighted higher
+  - `salience`: immediate urgency/intensity
+  - `importance`: durable relevance across recurrence and loop alignment
+  - `confidence`: trust estimate for claim quality
+  - `contradiction_penalty`: demotion when claim conflicts with newer evidence
+- Contradiction precedence:
+  - newer reconciliation evidence takes precedence over older breakup framing
+  - stale contradictory relationship claims are penalized in ranking
+- Timestamp skew tolerance:
+  - near-future timestamp drift (clock skew) is tolerated to avoid dropping fresh summaries
+- Traceability:
+  - `/session/startbrief` returns ranking evidence (`claim_ranking`, `loop_ranking`, and definitions)
+  - `/internal/debug/startbrief/ranking` returns full candidate rankings for diagnostics

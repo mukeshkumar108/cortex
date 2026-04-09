@@ -260,6 +260,40 @@ tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z&sessionId=<optional>&pe
   "evidence": {
     "session_summary_ids_used": [],
     "session_summary_ids_fetched": [],
+    "claim_ranking": [
+      {
+        "session_id": "string",
+        "score": 0.0,
+        "recency": 0.0,
+        "salience": 0.0,
+        "importance": 0.0,
+        "confidence": 0.0,
+        "contradiction_penalty": 0.0
+      }
+    ],
+    "claim_ranking_defs": {
+      "salience": "Immediate intensity/urgency of a session claim (short-horizon prominence).",
+      "importance": "Durable relevance inferred from recurrence across recent sessions and alignment with active loops.",
+      "confidence": "Trust in claim quality based on summary quality and salience band."
+    },
+    "loop_ranking": [
+      {
+        "id": "string|null",
+        "text": "string",
+        "type": "string|null",
+        "score": 0.0,
+        "recency": 0.0,
+        "salience": 0.0,
+        "importance": 0.0,
+        "confidence": 0.0,
+        "contradiction_penalty": 0.0
+      }
+    ],
+    "loop_ranking_defs": {
+      "salience": "Immediate urgency/intensity of the loop signal.",
+      "importance": "Durable relevance by loop type/time horizon and commitment durability.",
+      "confidence": "Trust in loop signal quality derived from explicit confidence or salience proxy."
+    },
     "summary_fetch_count": 0,
     "summary_used_count": 0,
     "summary_content_quality": "ok|none_fetched|empty_after_normalization",
@@ -294,6 +328,40 @@ tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z&sessionId=<optional>&pe
   "evidence": {
     "session_summary_ids_used": ["session-abc"],
     "session_summary_ids_fetched": ["session-abc"],
+    "claim_ranking": [
+      {
+        "session_id": "session-abc",
+        "score": 0.92,
+        "recency": 1.0,
+        "salience": 1.0,
+        "importance": 0.9,
+        "confidence": 0.85,
+        "contradiction_penalty": 0.0
+      }
+    ],
+    "claim_ranking_defs": {
+      "salience": "Immediate intensity/urgency of a session claim (short-horizon prominence).",
+      "importance": "Durable relevance inferred from recurrence across recent sessions and alignment with active loops.",
+      "confidence": "Trust in claim quality based on summary quality and salience band."
+    },
+    "loop_ranking": [
+      {
+        "id": null,
+        "text": "Repair relationship with Jasmine",
+        "type": "thread",
+        "score": 0.74,
+        "recency": 0.55,
+        "salience": 1.0,
+        "importance": 0.72,
+        "confidence": 0.9,
+        "contradiction_penalty": 0.0
+      }
+    ],
+    "loop_ranking_defs": {
+      "salience": "Immediate urgency/intensity of the loop signal.",
+      "importance": "Durable relevance by loop type/time horizon and commitment durability.",
+      "confidence": "Trust in loop signal quality derived from explicit confidence or salience proxy."
+    },
     "summary_fetch_count": 1,
     "summary_used_count": 1,
     "summary_content_quality": "ok",
@@ -310,6 +378,31 @@ Notes:
 - Items come primarily from Postgres loops (salience + recency), with optional unresolved tensions from Graphiti.
 - `timeGapHuman` is derived from session/message timestamps when available, otherwise Graphiti episode time.
 - `timeOfDayLabel` uses `timezone` when provided (fallback UTC).
+- `evidence.claim_ranking` and `evidence.loop_ranking` expose why claims/loops were selected.
+- Terminology:
+  - `salience` = immediate urgency/intensity
+  - `importance` = durable relevance across recurrence/persistence
+
+---
+
+### GET /internal/debug/startbrief/ranking (internal)
+Debug-only ranking surface for traceability.
+
+**Query params**
+```
+tenantId=<string>&userId=<string>&now=<ISO-8601 optional>&timezone=<IANA optional>&limit=<3..20 optional>
+```
+
+**Headers**
+```
+x-internal-token: <INTERNAL_TOKEN>
+```
+
+**Behavior**
+- Returns full summary and loop candidate rankings with score components.
+- Includes selected winners and definitions for each scoring field.
+
+Use this endpoint to diagnose stale-memory precedence and ranking drift.
 
 ---
 

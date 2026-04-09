@@ -2950,6 +2950,49 @@ async def _generate_user_model_enrichment_proposal(
             for loop_item in (top_loops or [])
             if _normalize_text(getattr(loop_item, "text", ""))
         ]
+        reference_now_utc = window_end if window_end.tzinfo else window_end.replace(tzinfo=dt_timezone.utc)
+        active_relationship_names = _extract_active_relationship_names(current_model)
+        summary_texts_for_scoring = [_summary_text_for_scoring(s) for s in (session_summaries or []) if _summary_text_for_scoring(s)]
+        loop_texts_for_scoring = [_normalize_text(l.get("text")) for l in loops_payload if _normalize_text(l.get("text"))]
+        has_recent_reconciliation_signal = any(
+            re.search(r"\b(reconciled|back together|got back together)\b", text.lower())
+            for text in summary_texts_for_scoring
+        )
+        scored_session_rows: List[Dict[str, Any]] = []
+        for row in session_summaries or []:
+            metrics = _score_startbrief_summary(
+                summary=row,
+                reference_now_utc=reference_now_utc,
+                active_relationship_names=active_relationship_names,
+                has_recent_reconciliation_signal=has_recent_reconciliation_signal,
+                all_summary_texts=summary_texts_for_scoring,
+                loop_texts=loop_texts_for_scoring,
+            )
+            scored_session_rows.append(
+                {
+                    **metrics,
+                    "summary_facts": _normalize_text(row.get("summary_facts"))[:220],
+                    "created_at": _normalize_text(row.get("created_at")) or None,
+                }
+            )
+        scored_session_rows.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+        scored_loop_rows: List[Dict[str, Any]] = []
+        for row in loops_payload:
+            metrics = _score_startbrief_loop(
+                loop={
+                    "id": None,
+                    "text": row.get("text"),
+                    "type": row.get("type"),
+                    "salience": row.get("salience"),
+                    "lastSeenAt": None,
+                    "timeHorizon": row.get("time_horizon"),
+                    "confidence": None,
+                },
+                reference_now_utc=reference_now_utc,
+                has_recent_reconciliation_signal=has_recent_reconciliation_signal,
+            )
+            scored_loop_rows.append(metrics)
+        scored_loop_rows.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
         daily_payload: Dict[str, Any] = {}
         if latest_daily:
             daily_payload = {
@@ -2979,10 +3022,14 @@ async def _generate_user_model_enrichment_proposal(
             "- narrative_current: include approximate age markers for time-relative facts when possible (e.g., \"about 2 weeks ago\").\n"
             "- narrative_current: after ~30 days, drop stale items unless still evidenced; move to narrative_stable only if clearly durable.\n"
             "- Never assume current facts are still true without recent evidence.\n"
+            "- Precedence rule: prefer higher score evidence from SCORED_SESSION_CLAIMS_JSON and SCORED_LOOP_CLAIMS_JSON.\n"
+            "- If newer evidence contradicts older relationship status, keep newer evidence and drop older claim from narrative_current.\n"
             "- Describe the person only; do not give instructions/advice.\n\n"
             f"WINDOW_START: {window_start.isoformat()}\n"
             f"WINDOW_END: {window_end.isoformat()}\n\n"
             f"CURRENT_USER_MODEL_JSON:\n{json.dumps(current_model, ensure_ascii=True)}\n\n"
+            f"SCORED_SESSION_CLAIMS_JSON:\n{json.dumps(scored_session_rows[:8], ensure_ascii=True)}\n\n"
+            f"SCORED_LOOP_CLAIMS_JSON:\n{json.dumps(scored_loop_rows[:8], ensure_ascii=True)}\n\n"
             f"SESSION_INDEX_JSON:\n{json.dumps(session_summaries, ensure_ascii=True)}\n\n"
             f"TOP_5_LOOPS_JSON:\n{json.dumps(loops_payload, ensure_ascii=True)}\n\n"
             f"LATEST_DAILY_ANALYSIS_JSON:\n{json.dumps(daily_payload, ensure_ascii=True)}\n"
@@ -2997,6 +3044,17 @@ async def _generate_user_model_enrichment_proposal(
         if isinstance(narrative_payload, dict):
             narrative_stable = _normalize_text(narrative_payload.get("narrative_stable"))
             narrative_current = _normalize_text(narrative_payload.get("narrative_current"))
+            narrative_stable = _sanitize_enrichment_narrative_stable(
+                narrative_stable=narrative_stable,
+                current_model=current_model,
+            ) or ""
+            narrative_current = _sanitize_enrichment_narrative_current(
+                narrative_current=narrative_current,
+                session_summaries=session_summaries,
+                loop_texts=loop_texts_for_scoring,
+                current_model=current_model,
+                reference_now_utc=reference_now_utc,
+            ) or ""
             if narrative_stable:
                 proposal["narrative_stable"] = narrative_stable[:2000]
             if narrative_current:
@@ -3643,6 +3701,20 @@ def _parse_optional_dt(value: Any) -> Optional[datetime]:
         return datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+def _is_unreasonably_future(
+    candidate: Optional[datetime],
+    reference_now_utc: datetime,
+    tolerance: timedelta = timedelta(hours=2),
+) -> bool:
+    if not candidate:
+        return False
+    dt = candidate
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=dt_timezone.utc)
+    ref = reference_now_utc if reference_now_utc.tzinfo else reference_now_utc.replace(tzinfo=dt_timezone.utc)
+    return dt > (ref + tolerance)
 
 
 def should_use_bridge(
@@ -5486,6 +5558,387 @@ def _session_frequency_phrase(sessions_today_count: int) -> str:
     return f"This is the {_ordinal(sessions_today_count + 1)} conversation today"
 
 
+_NARRATIVE_RELATIVE_TIME_RE = re.compile(
+    r"\b(yesterday|today|recently|last night|last week|about \d+\s+(day|days|week|weeks|month|months)\s+ago)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _sentence_split(text: Optional[str]) -> List[str]:
+    clean = _normalize_text(text)
+    if not clean:
+        return []
+    return [_normalize_text(s) for s in re.split(r"(?<=[.!?])\s+", clean) if _normalize_text(s)]
+
+
+def _extract_active_relationship_names(model: Dict[str, Any]) -> List[str]:
+    out: List[str] = []
+    relationships = model.get("key_relationships")
+    if not isinstance(relationships, list):
+        return out
+    for row in relationships:
+        if not isinstance(row, dict):
+            continue
+        if _normalize_text(row.get("status")).lower() != "active":
+            continue
+        name = _normalize_text(row.get("name"))
+        if not name:
+            continue
+        if name.lower() in {x.lower() for x in out}:
+            continue
+        out.append(name)
+    return out
+
+
+def _sentence_conflicts_with_active_relationships(sentence: str, active_names: List[str]) -> bool:
+    lower = _normalize_text(sentence).lower()
+    if not lower or not active_names:
+        return False
+    for name in active_names:
+        n = re.escape(name.lower())
+        # If current relationship state is active, suppress stale breakup framing for that same entity.
+        if re.search(rf"\b(broke up|break up|breakup|split up|ex[-\s]?girlfriend|ex[-\s]?boyfriend)\b.*\b{n}\b", lower):
+            return True
+        if re.search(rf"\b{n}\b.*\b(broke up|break up|breakup|split up|ex[-\s]?girlfriend|ex[-\s]?boyfriend)\b", lower):
+            return True
+    return False
+
+
+def _sentence_conflicts_with_recent_reconciliation(sentence: str, evidence_texts: List[str]) -> bool:
+    lower = _normalize_text(sentence).lower()
+    if not lower:
+        return False
+    if not re.search(r"\b(broke up|break up|breakup|split up)\b", lower):
+        return False
+    evidence_blob = " ".join(_normalize_text(t).lower() for t in (evidence_texts or []) if _normalize_text(t))
+    if not evidence_blob:
+        return False
+    # Fresh reconciliation signal should dominate stale breakup summaries.
+    return bool(re.search(r"\b(reconciled|back together|got back together)\b", evidence_blob))
+
+
+def _build_startbrief_narrative(
+    narrative_stable: Optional[str],
+    narrative_current: Optional[str],
+    selected_summaries: List[Dict[str, Any]],
+    top_active_loops: List[Dict[str, Any]],
+    user_model: Dict[str, Any],
+) -> Optional[str]:
+    current_sentences = _sentence_split(narrative_current)
+    stable_sentences = _sentence_split(narrative_stable)
+    if not current_sentences and not stable_sentences:
+        return None
+
+    evidence_texts: List[str] = []
+    for s in selected_summaries or []:
+        for key in ("summary_facts", "summary_text", "moment", "index_text"):
+            value = _normalize_text(s.get(key))
+            if value:
+                evidence_texts.append(value)
+    for loop in top_active_loops or []:
+        text = _normalize_text(loop.get("text"))
+        if text:
+            evidence_texts.append(text)
+
+    evidence_terms = _query_terms(" ".join(evidence_texts))
+    active_relationship_names = _extract_active_relationship_names(user_model if isinstance(user_model, dict) else {})
+
+    kept_current: List[str] = []
+    for sentence in current_sentences:
+        if _sentence_conflicts_with_active_relationships(sentence, active_relationship_names):
+            continue
+        if _sentence_conflicts_with_recent_reconciliation(sentence, evidence_texts):
+            continue
+        overlap = _query_overlap_score(sentence, evidence_terms)
+        is_relative = bool(_NARRATIVE_RELATIVE_TIME_RE.search(sentence))
+        # Relative-time details must stay anchored to current evidence or they drift into stale trivia.
+        if is_relative and overlap < 0.45:
+            continue
+        if overlap < 0.2 and len(current_sentences) > 2:
+            continue
+        kept_current.append(sentence)
+        if len(kept_current) >= 4:
+            break
+
+    if kept_current:
+        return _truncate_at_word_boundary(" ".join(kept_current), 520)
+
+    kept_stable = [s for s in stable_sentences if not _NARRATIVE_RELATIVE_TIME_RE.search(s)]
+    if kept_stable:
+        return _truncate_at_word_boundary(" ".join(kept_stable[:2]), 320)
+    for s in selected_summaries or []:
+        fallback = _normalize_text(s.get("summary_facts") or s.get("summary_text") or s.get("moment"))
+        if fallback:
+            return _truncate_at_word_boundary(fallback, 260)
+    return None
+
+
+def _sanitize_enrichment_narrative_current(
+    narrative_current: Optional[str],
+    session_summaries: List[Dict[str, Any]],
+    loop_texts: List[str],
+    current_model: Dict[str, Any],
+    reference_now_utc: Optional[datetime] = None,
+) -> Optional[str]:
+    sentences = _sentence_split(narrative_current)
+    if not sentences:
+        return None
+    now_utc = reference_now_utc or datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=dt_timezone.utc)
+    active_relationship_names = _extract_active_relationship_names(current_model if isinstance(current_model, dict) else {})
+    evidence_texts: List[str] = []
+    for row in session_summaries or []:
+        for key in ("summary_facts", "moment", "bridge_text"):
+            value = _normalize_text(row.get(key))
+            if value:
+                evidence_texts.append(value)
+    for text in loop_texts or []:
+        clean = _normalize_text(text)
+        if clean:
+            evidence_texts.append(clean)
+    evidence_terms = _query_terms(" ".join(evidence_texts))
+    kept: List[str] = []
+    for sentence in sentences:
+        if _sentence_conflicts_with_active_relationships(sentence, active_relationship_names):
+            continue
+        if _sentence_conflicts_with_recent_reconciliation(sentence, evidence_texts):
+            continue
+        if _NARRATIVE_RELATIVE_TIME_RE.search(sentence) and _query_overlap_score(sentence, evidence_terms) < 0.45:
+            continue
+        kept.append(sentence)
+        if len(kept) >= 6:
+            break
+    if kept:
+        return _truncate_at_word_boundary(" ".join(kept), 1200)
+    # Fallback to best recent summary claims if LLM narrative is fully filtered.
+    scored_rows: List[Tuple[float, str]] = []
+    all_summary_texts = [_summary_text_for_scoring(s) for s in (session_summaries or []) if _summary_text_for_scoring(s)]
+    for row in session_summaries or []:
+        metrics = _score_startbrief_summary(
+            summary=row,
+            reference_now_utc=now_utc,
+            active_relationship_names=active_relationship_names,
+            has_recent_reconciliation_signal=any(
+                re.search(r"\b(reconciled|back together|got back together)\b", t.lower()) for t in all_summary_texts
+            ),
+            all_summary_texts=all_summary_texts,
+            loop_texts=loop_texts or [],
+        )
+        text = _summary_text_for_scoring(row)
+        if text:
+            scored_rows.append((metrics.get("score", 0.0), text))
+    scored_rows.sort(key=lambda x: x[0], reverse=True)
+    fallback_sentences = [text for _score, text in scored_rows[:2] if text]
+    if fallback_sentences:
+        return _truncate_at_word_boundary(" ".join(fallback_sentences), 420)
+    return None
+
+
+def _sanitize_enrichment_narrative_stable(
+    narrative_stable: Optional[str],
+    current_model: Dict[str, Any],
+) -> Optional[str]:
+    sentences = _sentence_split(narrative_stable)
+    if not sentences:
+        return None
+    active_relationship_names = _extract_active_relationship_names(current_model if isinstance(current_model, dict) else {})
+    kept: List[str] = []
+    for sentence in sentences:
+        if _NARRATIVE_RELATIVE_TIME_RE.search(sentence):
+            continue
+        if _sentence_conflicts_with_active_relationships(sentence, active_relationship_names):
+            continue
+        kept.append(sentence)
+        if len(kept) >= 10:
+            break
+    return _truncate_at_word_boundary(" ".join(kept), 2000) if kept else None
+
+
+def _summary_text_for_scoring(summary: Dict[str, Any]) -> str:
+    return _normalize_text(
+        summary.get("latest_thread_text")
+        or summary.get("summary_facts")
+        or summary.get("summary_text")
+        or summary.get("summary")
+        or summary.get("index_text")
+    )
+
+
+def _summary_salience_weight(raw: Any) -> float:
+    value = _normalize_text(raw).lower()
+    return {"high": 1.0, "medium": 0.7, "low": 0.4}.get(value, 0.5)
+
+
+def _summary_confidence_weight(raw_salience: Any, text: str) -> float:
+    base = {"high": 0.85, "medium": 0.65, "low": 0.45}.get(_normalize_text(raw_salience).lower(), 0.5)
+    if re.search(r"\blimited actionable detail\b", _normalize_text(text).lower()):
+        base = min(base, 0.35)
+    return max(0.0, min(1.0, base))
+
+
+def _summary_recency_weight(created_at: Optional[datetime], reference_now_utc: datetime) -> float:
+    if not created_at:
+        return 0.1
+    dt = created_at if created_at.tzinfo else created_at.replace(tzinfo=dt_timezone.utc)
+    ref = reference_now_utc if reference_now_utc.tzinfo else reference_now_utc.replace(tzinfo=dt_timezone.utc)
+    age_hours = max(0.0, (ref - dt).total_seconds() / 3600.0)
+    if age_hours <= 2:
+        return 1.0
+    if age_hours <= 12:
+        return 0.85
+    if age_hours <= 24:
+        return 0.7
+    if age_hours <= 72:
+        return 0.45
+    return 0.2
+
+
+def _estimate_summary_importance(
+    text: str,
+    all_summary_texts: List[str],
+    loop_texts: List[str],
+) -> float:
+    # Importance = enduring relevance across repeated mentions and active loop alignment.
+    # Salience is immediate intensity/urgency at the time of mention.
+    terms = _query_terms(text)
+    if not terms:
+        return 0.35
+    recurrence_hits = 0
+    for other in all_summary_texts:
+        other_clean = _normalize_text(other)
+        if not other_clean or other_clean == text:
+            continue
+        if _query_overlap_score(other_clean, terms) >= 0.55:
+            recurrence_hits += 1
+    loop_hits = 0
+    for loop_text in loop_texts:
+        if _query_overlap_score(loop_text, terms) >= 0.45:
+            loop_hits += 1
+    score = 0.35 + min(0.35, recurrence_hits * 0.18) + min(0.3, loop_hits * 0.15)
+    return max(0.0, min(1.0, score))
+
+
+def _score_startbrief_summary(
+    summary: Dict[str, Any],
+    reference_now_utc: datetime,
+    active_relationship_names: List[str],
+    has_recent_reconciliation_signal: bool,
+    all_summary_texts: List[str],
+    loop_texts: List[str],
+) -> Dict[str, Any]:
+    text = _summary_text_for_scoring(summary)
+    created_dt = _parse_optional_dt(summary.get("created_at"))
+    recency = _summary_recency_weight(created_dt, reference_now_utc)
+    salience = _summary_salience_weight(summary.get("salience"))
+    confidence = _summary_confidence_weight(summary.get("salience"), text)
+    importance = _estimate_summary_importance(text, all_summary_texts, loop_texts)
+
+    contradiction_penalty = 0.0
+    if _sentence_conflicts_with_active_relationships(text, active_relationship_names):
+        contradiction_penalty -= 0.35
+    if has_recent_reconciliation_signal and re.search(r"\b(broke up|break up|breakup|split up)\b", text.lower()):
+        contradiction_penalty -= 0.25
+    if re.search(r"\blimited actionable detail\b", text.lower()):
+        contradiction_penalty -= 0.15
+
+    total = (0.40 * recency) + (0.20 * salience) + (0.25 * importance) + (0.15 * confidence) + contradiction_penalty
+    return {
+        "session_id": _normalize_text(summary.get("session_id")),
+        "score": round(float(total), 4),
+        "recency": round(float(recency), 4),
+        "salience": round(float(salience), 4),
+        "importance": round(float(importance), 4),
+        "confidence": round(float(confidence), 4),
+        "contradiction_penalty": round(float(contradiction_penalty), 4),
+    }
+
+
+def _loop_salience_weight(raw: Any) -> float:
+    try:
+        v = float(raw)
+    except Exception:
+        return 0.5
+    # Loop salience is stored in 0..5 (mostly); normalize to 0..1.
+    if v > 1.0:
+        v = v / 5.0
+    return max(0.0, min(1.0, v))
+
+
+def _loop_recency_weight(last_seen_at: Any, reference_now_utc: datetime) -> float:
+    dt = _parse_optional_dt(last_seen_at)
+    if not dt:
+        return 0.2
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=dt_timezone.utc)
+    ref = reference_now_utc if reference_now_utc.tzinfo else reference_now_utc.replace(tzinfo=dt_timezone.utc)
+    age_hours = max(0.0, (ref - dt).total_seconds() / 3600.0)
+    if age_hours <= 6:
+        return 1.0
+    if age_hours <= 24:
+        return 0.8
+    if age_hours <= 72:
+        return 0.55
+    return 0.3
+
+
+def _loop_importance_weight(loop: Dict[str, Any]) -> float:
+    text = _normalize_text(loop.get("text"))
+    loop_type = _normalize_text(loop.get("type")).lower()
+    horizon = _normalize_text(loop.get("timeHorizon")).lower()
+    base = 0.35
+    if loop_type in {"thread", "commitment", "decision"}:
+        base += 0.25
+    if loop_type == "habit":
+        base += 0.18
+    if horizon in {"ongoing", "this_week"}:
+        base += 0.12
+    if _is_durable_commitment_text(text):
+        base += 0.1
+    return max(0.0, min(1.0, base))
+
+
+def _loop_confidence_weight(loop: Dict[str, Any]) -> float:
+    raw = loop.get("confidence")
+    if raw is not None:
+        return _normalize_confidence(raw, default=0.6)
+    salience = _loop_salience_weight(loop.get("salience"))
+    return max(0.35, min(0.9, 0.35 + (0.55 * salience)))
+
+
+def _loop_contradiction_penalty(loop: Dict[str, Any], has_recent_reconciliation_signal: bool) -> float:
+    text = _normalize_text(loop.get("text")).lower()
+    if not text:
+        return 0.0
+    if has_recent_reconciliation_signal and re.search(r"\b(breakup|break up|split up|process relationship guilt)\b", text):
+        return -0.25
+    return 0.0
+
+
+def _score_startbrief_loop(
+    loop: Dict[str, Any],
+    reference_now_utc: datetime,
+    has_recent_reconciliation_signal: bool,
+) -> Dict[str, Any]:
+    recency = _loop_recency_weight(loop.get("lastSeenAt"), reference_now_utc)
+    salience = _loop_salience_weight(loop.get("salience"))
+    importance = _loop_importance_weight(loop)
+    confidence = _loop_confidence_weight(loop)
+    contradiction_penalty = _loop_contradiction_penalty(loop, has_recent_reconciliation_signal)
+    total = (0.35 * recency) + (0.20 * salience) + (0.30 * importance) + (0.15 * confidence) + contradiction_penalty
+    return {
+        "id": _normalize_text(loop.get("id")) or None,
+        "text": _normalize_text(loop.get("text")),
+        "type": _normalize_text(loop.get("type")) or None,
+        "score": round(float(total), 4),
+        "recency": round(float(recency), 4),
+        "salience": round(float(salience), 4),
+        "importance": round(float(importance), 4),
+        "confidence": round(float(confidence), 4),
+        "contradiction_penalty": round(float(contradiction_penalty), 4),
+    }
+
+
 def select_startbrief_ingredients(
     reference_now: datetime,
     last_session_end: Optional[datetime],
@@ -5495,6 +5948,7 @@ def select_startbrief_ingredients(
     yesterday_daily_analysis: Dict[str, Any],
     top_active_loops: List[Dict[str, Any]],
     user_model_hints: List[str],
+    user_model: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     gap_minutes: Optional[int] = None
     if last_session_end:
@@ -5523,30 +5977,45 @@ def select_startbrief_ingredients(
     if not in_24h:
         in_24h = recent_session_summaries[:]
 
-    def _salience_rank_local(v: Any) -> int:
-        return {"high": 0, "medium": 1, "low": 2}.get(_normalize_text(v).lower(), 2)
+    loop_texts_for_importance = [_normalize_text(l.get("text")) for l in (top_active_loops or []) if _normalize_text(l.get("text"))]
+    summary_texts_for_importance = [_summary_text_for_scoring(s) for s in in_24h if _summary_text_for_scoring(s)]
+    active_relationship_names = _extract_active_relationship_names(user_model if isinstance(user_model, dict) else {})
+    has_recent_reconciliation_signal = any(
+        re.search(r"\b(reconciled|back together|got back together)\b", _summary_text_for_scoring(s).lower())
+        for s in in_24h
+    )
 
-    highest = sorted(
-        in_24h,
-        key=lambda s: (_salience_rank_local(s.get("salience")), -int((_parse_optional_dt(s.get("created_at")) or datetime.min.replace(tzinfo=dt_timezone.utc)).timestamp()))
-    )
+    scored_summaries: List[Tuple[Dict[str, Any], Dict[str, Any], float]] = []
+    for s in in_24h:
+        metrics = _score_startbrief_summary(
+            summary=s,
+            reference_now_utc=now_utc,
+            active_relationship_names=active_relationship_names,
+            has_recent_reconciliation_signal=has_recent_reconciliation_signal,
+            all_summary_texts=summary_texts_for_importance,
+            loop_texts=loop_texts_for_importance,
+        )
+        created_dt = _parse_optional_dt(s.get("created_at"))
+        created_ts = (
+            (created_dt.astimezone(dt_timezone.utc) if created_dt and created_dt.tzinfo else (created_dt.replace(tzinfo=dt_timezone.utc) if created_dt else datetime.min.replace(tzinfo=dt_timezone.utc))).timestamp()
+        )
+        scored_summaries.append((s, metrics, float(created_ts)))
+
+    scored_summaries.sort(key=lambda row: (row[1].get("score", 0.0), row[2]), reverse=True)
+    all_summary_scores: List[Dict[str, Any]] = [metrics for _summary_row, metrics, _created_ts in scored_summaries]
     selected: List[Dict[str, Any]] = []
-    if highest:
-        selected.append(highest[0])
-    most_recent = sorted(
-        in_24h,
-        key=lambda s: -int((_parse_optional_dt(s.get("created_at")) or datetime.min.replace(tzinfo=dt_timezone.utc)).timestamp())
-    )
-    for recent in most_recent:
-        if selected and recent.get("session_id") == selected[0].get("session_id"):
+    selected_summary_scores: List[Dict[str, Any]] = []
+    seen_session_ids = set()
+    for summary_row, metrics, _created_ts in scored_summaries:
+        sid = _normalize_text(summary_row.get("session_id"))
+        if sid and sid in seen_session_ids:
             continue
-        recent_salience = _normalize_text(recent.get("salience")).lower()
-        # Missing salience should not be treated the same as explicit low salience.
-        salience_allows_recent = (not recent_salience) or (recent_salience in {"high", "medium"})
-        if salience_allows_recent:
-            selected.append(recent)
+        if sid:
+            seen_session_ids.add(sid)
+        selected.append(summary_row)
+        selected_summary_scores.append(metrics)
+        if len(selected) >= 2:
             break
-    selected = selected[:2]
 
     filtered_loops: List[Dict[str, Any]] = []
     for loop in top_active_loops or []:
@@ -5568,7 +6037,31 @@ def select_startbrief_ingredients(
             if _normalize_text(l.get("text")) and not _is_low_value_loop(_normalize_text(l.get("text")), l.get("salience"))
         ][:2]
 
-    filtered_loops = sorted(filtered_loops, key=_loop_priority)[:2]
+    scored_loops: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for loop in filtered_loops:
+        metrics = _score_startbrief_loop(
+            loop=loop,
+            reference_now_utc=now_utc,
+            has_recent_reconciliation_signal=has_recent_reconciliation_signal,
+        )
+        scored_loops.append((loop, metrics))
+    scored_loops.sort(
+        key=lambda pair: (
+            pair[1].get("score", 0.0),
+            int(pair[0].get("salience") or 0),
+        ),
+        reverse=True,
+    )
+    all_loop_scores = [pair[1] for pair in scored_loops]
+    selected_loops = [pair[0] for pair in scored_loops[:2]]
+    selected_loop_scores = [pair[1] for pair in scored_loops[:5]]
+
+    loop_reason_by_text: Dict[str, str] = {}
+    for l in selected_loops:
+        text = _normalize_text(l.get("text"))
+        reason = _normalize_text(l.get("reason"))
+        if text and reason:
+            loop_reason_by_text[text.lower()] = reason
 
     last_thread_parts: List[str] = []
     tone_parts: List[str] = []
@@ -5612,13 +6105,9 @@ def select_startbrief_ingredients(
                 continuation_hint = bridge
                 break
 
-    open_threads = _dedupe_keep_order(unresolved_items + [_normalize_text(l.get("text")) for l in filtered_loops], limit=2)
+    open_threads = _dedupe_keep_order(unresolved_items + [_normalize_text(l.get("text")) for l in selected_loops], limit=2)
     open_thread_reasons = _dedupe_keep_order(
-        [
-            _normalize_text(l.get("reason"))
-            for l in filtered_loops
-            if _normalize_text(l.get("reason"))
-        ],
+        [loop_reason_by_text.get(t.lower(), "") for t in open_threads if loop_reason_by_text.get(t.lower(), "")],
         limit=2,
     )
     gap_human = _format_gap_human(gap_minutes)
@@ -5630,13 +6119,18 @@ def select_startbrief_ingredients(
         "gap_minutes": gap_minutes,
         "sessions_today_count": sessions_today_count,
         "selected_summaries": selected,
+        "selected_summary_scores": selected_summary_scores[:5],
+        "all_summary_scores": all_summary_scores[:20],
         "last_thread": _join_sentence_parts(last_thread_parts),
         "user_tone": _normalize_text(" ".join(_dedupe_keep_order(tone_parts, limit=2))),
         "open_threads": open_threads,
         "open_thread_reasons": open_thread_reasons,
-        "open_loops": [_normalize_text(l.get("text")) for l in filtered_loops[:2] if _normalize_text(l.get("text"))],
+        "open_loops": [_normalize_text(l.get("text")) for l in selected_loops[:2] if _normalize_text(l.get("text"))],
+        "selected_loops": selected_loops[:2],
+        "selected_loop_scores": selected_loop_scores[:5],
+        "all_loop_scores": all_loop_scores[:20],
         "continuation_hint": continuation_hint,
-        "now_state": _normalize_text(filtered_loops[0].get("text")) if filtered_loops else "",
+        "now_state": _normalize_text(selected_loops[0].get("text")) if selected_loops else "",
         "now_local": now_local,
         "gap_human": gap_human,
         "session_frequency": session_frequency,
@@ -5651,19 +6145,23 @@ def compose_ops_context(
     top_active_loops: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     top_loops_today: List[Dict[str, Any]] = []
-    filtered = []
-    for loop in top_active_loops:
+    filtered = ingredients.get("selected_loops") if isinstance(ingredients.get("selected_loops"), list) else []
+    if not filtered:
+        for loop in top_active_loops:
+            text = _normalize_text(loop.get("text"))
+            if not text:
+                continue
+            if _is_low_value_loop(text, loop.get("salience")):
+                continue
+            loop_type = _normalize_text(loop.get("type")).lower()
+            if loop_type == "commitment" and not _is_durable_commitment_text(text):
+                continue
+            filtered.append(loop)
+        filtered = sorted(filtered, key=_loop_priority)[:2]
+    for loop in filtered[:2]:
         text = _normalize_text(loop.get("text"))
         if not text:
             continue
-        if _is_low_value_loop(text, loop.get("salience")):
-            continue
-        loop_type = _normalize_text(loop.get("type")).lower()
-        if loop_type == "commitment" and not _is_durable_commitment_text(text):
-            continue
-        filtered.append(loop)
-    filtered = sorted(filtered, key=_loop_priority)[:2]
-    for loop in filtered:
         top_loops_today.append(
             {
                 "text": _normalize_text(loop.get("text")),
@@ -8365,6 +8863,7 @@ async def session_startbrief(
         last_activity_time: Optional[datetime] = None
         recent_session_summaries: List[Dict[str, Any]] = []
         user_model_hints: List[str] = []
+        user_model_data: Dict[str, Any] = {}
         user_model_narrative: Optional[str] = None
         user_model_narrative_stable: Optional[str] = None
         user_model_narrative_current: Optional[str] = None
@@ -8460,7 +8959,7 @@ async def session_startbrief(
                     continue
                 created_at = _normalize_text(normalized.get("created_at"))
                 created_dt = _parse_optional_dt(created_at)
-                if created_dt and created_dt.astimezone(dt_timezone.utc) > reference_now_utc:
+                if _is_unreasonably_future(created_dt, reference_now_utc):
                     continue
                 summary_facts = _normalize_text(normalized.get("latest_thread_text"))
                 tone = _normalize_text(normalized.get("tone"))
@@ -8501,7 +9000,7 @@ async def session_startbrief(
                             continue
                         created_at = _normalize_text(normalized.get("created_at"))
                         created_dt = _parse_optional_dt(created_at)
-                        if created_dt and created_dt.astimezone(dt_timezone.utc) > reference_now_utc:
+                        if _is_unreasonably_future(created_dt, reference_now_utc):
                             continue
                         summary_facts = _normalize_text(normalized.get("latest_thread_text"))
                         tone = _normalize_text(normalized.get("tone"))
@@ -8534,7 +9033,7 @@ async def session_startbrief(
                     or (attrs.get("reference_time") if isinstance(attrs, dict) else None)
                     or (normalized_latest.get("created_at") if normalized_latest else None)
                 )
-                if summary_end and summary_end.astimezone(dt_timezone.utc) > reference_now_utc:
+                if _is_unreasonably_future(summary_end, reference_now_utc):
                     summary_end = None
                 bridge_candidate = _normalize_text(
                     (normalized_latest.get("bridge_text") if normalized_latest else None) or (
@@ -8719,6 +9218,7 @@ async def session_startbrief(
             user_model_row = scoped_user_models[0] if scoped_user_models else None
             if user_model_row:
                 user_model = _normalize_user_model(user_model_row.get("model"))
+                user_model_data = user_model
                 user_model_narrative_stable = (
                     _normalize_text(user_model.get("narrative_stable"))
                     or _normalize_text(user_model_row.get("narrative_stable"))
@@ -8825,6 +9325,14 @@ async def session_startbrief(
             yesterday_daily_analysis=yesterday_analysis,
             top_active_loops=loop_items,
             user_model_hints=user_model_hints,
+            user_model=user_model_data,
+        )
+        startbrief_narrative = _build_startbrief_narrative(
+            narrative_stable=user_model_narrative_stable,
+            narrative_current=user_model_narrative_current,
+            selected_summaries=ingredients.get("selected_summaries") if isinstance(ingredients.get("selected_summaries"), list) else [],
+            top_active_loops=loop_items,
+            user_model=user_model_data,
         )
 
         # Optional bounded fallback: if nodes were fetched but produced no usable thread text,
@@ -8849,7 +9357,7 @@ async def session_startbrief(
                         continue
                     created_at = _normalize_text(normalized.get("created_at"))
                     created_dt = _parse_optional_dt(created_at)
-                    if created_dt and created_dt.astimezone(dt_timezone.utc) > reference_now_utc:
+                    if _is_unreasonably_future(created_dt, reference_now_utc):
                         continue
                     summary_facts = _normalize_text(normalized.get("latest_thread_text"))
                     tone = _normalize_text(normalized.get("tone"))
@@ -8881,6 +9389,7 @@ async def session_startbrief(
                         yesterday_daily_analysis=yesterday_analysis,
                         top_active_loops=loop_items,
                         user_model_hints=user_model_hints,
+                        user_model=user_model_data,
                     )
             except Exception as e:
                 logger.warning("startbrief properties fallback failed: %s", e)
@@ -8913,8 +9422,8 @@ async def session_startbrief(
             "yesterday_themes": ingredients.get("yesterday_themes", [])[:2],
             "steering_note": ingredients.get("steering_note"),
             "continuation_hint": resume_bridge_text if ingredients.get("depth_label") == "continuation" else None,
-            "user_narrative_stable": user_model_narrative_stable,
-            "user_narrative_current": user_model_narrative_current,
+            "user_narrative_stable": None,
+            "user_narrative_current": startbrief_narrative,
         }
         depth_label = ingredients.get("depth_label") or "yesterday"
         handover_text = None
@@ -8986,7 +9495,7 @@ async def session_startbrief(
 
         response = SessionStartBriefResponse(
             handover_text=_normalize_text(handover_text) or _sanitize_handover_tone(_fallback_handover_text(ingredients, depth_label)),
-            narrative=user_model_narrative,
+            narrative=startbrief_narrative,
             handover_depth=depth_label,
             time_context={
                 "local_time": local_time,
@@ -9003,6 +9512,18 @@ async def session_startbrief(
             evidence={
                 "session_summary_ids_used": evidence_ids[:2],
                 "session_summary_ids_fetched": fetched_summary_ids[:5],
+                "claim_ranking": ingredients.get("selected_summary_scores", [])[:5],
+                "loop_ranking": ingredients.get("selected_loop_scores", [])[:5],
+                "claim_ranking_defs": {
+                    "salience": "Immediate intensity/urgency of a session claim (short-horizon prominence).",
+                    "importance": "Durable relevance inferred from recurrence across recent sessions and alignment with active loops.",
+                    "confidence": "Trust in claim quality based on summary quality and salience band.",
+                },
+                "loop_ranking_defs": {
+                    "salience": "Immediate urgency/intensity of the loop signal.",
+                    "importance": "Durable relevance by loop type/time horizon and commitment durability.",
+                    "confidence": "Trust in loop signal quality derived from explicit confidence or salience proxy.",
+                },
                 "summary_fetch_count": len(fetched_summary_ids),
                 "summary_used_count": len(used_summary_ids),
                 "summary_content_quality": summary_content_quality,
@@ -9677,6 +10198,178 @@ async def debug_startbrief_history(
     except Exception as e:
         logger.error(f"Debug startbrief history failed: {e}")
         raise HTTPException(status_code=500, detail="Debug startbrief history failed")
+
+
+@app.get("/internal/debug/startbrief/ranking")
+async def debug_startbrief_ranking(
+    tenantId: str,
+    userId: str,
+    now: Optional[str] = None,
+    timezone: Optional[str] = None,
+    limit: int = 12,
+    x_internal_token: str | None = Header(default=None)
+):
+    _require_internal_token(x_internal_token)
+    try:
+        tenantId = _normalize_text(_canonical_tenant_id(tenantId)) or tenantId
+        safe_limit = max(3, min(int(limit or 12), 20))
+        reference_now = datetime.utcnow()
+        if now:
+            reference_now = datetime.fromisoformat(now.replace("Z", "+00:00"))
+        tzinfo = _resolve_timezone(timezone)
+        if reference_now.tzinfo is None:
+            reference_now = reference_now.replace(tzinfo=tzinfo or dt_timezone.utc)
+        if tzinfo:
+            reference_now = reference_now.astimezone(tzinfo)
+        reference_now_utc = reference_now.astimezone(dt_timezone.utc)
+
+        recent_session_summaries: List[Dict[str, Any]] = []
+        summary_nodes = await graphiti_client.get_recent_session_summary_nodes(
+            tenant_id=tenantId,
+            user_id=userId,
+            limit=safe_limit,
+        )
+        for node in summary_nodes or []:
+            normalized = _normalize_startbrief_session_summary_node(node)
+            if not normalized:
+                continue
+            created_at = _normalize_text(normalized.get("created_at"))
+            created_dt = _parse_optional_dt(created_at)
+            if _is_unreasonably_future(created_dt, reference_now_utc):
+                continue
+            summary_facts = _normalize_text(normalized.get("latest_thread_text"))
+            moment = _normalize_text(normalized.get("moment"))
+            if not summary_facts and not moment:
+                continue
+            recent_session_summaries.append({
+                "session_id": _normalize_text(normalized.get("session_id")),
+                "created_at": created_at,
+                "summary_facts": summary_facts,
+                "tone": _normalize_text(normalized.get("tone")),
+                "moment": moment,
+                "unresolved": normalized.get("unresolved") if isinstance(normalized.get("unresolved"), list) else [],
+                "decisions": normalized.get("decisions") if isinstance(normalized.get("decisions"), list) else [],
+                "salience": _normalize_text(normalized.get("salience")) or "low",
+                "summary_text": _normalize_text(normalized.get("summary_text")),
+                "bridge_text": _normalize_text(normalized.get("bridge_text")),
+                "reference_time": _normalize_text(normalized.get("reference_time") or created_at),
+            })
+
+        loop_items: List[Dict[str, Any]] = []
+        active_loops = await loops.get_top_loops_for_startbrief(
+            tenant_id=tenantId,
+            user_id=userId,
+            limit=safe_limit,
+            persona_id=None,
+        )
+        for loop_item in active_loops or []:
+            text = _normalize_text(getattr(loop_item, "text", ""))
+            if not text:
+                continue
+            loop_items.append(
+                {
+                    "id": _normalize_text(getattr(loop_item, "id", None)) or None,
+                    "kind": "loop",
+                    "text": text,
+                    "type": _normalize_text(getattr(loop_item, "type", "")) or None,
+                    "timeHorizon": _normalize_text(getattr(loop_item, "timeHorizon", "")) or None,
+                    "dueDate": _normalize_text(getattr(loop_item, "dueDate", "")) or None,
+                    "salience": int(getattr(loop_item, "salience", 0) or 0),
+                    "lastSeenAt": _normalize_text(getattr(loop_item, "lastSeenAt", "")) or None,
+                    "reason": _normalize_text((getattr(loop_item, "metadata", {}) or {}).get("reason")) or None,
+                    "confidence": getattr(loop_item, "confidence", None),
+                }
+            )
+
+        user_model_hints: List[str] = []
+        user_model_data: Dict[str, Any] = {}
+        try:
+            _, tenant_scope = _resolve_tenant_scope(tenantId)
+            scoped_user_models = await _fetch_user_model_rows_for_scope(tenant_scope=tenant_scope, user_id=userId)
+            user_model_row = scoped_user_models[0] if scoped_user_models else None
+            if user_model_row:
+                user_model_data = _normalize_user_model(user_model_row.get("model"))
+                user_model_hints = _extract_high_confidence_user_model_hints(
+                    user_model_data,
+                    threshold=float(get_settings().user_model_high_confidence)
+                )
+        except Exception:
+            user_model_data = {}
+            user_model_hints = []
+
+        yesterday_analysis = {"date": None, "themes": [], "steering_note": None}
+        try:
+            yesterday_analysis = await _get_yesterday_analysis_context(
+                tenant_id=tenantId,
+                user_id=userId,
+                reference_date=reference_now.date()
+            )
+        except Exception:
+            pass
+
+        last_activity_time: Optional[datetime] = None
+        try:
+            row = await db.fetchone(
+                """
+                SELECT messages
+                FROM session_transcript
+                WHERE tenant_id = $1 AND user_id = $2
+                  AND updated_at <= $3
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                tenantId,
+                userId,
+                reference_now_utc
+            )
+            messages = row.get("messages") if row else None
+            if isinstance(messages, list) and messages:
+                last_msg = messages[-1]
+                ts = last_msg.get("timestamp")
+                if isinstance(ts, str):
+                    try:
+                        last_activity_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    except Exception:
+                        last_activity_time = None
+        except Exception:
+            last_activity_time = None
+
+        ingredients = select_startbrief_ingredients(
+            reference_now=reference_now,
+            last_session_end=last_activity_time,
+            sessions_today_count=0,
+            time_of_day_label=_time_of_day_label(reference_now.replace(tzinfo=None)),
+            recent_session_summaries=recent_session_summaries,
+            yesterday_daily_analysis=yesterday_analysis,
+            top_active_loops=loop_items,
+            user_model_hints=user_model_hints,
+            user_model=user_model_data,
+        )
+        selected_summary_ids = [
+            _normalize_text(s.get("session_id"))
+            for s in ingredients.get("selected_summaries", [])
+            if _normalize_text(s.get("session_id"))
+        ]
+        return {
+            "tenantId": tenantId,
+            "userId": userId,
+            "reference_now": reference_now.isoformat(),
+            "summary_candidates_count": len(recent_session_summaries),
+            "loop_candidates_count": len(loop_items),
+            "selected_summary_ids": selected_summary_ids,
+            "selected_loop_texts": [_normalize_text(l.get("text")) for l in ingredients.get("selected_loops", []) if _normalize_text(l.get("text"))],
+            "summary_ranking": ingredients.get("all_summary_scores", []),
+            "loop_ranking": ingredients.get("all_loop_scores", []),
+            "defs": {
+                "salience": "Immediate urgency/intensity signal.",
+                "importance": "Durable relevance over time (recurrence + loop/domain persistence).",
+                "confidence": "Trust estimate for claim quality.",
+                "contradiction_penalty": "Negative weight when a claim conflicts with newer evidence."
+            }
+        }
+    except Exception as e:
+        logger.error(f"Debug startbrief ranking failed: {e}")
+        raise HTTPException(status_code=500, detail="Debug startbrief ranking failed")
 
 
 @app.post("/internal/debug/graphiti/query")

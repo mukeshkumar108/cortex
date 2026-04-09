@@ -2,11 +2,13 @@
 
 A FastAPI memory service with a sliding‑window session buffer and Graphiti‑native semantic memory. Designed to be reliable, tenant‑isolated, and cheap to run.
 
+Implementation evolution log: [docs/IMPROVEMENT_LOG.md](/opt/synapse/docs/IMPROVEMENT_LOG.md)
+
 ## What it does (short)
 - **/ingest**: writes turns to Postgres (rolling summary + last 12 messages). Never blocks.
-- **/brief**: minimal session seed (time + working memory + rolling summary).
-- **/session/startbrief**: structured start brief (`handover_text`, `handover_depth`, `time_context`, `resume`, `ops_context`, `evidence`). Optional `sessionId`, `personaId`, `timezone`.
-- **/session/brief**: Graphiti‑native start brief (structured briefContext + facts/openLoops/commitments + currentFocus).
+- **/session/startbrief**: canonical startup packet (`handover_text`, `handover_depth`, `time_context`, `resume`, `ops_context`, `evidence`). Optional `sessionId`, `personaId`, `timezone`.
+- **/brief**: internal minimal/fallback startup mode (time + working memory + rolling summary).
+- **/session/brief**: legacy/internal compatibility startup mode.
 - **/memory/query**: on‑demand Graphiti semantic recall (clean facts/entities payload by default).
 - **/memory/loops**: prioritized procedural loops (active + needs_review commitments/threads/habits/frictions/decisions; stale hidden).
 - **/user/model**: persistent structured user model with domain completeness scores.
@@ -31,15 +33,15 @@ curl -s http://localhost:8000/health
 
 ## API: minimal usage
 **Recommended loop**
-1) `/brief` once at session start (optional)
-2) `/session/brief` if you want a structured start‑brief (Graphiti)
-3) LLM responds
-4) `/ingest` user turn
-5) `/ingest` assistant turn
-6) Canonical finalization: call `/session/ingest`; `/session/close` is legacy/admin-safe and enqueue-only.
+1. `/session/startbrief` once at session start (canonical startup packet)
+2. LLM responds
+3. `/memory/query` on demand for targeted recall
+4. `/memory/loops` on demand for procedural loops
+5. `/user/model` on demand for durable user picture
+6. Canonical write-back/finalization: `/session/ingest`; `/session/close` remains legacy/admin-safe and enqueue-only.
 
 ## Quick API examples
-**POST /brief**
+**POST /brief (internal minimal/fallback)**
 ```bash
 curl -s http://localhost:8000/brief -H 'Content-Type: application/json' -d '{
   "tenantId": "tenant_a",
@@ -50,7 +52,7 @@ curl -s http://localhost:8000/brief -H 'Content-Type: application/json' -d '{
 }'
 ```
 
-**GET /session/brief**
+**GET /session/brief (legacy/internal compatibility)**
 ```bash
 curl -s "http://localhost:8000/session/brief?tenantId=tenant_a&userId=user_1&now=2026-02-06T10:15:00Z"
 ```
@@ -86,6 +88,40 @@ Exact response payload shape:
   "evidence": {
     "session_summary_ids_used": [],
     "session_summary_ids_fetched": [],
+    "claim_ranking": [
+      {
+        "session_id": "string",
+        "score": 0.0,
+        "recency": 0.0,
+        "salience": 0.0,
+        "importance": 0.0,
+        "confidence": 0.0,
+        "contradiction_penalty": 0.0
+      }
+    ],
+    "claim_ranking_defs": {
+      "salience": "Immediate intensity/urgency of a session claim (short-horizon prominence).",
+      "importance": "Durable relevance inferred from recurrence across recent sessions and alignment with active loops.",
+      "confidence": "Trust in claim quality based on summary quality and salience band."
+    },
+    "loop_ranking": [
+      {
+        "id": "string|null",
+        "text": "string",
+        "type": "string|null",
+        "score": 0.0,
+        "recency": 0.0,
+        "salience": 0.0,
+        "importance": 0.0,
+        "confidence": 0.0,
+        "contradiction_penalty": 0.0
+      }
+    ],
+    "loop_ranking_defs": {
+      "salience": "Immediate urgency/intensity of the loop signal.",
+      "importance": "Durable relevance by loop type/time horizon and commitment durability.",
+      "confidence": "Trust in loop signal quality derived from explicit confidence or salience proxy."
+    },
     "summary_fetch_count": 0,
     "summary_used_count": 0,
     "summary_content_quality": "ok|none_fetched|empty_after_normalization",
@@ -138,6 +174,11 @@ Exact response payload shape:
 
 Optional compatibility mode:
 - Set `"includeContext": true` to include `openLoops`, `commitments`, `contextAnchors`, `userStatedState`, `currentFocus`, `recallSheet`, and `supplementalContext`.
+
+## Internal debug
+- `GET /internal/debug/startbrief/ranking` (requires `x-internal-token`)
+  - Returns full summary and loop candidate rankings with score components.
+  - Use when diagnosing stale/contradictory startbrief context selection.
 
 **GET /memory/loops**
 ```bash
