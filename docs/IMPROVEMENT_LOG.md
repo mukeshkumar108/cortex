@@ -2,6 +2,25 @@
 
 Purpose: running implementation log for memory quality and retrieval/startbrief evolution.
 
+## 2026-04-10
+
+### Backend Productization Guidance
+- Added backend integration contract for production usage of:
+  - `/session/startbrief`
+  - `/memory/query` (`exact|episodic|hybrid`)
+  - `/entities/profile`
+  - `/memory/loops`
+  - `/session/ingest`
+- New doc:
+  - `docs/BACKEND_MEMORY_INTEGRATION_GUIDE_V1.md`
+- Added rollout checklist with:
+  - feature-flag sequence
+  - SLO/alert thresholds
+  - go/no-go criteria
+  - oncall triage + rollback plan
+- New doc:
+  - `docs/BACKEND_MEMORY_ROLLOUT_CHECKLIST_V1.md`
+
 ## 2026-04-09
 
 ### Startup Contract and Surface Clarity

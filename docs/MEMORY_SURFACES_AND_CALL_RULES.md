@@ -13,6 +13,7 @@ Backend-facing rule of thumb: one canonical startup packet, then call targeted s
 ## Endpoint roles
 - `GET /session/startbrief`: canonical startup packet for stateless continuity and runtime steering.
 - `POST /memory/query`: semantic recall for specific natural-language questions.
+  - Use `memoryIntent=exact|episodic|hybrid` to choose retrieval mode per prompt.
 - `GET /memory/loops`: prioritized procedural memory (commitments/threads/habits/frictions/decisions).
 - `GET /user/model`: synthesized durable user profile and completeness/staleness metadata.
 - `POST /entities/profile`: compact entity identity card (person/project/company/place/other) with facts, optional relevant loops, and provenance.
@@ -47,3 +48,7 @@ From `/session/startbrief`, backend should forward:
 - Ambient entity grounding is now first-class via `entity_hints`.
 - Entity deep-dive is available via `POST /entities/profile`.
 - Relationship identity handling in shared entity builder now promotes known relationship names to `person` with role when reliable role evidence exists in user model or recent summaries.
+
+## Production integration guide
+- For production routing/defaults/failure behavior and rollout metrics, use:
+  - `docs/BACKEND_MEMORY_INTEGRATION_GUIDE_V1.md`
