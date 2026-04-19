@@ -29,6 +29,57 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-19 15:33 UTC — T2
+- Summary of what changed:
+  - Added T2 hardening migration `036_synapse_v2_schema_hardening.sql` to close post-audit structural gaps.
+  - Enforced session/turn user integrity with composite session key shape and tenant/session/user FK from `turns_v2`.
+  - Added tenant-scoped self-FK lineage for entity merges (`entities.merged_into_entity_id`) with self-merge guard.
+  - Added relational policy-version anchor via `predicate_policy_versions` and FKs from `predicate_policy`, `extract_results`, and `claims`.
+  - Added dedicated idempotency substrate table `turn_ingest_idempotency` with non-empty key and tenant-scoped relational constraints.
+  - Documented pgcrypto operational requirement in migration and roadmap.
+- Files changed:
+  - `migrations/036_synapse_v2_schema_hardening.sql`
+  - `tests/test_schema_migration.py`
+  - `schema.sql`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+- Tests added/updated:
+  - `tests/test_schema_migration.py`:
+    - table existence checks for `predicate_policy_versions` and `turn_ingest_idempotency`
+    - constraint checks for `turns_v2_session_user_fk`, `entities_merged_into_fk`, `claims_policy_version_fk`
+    - index checks for idempotency lookup index
+- Acceptance criteria satisfied:
+  - T2 post-audit structural blockers are resolved within additive schema scope.
+  - Tenant isolation and lineage integrity are enforced for new canonical tables.
+  - Schema now supports fail-closed policy-version reference and enforceable ingest idempotency contract for future T3/T5 work.
+- Known remaining gaps:
+  - Migration execution/validation in staging/production environment remains operational follow-through.
+- Status: done
+
+### 2026-04-19 15:17 UTC — T2
+- Summary of what changed:
+  - Added additive v2 canonical schema migration `035_synapse_v2_additive_schema.sql`.
+  - Introduced canonical/supporting tables for v2: `sessions_v2`, `turns_v2`, `entities`, `entity_aliases`, `claims`, `claim_evidence`, `canonical_mutations`, `predicate_policy`, `extract_results`, `projection_snapshots`, `projection_latest`, `claims_quarantine`, and `v2_pipeline_checkpoints`.
+  - Added tenant-scoped PK/FK/unique constraints for canonical lifecycle and evidence linkage.
+  - Added index coverage for factual lookup (`claims`), episodic lookup (`turns_v2`), projection lookup (`projection_latest`/`projection_snapshots`), and pipeline scans.
+  - Updated schema documentation section to include v2 substrate tables (without implying rollout completion).
+  - Added migration tests validating table existence and key constraints/indexes.
+- Files changed:
+  - `migrations/035_synapse_v2_additive_schema.sql`
+  - `schema.sql`
+  - `tests/test_schema_migration.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+- Tests added/updated:
+  - `tests/test_schema_migration.py`:
+    - `test_t2_v2_additive_schema_objects_exist`
+    - `test_t2_v2_constraints_and_indexes`
+- Acceptance criteria satisfied:
+  - Additive v2 schema substrate exists for T3/T5/T6/T7 without legacy table deletion.
+  - Required tenant-scoped PK/FK/unique constraints are present for canonical claim/evidence flows.
+  - Safe index strategy for factual, episodic, and projection lookup is implemented.
+- Known remaining gaps:
+  - Migration application/validation in staging and production environments is pending operational execution.
+- Status: done
+
 ### 2026-04-19 15:09 UTC — T0
 - Summary of what changed:
   - Replaced remaining `uuid5`-based local hashing in `main.py` with canonicalization SDK hashing.

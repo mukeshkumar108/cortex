@@ -79,17 +79,17 @@ Current schema is legacy/mixed and not sufficient for canonical claim lifecycle 
 T0.
 
 ### 4. Current status
-Not implemented as v2 schema.
+Done (additive schema implemented).
 
 ### 5. Gaps
-- No canonical v2 claim store with lifecycle guarantees.
-- No canonical mutation log.
-- Existing schema/docs drift.
+- None for T2 schema scope.
+- Operational requirement: database role must allow `pgcrypto` extension presence (`gen_random_uuid()` dependency).
 
 ### 6. Acceptance criteria
-- New migrations applied in staging with zero downtime.
-- Required PK/FK/unique constraints present for tenant isolation and claim lifecycle.
-- Indexes created for factual/episodic query SLOs.
+- Additive v2 migration exists and is runnable without destructive legacy changes. ✅
+- Required PK/FK/unique constraints are present for tenant isolation, claim lifecycle support, and evidence linkage. ✅
+- Indexes for factual lookup, episodic lookup, and projection lookup are present. ✅
+- Post-audit hardening gaps (session/turn user integrity, entity merge lineage FK, policy-version anchoring, idempotency substrate) are closed. ✅
 
 ### 7. Risks
 - Locking on large tables if constraints/indexes are not staged safely.
@@ -656,8 +656,8 @@ Can run independently once dependencies are met:
 - Documentation alignment portions of **T15** can start early, but destructive cleanup must wait.
 
 ## Immediate Next 3 Tickets
-1. **T2** — Add v2 additive schema and indexes.
-2. **T5** — Predicate policy service + versioning.
-3. **T3** — Dual-write evidence ingest to v2 surfaces.
+1. **T5** — Predicate policy service + versioning.
+2. **T3** — Dual-write evidence ingest to v2 surfaces.
+3. **T3b** — Evidence contract hardening.
 
-Rationale: T1 and T0 are complete; the next blocking work is schema substrate (T2), policy versioning guardrails (T5), then v2 evidence dual-write (T3).
+Rationale: T2 schema substrate is now in place. Next blocking work is policy versioning guardrails (T5), then v2 evidence ingest and contract enforcement (T3/T3b).

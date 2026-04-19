@@ -175,3 +175,229 @@ ON graphiti_outbox(tenant_id, session_id);
 
 CREATE INDEX IF NOT EXISTS idx_graphiti_outbox_next_attempt
 ON graphiti_outbox(status, next_attempt_at);
+
+-- ---------------------------------------------------------------------------
+-- Synapse v2 additive canonical substrate (T2)
+-- Implemented via migrations/035_synapse_v2_additive_schema.sql
+-- This section documents table contracts only; rollout is controlled by flags.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS sessions_v2 (
+    tenant_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    started_at TIMESTAMPTZ,
+    ended_at TIMESTAMPTZ,
+    status TEXT NOT NULL DEFAULT 'open',
+    source TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, session_id)
+);
+
+CREATE TABLE IF NOT EXISTS turns_v2 (
+    turn_id BIGSERIAL PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    turn_index INT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    source_turn_id TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS entities (
+    entity_id UUID NOT NULL DEFAULT gen_random_uuid(),
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    canonical_name TEXT NOT NULL,
+    canonical_name_normalized TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    merged_into_entity_id UUID,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, entity_id)
+);
+
+CREATE TABLE IF NOT EXISTS entity_aliases (
+    alias_id BIGSERIAL PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    entity_id UUID NOT NULL,
+    alias_text TEXT NOT NULL,
+    alias_normalized TEXT NOT NULL,
+    is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+    confidence DOUBLE PRECISION,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    first_seen_at TIMESTAMPTZ,
+    last_seen_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS predicate_policy (
+    predicate_policy_id BIGSERIAL PRIMARY KEY,
+    policy_version TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    cardinality TEXT NOT NULL,
+    conflict_rule TEXT NOT NULL,
+    expected_object_type TEXT,
+    equivalence_rule TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT FALSE,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS extract_results (
+    extract_result_id BIGSERIAL PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    turn_id BIGINT,
+    extract_run_id UUID NOT NULL DEFAULT gen_random_uuid(),
+    model_version TEXT,
+    prompt_version TEXT,
+    predicate_policy_version TEXT,
+    status TEXT NOT NULL DEFAULT 'succeeded',
+    raw_output JSONB,
+    candidates JSONB,
+    error_text TEXT,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS claims (
+    claim_id BIGSERIAL PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    claim_slot_key TEXT NOT NULL,
+    claim_event_key TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    subject_entity_id UUID,
+    subject_text TEXT,
+    object_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    lifecycle_status TEXT NOT NULL DEFAULT 'active',
+    extraction_confidence DOUBLE PRECISION,
+    truth_confidence DOUBLE PRECISION,
+    predicate_policy_version TEXT,
+    source_extract_result_id BIGINT,
+    occurred_at TIMESTAMPTZ,
+    valid_from TIMESTAMPTZ,
+    valid_to TIMESTAMPTZ,
+    superseded_by_claim_id BIGINT,
+    retracted_at TIMESTAMPTZ,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS claim_evidence (
+    claim_evidence_id BIGSERIAL PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    claim_id BIGINT NOT NULL,
+    session_id TEXT NOT NULL,
+    turn_id BIGINT,
+    evidence_kind TEXT NOT NULL DEFAULT 'span',
+    evidence_text TEXT,
+    evidence_start_char INT,
+    evidence_end_char INT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS claims_quarantine (
+    quarantine_id BIGSERIAL PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    extract_result_id BIGINT,
+    candidate_payload JSONB NOT NULL,
+    reason TEXT NOT NULL,
+    quarantine_status TEXT NOT NULL DEFAULT 'pending',
+    reviewed_by TEXT,
+    reviewed_at TIMESTAMPTZ,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS canonical_mutations (
+    mutation_id BIGSERIAL PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    mutation_type TEXT NOT NULL,
+    claim_id BIGINT,
+    entity_id UUID,
+    source_extract_result_id BIGINT,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    committed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    committed_by TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE TABLE IF NOT EXISTS projection_snapshots (
+    snapshot_id BIGSERIAL PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    projection_type TEXT NOT NULL,
+    projection_version TEXT NOT NULL,
+    source_mutation_id BIGINT,
+    payload JSONB NOT NULL,
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE TABLE IF NOT EXISTS projection_latest (
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    projection_type TEXT NOT NULL,
+    projection_version TEXT NOT NULL,
+    source_mutation_id BIGINT,
+    payload JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (tenant_id, user_id, projection_type, projection_version)
+);
+
+CREATE TABLE IF NOT EXISTS v2_pipeline_checkpoints (
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    pipeline_name TEXT NOT NULL,
+    last_session_id TEXT,
+    last_turn_id BIGINT,
+    last_extract_result_id BIGINT,
+    last_mutation_id BIGINT,
+    last_run_at TIMESTAMPTZ,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, user_id, pipeline_name)
+);
+
+-- T2 hardening additions (post-audit)
+-- Requires pgcrypto for gen_random_uuid() where UUID defaults are used.
+
+CREATE TABLE IF NOT EXISTS predicate_policy_versions (
+    policy_version TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'draft',
+    description TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    activated_at TIMESTAMPTZ,
+    retired_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS turn_ingest_idempotency (
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    turn_id BIGINT NOT NULL,
+    source TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (tenant_id, user_id, session_id, idempotency_key)
+);
