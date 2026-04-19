@@ -154,6 +154,47 @@ async def test_session_ingest_dedupe_key_idempotent():
 
 
 @pytest.mark.asyncio
+async def test_session_ingest_empty_transcript_skips_graphiti_job():
+    tenant = f"tenant-{uuid4().hex}"
+    user = f"user-{uuid4().hex}"
+    session_id = f"session-{uuid4().hex}"
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                "/session/ingest",
+                json={
+                    "tenantId": tenant,
+                    "userId": user,
+                    "sessionId": session_id,
+                    "messages": [],
+                }
+            )
+            assert resp.status_code == 200
+            assert resp.json()["status"] == "skipped_empty_transcript"
+
+    conn = await asyncpg.connect(_db_url())
+    try:
+        count = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM graphiti_outbox
+            WHERE tenant_id = $1 AND user_id = $2 AND session_id = $3
+              AND job_type = 'session_raw_episode'
+            """,
+            tenant,
+            user,
+            session_id,
+        )
+        assert int(count or 0) == 0
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_session_ingest_dedupe_does_not_reset_sent_job():
     tenant = f"tenant-{uuid4().hex}"
     user = f"user-{uuid4().hex}"

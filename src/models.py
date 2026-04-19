@@ -122,15 +122,28 @@ class MemoryQueryRequest(BaseModel):
     userId: str
     query: str
     limit: Optional[int] = 10
+    memoryIntent: Optional[str] = Field(default="exact", pattern="^(exact|episodic|hybrid)$")
     referenceTime: Optional[str] = None
     includeContext: Optional[bool] = False
     focusQuery: Optional[str] = None
+
+
+class EpisodeRecallItem(BaseModel):
+    episodeId: Optional[str] = None
+    sessionId: Optional[str] = None
+    referenceTime: Optional[str] = None
+    score: Optional[float] = None
+    summary: Optional[str] = None
+    evidence: List[str] = []
+    linkedEntities: List[str] = []
+    sourceTenant: Optional[str] = None
 
 
 class MemoryQueryResponse(BaseModel):
     facts: List[str] = []
     factItems: List[Fact] = []
     entities: List[Entity] = []
+    episodes: List[EpisodeRecallItem] = []
     openLoops: Optional[List[str]] = None
     commitments: Optional[List[str]] = None
     contextAnchors: Optional[Dict[str, Any]] = None
@@ -200,9 +213,12 @@ class SessionStartBriefEntityHint(BaseModel):
     name: str
     type: str = "other"
     role: Optional[str] = None
-    importance: Optional[float] = None
+    importance: Optional[str] = None
     salience: Optional[float] = None
     lastSeenAt: Optional[str] = None
+    source: Optional[str] = None
+    confidence: Optional[float] = None
+    updatedAt: Optional[str] = None
 
 
 class SessionStartBriefResponse(BaseModel):

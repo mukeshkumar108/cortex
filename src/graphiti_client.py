@@ -1,5 +1,6 @@
 import inspect
 import asyncio
+import re
 from graphiti_core import Graphiti
 from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig
@@ -7,99 +8,199 @@ from graphiti_core.nodes import EpisodeType, EpisodicNode, EntityNode
 from graphiti_core.edges import EntityEdge
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone as dt_timezone
 import logging
 from .config import get_settings
-from .falkor_utils import extract_node_dicts, pick_first_node
+from .falkor_utils import extract_node_dicts, extract_query_rows, pick_first_node
+from .memory_ontology import (
+    CANONICAL_EDGE_METADATA_FIELDS,
+    CANONICAL_NODE_METADATA_FIELDS,
+    CANONICAL_PROVENANCE_FIELDS,
+    ONTOLOGY_NODE_TYPES,
+    canonicalize_entity_name,
+    choose_preferred_node,
+    infer_ontology_type,
+    validate_ontology_node,
+)
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-class MentalState(BaseModel):
-    """User-stated state captured only when explicitly stated."""
-    mood: Optional[str] = Field(None, description="Explicit user phrase only, e.g., 'I feel anxious'")
-    energy_level: Optional[str] = Field(None, description="Explicit user phrase only, e.g., 'I am tired'")
+_SEMANTIC_QUERY_STOPWORDS = {
+    "the", "a", "an", "and", "or", "for", "to", "of", "in", "on", "at", "by",
+    "with", "from", "is", "are", "was", "were", "be", "been", "being", "do",
+    "did", "does", "why", "what", "when", "where", "who", "how", "i", "me",
+    "my", "you", "your", "we", "our", "it", "this", "that", "these", "those",
+}
+
+class MemoryNodeMetadata(BaseModel):
+    domains: List[str] = Field(
+        default_factory=list,
+        description=f"Subset of ontology domains. Canonical node metadata fields: {', '.join(CANONICAL_NODE_METADATA_FIELDS['all_nodes'])}",
+    )
+    confidence: Optional[float] = Field(None, description="0..1 trust in this node's current semantic fit")
+    importance: Optional[str] = Field(None, description="low, medium, or high durable importance")
+    salience: Optional[str] = Field(None, description="low, medium, or high short-horizon prominence")
+    first_seen_at: Optional[str] = Field(None, description="ISO timestamp for earliest known supporting evidence")
+    last_seen_at: Optional[str] = Field(None, description="ISO timestamp for latest known supporting evidence")
 
 
-class Tension(BaseModel):
-    """An unresolved problem, task, or blocker explicitly mentioned by the user."""
-    description: str = Field(..., description="Short factual description of the unresolved item")
-    status: str = Field("unresolved", description="Current state of this loop")
+class Person(MemoryNodeMetadata):
+    """A durable person in the user's autobiographical memory."""
+    aliases: List[str] = Field(
+        default_factory=list,
+        description=f"Stable alternative names only. Identity node metadata fields: {', '.join(CANONICAL_NODE_METADATA_FIELDS['identity_nodes'])}",
+    )
 
 
-class Environment(BaseModel):
-    """The physical or situational context mentioned in the session."""
-    location_type: Optional[str] = Field(None, description="e.g., Cafe, Home, Gym, Outside")
-    vibe: Optional[str] = Field(None, description="Concrete context detail only (e.g., 'Noisy', 'Raining')")
-
-class Observation(BaseModel):
-    """A small incidental human detail (sensory or phrasing)."""
-    detail: Optional[str] = Field(None, description="e.g., 'raining outside', 'drinking matcha'")
-
-class UserFocus(BaseModel):
-    """User-stated focus captured only when explicitly stated."""
-    focus: Optional[str] = Field(None, description="Explicit user phrase only, keep concise and neutral")
+class Project(MemoryNodeMetadata):
+    """A durable project, product, organization, or work stream."""
+    aliases: List[str] = Field(
+        default_factory=list,
+        description=f"Stable alternative names only. Identity node metadata fields: {', '.join(CANONICAL_NODE_METADATA_FIELDS['identity_nodes'])}",
+    )
 
 
-class Feels(BaseModel):
-    """Edge: User explicitly stated a mental state."""
+class Goal(MemoryNodeMetadata):
+    """A durable user goal or pursuit."""
+    status: Optional[str] = Field(None, description="active, paused, completed, or unknown")
+    time_horizon: Optional[str] = Field(None, description="short_term, ongoing, quarterly, yearly, or long_term")
+
+
+class Loop(MemoryNodeMetadata):
+    """An unresolved ongoing thread tied to a durable person/project/goal."""
+    status: Optional[str] = Field(None, description="open, blocked, waiting, or unknown")
+    time_horizon: Optional[str] = Field(None, description="today, this_week, near_term, or unknown")
+
+
+class Preference(MemoryNodeMetadata):
+    """A stable preference explicitly expressed by the user."""
+    polarity: Optional[str] = Field(None, description="prefer, avoid, or neutral")
+
+
+class Event(MemoryNodeMetadata):
+    """A concrete autobiographical event or episode."""
+    occurred_at: Optional[str] = Field(None, description="ISO timestamp or coarse date when known")
+    significance: Optional[str] = Field(None, description="low, medium, or high life-event significance")
+
+
+class MemoryEdgeMetadata(BaseModel):
+    confidence: Optional[float] = Field(
+        None,
+        description=f"0..1 trust in the claim carried by this edge. Canonical edge metadata fields: {', '.join(CANONICAL_EDGE_METADATA_FIELDS['all_edges'])}",
+    )
+    importance: Optional[str] = Field(None, description="low, medium, or high durable importance of this relationship")
+    valid_at: Optional[str] = Field(None, description="ISO timestamp when a time-bounded claim is known to be valid")
+    invalid_at: Optional[str] = Field(None, description="ISO timestamp when a time-bounded claim is no longer valid")
+
+
+class RelatedToUserAs(MemoryEdgeMetadata):
+    """Edge: relationship between the user and a person with explicit role metadata."""
+    role: Optional[str] = Field(None, description="girlfriend, daughter, friend, etc.")
+
+
+class WorkingOn(MemoryEdgeMetadata):
+    """Edge: the user is actively working on a project."""
     pass
 
 
-class StrugglingWith(BaseModel):
-    """Edge: User has an unresolved item."""
+class Pursuing(MemoryEdgeMetadata):
+    """Edge: the user is actively pursuing a goal."""
     pass
 
 
-class LocatedIn(BaseModel):
-    """Edge: Person is located in an Environment."""
+class About(MemoryEdgeMetadata):
+    """Fallback edge only when a more specific relation does not apply."""
     pass
 
-class Observed(BaseModel):
-    """Edge: Person observed a small incidental detail."""
+
+class Prefers(MemoryEdgeMetadata):
+    """Edge: the user prefers a thing or way of working."""
     pass
 
-class FocusedOn(BaseModel):
-    """Edge: User explicitly stated current focus."""
+
+class InvolvedIn(MemoryEdgeMetadata):
+    """Edge: a person or project is involved in an event."""
     pass
+
+
+class CaresAbout(MemoryEdgeMetadata):
+    """Edge: durable concern or care relationship to an entity."""
+    pass
+
+
+class EvidenceFor(MemoryEdgeMetadata):
+    """Edge: provenance link grounding a memory node or fact in an event/episode."""
+    provenance: Optional[str] = Field(
+        None,
+        description=f"Compact provenance summary. Canonical provenance fields: {', '.join(CANONICAL_PROVENANCE_FIELDS)}",
+    )
+    session_id: Optional[str] = Field(None, description="Session identifier when known")
+    episode_uuid: Optional[str] = Field(None, description="Episode UUID when known")
+    timestamp: Optional[str] = Field(None, description="Message or event timestamp when known")
+    message_index: Optional[int] = Field(None, description="Supporting transcript message index when known")
+    evidence_summary: Optional[str] = Field(None, description="Short grounding summary, not a new abstraction layer")
 
 
 NARRATIVE_ENTITY_TYPES: Dict[str, type[BaseModel]] = {
-    "MentalState": MentalState,
-    "Tension": Tension,
-    "Environment": Environment,
-    "Observation": Observation,
-    "UserFocus": UserFocus,
+    "Person": Person,
+    "Project": Project,
+    "Goal": Goal,
+    "Loop": Loop,
+    "Preference": Preference,
+    "Event": Event,
 }
 
 NARRATIVE_EDGE_TYPES: Dict[str, type[BaseModel]] = {
-    "FEELS": Feels,
-    "STRUGGLING_WITH": StrugglingWith,
-    "LOCATED_IN": LocatedIn,
-    "OBSERVED": Observed,
-    "FOCUSED_ON": FocusedOn,
+    "RELATED_TO_USER_AS": RelatedToUserAs,
+    "WORKING_ON": WorkingOn,
+    "PURSUING": Pursuing,
+    "ABOUT": About,
+    "PREFERS": Prefers,
+    "INVOLVED_IN": InvolvedIn,
+    "CARES_ABOUT": CaresAbout,
+    "EVIDENCE_FOR": EvidenceFor,
 }
 
 NARRATIVE_EDGE_TYPE_MAP: Dict[Tuple[str, str], List[str]] = {
-    ("Person", "MentalState"): ["FEELS"],
-    ("Person", "Tension"): ["STRUGGLING_WITH"],
-    ("Person", "Environment"): ["LOCATED_IN"],
-    ("Person", "Observation"): ["OBSERVED"],
-    ("Person", "UserFocus"): ["FOCUSED_ON"],
+    ("Person", "Person"): ["RELATED_TO_USER_AS", "CARES_ABOUT", "EVIDENCE_FOR"],
+    ("Person", "Project"): ["WORKING_ON", "CARES_ABOUT", "ABOUT", "EVIDENCE_FOR"],
+    ("Person", "Goal"): ["PURSUING", "ABOUT", "EVIDENCE_FOR"],
+    ("Person", "Loop"): ["ABOUT", "EVIDENCE_FOR"],
+    ("Person", "Preference"): ["PREFERS", "EVIDENCE_FOR"],
+    ("Person", "Event"): ["INVOLVED_IN", "EVIDENCE_FOR"],
+    ("Goal", "Person"): ["ABOUT", "EVIDENCE_FOR"],
+    ("Goal", "Project"): ["ABOUT", "EVIDENCE_FOR"],
+    ("Loop", "Person"): ["ABOUT", "EVIDENCE_FOR"],
+    ("Loop", "Project"): ["ABOUT", "EVIDENCE_FOR"],
+    ("Event", "Person"): ["ABOUT", "INVOLVED_IN", "EVIDENCE_FOR"],
+    ("Event", "Project"): ["ABOUT", "INVOLVED_IN", "EVIDENCE_FOR"],
 }
 
 NARRATIVE_EXTRACTION_INSTRUCTIONS = (
-    "Extract factual, user-stated memory only. Do not infer emotions, intent, or therapy-style framing. "
-    "Capture MentalState only when the user explicitly states it in first person (for example: 'I feel anxious', "
-    "'I am tired'). Capture unresolved tasks/blockers as Tension only when explicitly mentioned. "
-    "Capture UserFocus only when explicitly stated (for example: 'I'm focused on X', "
-    "'My priority this week is X', 'Today I need to X', 'Right now I'm trying to X'). "
-    "Do not infer focus from complaints, lists of tasks, or implied goals. Do not treat emotions as focus. "
-    "Keep focus concise (<= 80 chars), neutral, and user-phrased. "
-    "Capture environment as concrete context details (location/noise/weather) only when they add meaningful context to a memory or event. "
-    "Tag environment facts with a valid_at timestamp matching the episode time so they expire naturally. "
-    "Do not capture environment as standalone facts disconnected from a meaningful moment. "
-    "Continue extracting generic entities (names, places, projects). Optionally store one concrete Observation detail."
+    "Extract autobiographical memory for a premium assistant. Prefer a small durable ontology only: "
+    "Person, Project, Goal, Loop, Preference, and Event. Treat domain as metadata, not as a standalone entity. "
+    "Do not create Fact as a standalone node type. Facts are grounded claims carried by nodes and edges with provenance. "
+    "Preserve connected structure around durable hubs such as important people and projects. "
+    "Interpret meaning from context, not from isolated keywords. "
+    "Goal means a desired outcome or direction only; never use Goal for an active unresolved follow-up thread. "
+    "Loop means an active unresolved thread requiring continuation or attention; never use Loop for long-horizon aspiration. "
+    "Preference must be stable and behaviorally relevant; never create it from one-off requests, temporary context, or inferred personality traits. "
+    "Event must be a meaningful autobiographical occurrence or interaction; do not create Event for every transcript turn or trivial fragment. "
+    "Store trust and ranking signals as metadata, not as extra nodes: use confidence, importance, salience, first_seen_at, last_seen_at, and occurred_at when known. "
+    "Use life-event significance only as metadata on Event when the event is genuinely consequential. "
+    "Use related_to_user_as edges with explicit role metadata for relationship people. "
+    "Prefer specific edges such as working_on, pursuing, involved_in, and prefers. Use about only sparingly as a fallback when a more specific edge does not fit. "
+    "Every Event must be evidence-bearing. Every evidence_for edge must include provenance with session_id, timestamp, and message_index when available, plus episode_uuid or a short evidence_summary when known. "
+    "An Event should usually connect to at least one canonical node such as a Person, Project, Goal, Loop, or Preference. "
+    "If an Event cannot be tied to something meaningful and evidence-backed, suppress it. "
+    "The graph is not a transcript mirror: do not promote raw conversational fragments into nodes unless they are meaningful, durable, and evidence-backed. "
+    "Suppress generic noun phrases, summary artifacts, debug/system phrases, and one-off conceptual junk when they do not carry durable autobiographical meaning. "
+    "Do not create entities like session-summary placeholders or generic artifact labels when they are only conversational scaffolding. "
+    "Avoid duplicate Goal and Loop nodes for the same concept. Prefer one clean canonical node. "
+    "Apply precedence when candidates overlap: canonical Person/Project identity beats weaker variants; Loop beats Goal for active unresolved follow-up; Goal beats Loop for longer-horizon direction; Event supports canonical nodes via evidence_for and does not replace them. "
+    "When recency matters, prefer first_seen_at and last_seen_at metadata over vague recency wording. "
+    "Only create a node when it is durable, autobiographically meaningful, and evidence-backed by the transcript."
 )
 
 
@@ -140,6 +241,14 @@ def _is_predicate_string(text: Optional[str]) -> bool:
         return True
 
     return False
+
+
+def _semantic_query_terms(query: Optional[str]) -> List[str]:
+    text = str(query or "").strip().lower()
+    if not text:
+        return []
+    tokens = re.findall(r"[a-z0-9]+", text)
+    return [token for token in tokens if len(token) >= 2 and token not in _SEMANTIC_QUERY_STOPWORDS]
 
 
 def _format_predicate_as_fact(result: Any) -> str:
@@ -186,6 +295,10 @@ class GraphitiClient:
         return dict(self._metrics)
 
     @staticmethod
+    def _rows(result: Any) -> List[Any]:
+        return extract_query_rows(result)
+
+    @staticmethod
     def _failure_response(reason: str, error: Optional[Exception] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"success": False, "reason": reason}
         if error is not None:
@@ -211,7 +324,7 @@ class GraphitiClient:
                 group_id=group_id,
                 session_id=session_id
             )
-            for row in rows or []:
+            for row in self._rows(rows):
                 for node in extract_node_dicts(row, required_keys=("uuid",)):
                     if node.get("uuid"):
                         return True
@@ -231,7 +344,7 @@ class GraphitiClient:
                 group_id=group_id,
                 summary_uuid=summary_uuid,
             )
-            for row in rows or []:
+            for row in self._rows(rows):
                 for node in extract_node_dicts(row, required_keys=("uuid",)):
                     if str(node.get("uuid") or "") == str(summary_uuid):
                         return True
@@ -256,7 +369,7 @@ class GraphitiClient:
             )
             uuids: List[str] = []
             seen = set()
-            for row in rows or []:
+            for row in self._rows(rows):
                 for node in extract_node_dicts(row, required_keys=("uuid",)):
                     uuid = str(node.get("uuid") or "").strip()
                     if not uuid or uuid in seen:
@@ -399,7 +512,7 @@ class GraphitiClient:
 
     def _format_message_transcript(self, messages: List[Dict[str, Any]]) -> str:
         lines: List[str] = []
-        for msg in messages:
+        for idx, msg in enumerate(messages):
             role = (msg.get("role") or "").lower()
             if role == "assistant":
                 role_label = "Assistant"
@@ -408,7 +521,11 @@ class GraphitiClient:
             else:
                 role_label = "User"
             text = msg.get("text") or ""
-            lines.append(f"{role_label}: {text}")
+            timestamp = str(msg.get("timestamp") or "").strip()
+            prefix = f"[message_index={idx}]"
+            if timestamp:
+                prefix += f"[timestamp={timestamp}]"
+            lines.append(f"{prefix} {role_label}: {text}")
         return "\n".join(lines)
 
     async def add_episode(
@@ -669,6 +786,9 @@ class GraphitiClient:
         """
         if not query or not str(query).strip():
             return []
+        if not _semantic_query_terms(query):
+            logger.info("search_facts skipped due to empty semantic query terms query=%r", query)
+            return []
         if not self._initialized:
             await self.initialize()
         if not self._initialized or self.client is None:
@@ -732,7 +852,12 @@ class GraphitiClient:
             return facts
 
         except Exception as e:
-            logger.error(f"search_facts failed: {e}")
+            if "Syntax error" in str(e) and "()'" not in str(e):
+                logger.warning("search_facts skipped invalid semantic query query=%r error=%s", query, e)
+            elif "Syntax error" in str(e):
+                logger.warning("search_facts skipped invalid semantic query query=%r error=%s", query, e)
+            else:
+                logger.error(f"search_facts failed: {e}")
             return []
 
     async def search_nodes(
@@ -743,7 +868,9 @@ class GraphitiClient:
         limit: int = 5,
         reference_time: Optional[datetime] = None,
         query_hint: Optional[str] = None,
-        search_filter: Optional[Any] = None
+        search_filter: Optional[Any] = None,
+        allowed_types: Optional[List[str]] = None,
+        include_internal: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Search for relevant entities (nodes) in Graphiti using semantic query.
@@ -752,6 +879,9 @@ class GraphitiClient:
         extracted by Graphiti's LLM. Filters out edges/predicates.
         """
         if not query or not str(query).strip():
+            return []
+        if not _semantic_query_terms(query):
+            logger.info("search_nodes skipped due to empty semantic query terms query=%r", query)
             return []
         if not self._initialized:
             await self.initialize()
@@ -834,7 +964,7 @@ class GraphitiClient:
 
                 results = await search_fn(**kwargs)
 
-            entities = []
+            entities_by_key: Dict[str, Dict[str, Any]] = {}
             for result in results:
                 # Skip if this looks like an edge (has source_node_id, target_node_id, or is a predicate)
                 if _is_edge_result(result):
@@ -894,18 +1024,1172 @@ class GraphitiClient:
                 if hasattr(result, 'reference_time'):
                     entity_data["reference_time"] = result.reference_time
 
-                entities.append(entity_data)
+                canonical_name = canonicalize_entity_name(entity_data.get("summary"))
+                original_name = str(entity_data.get("summary") or "").strip()
+                entity_data["summary"] = canonical_name or entity_data.get("summary")
+                labels = entity_data.get("labels") if isinstance(entity_data.get("labels"), list) else []
+                inferred_type = infer_ontology_type(
+                    entity_data.get("type"),
+                    labels=labels,
+                    name=entity_data.get("summary"),
+                )
+                if inferred_type == "other" and allowed_types and len(allowed_types) == 1:
+                    inferred_type = str(allowed_types[0]).strip().lower()
+                entity_data["type"] = inferred_type
+                entity_data["canonical_name"] = canonical_name or entity_data.get("summary")
+                attrs = entity_data.get("attributes") if isinstance(entity_data.get("attributes"), dict) else {}
 
-                # Stop once we have enough valid entities
-                if len(entities) >= limit:
-                    break
+                allowed, canonical_name, disciplined_type, reason, discipline_score = validate_ontology_node(
+                    name=entity_data.get("summary"),
+                    raw_type=inferred_type,
+                    labels=labels,
+                    attributes=attrs,
+                    allowed_types=allowed_types or ONTOLOGY_NODE_TYPES,
+                    include_internal=include_internal,
+                )
+                entity_data["summary"] = canonical_name or entity_data.get("summary")
+                entity_data["type"] = disciplined_type
+                entity_data["discipline_score"] = discipline_score
 
+                if original_name and canonical_name and original_name != canonical_name:
+                    logger.info("graphiti node canonicalized from=%s to=%s", original_name, canonical_name)
+
+                if not allowed:
+                    logger.info(
+                        "graphiti node suppressed name=%s type=%s reason=%s",
+                        entity_data.get("summary"),
+                        disciplined_type,
+                        reason,
+                    )
+                    continue
+
+                dedupe_key = (
+                    str(entity_data.get("canonical_name") or "").strip().lower()
+                    or str(entity_data.get("uuid") or "").strip().lower()
+                )
+                if not dedupe_key:
+                    continue
+
+                existing = entities_by_key.get(dedupe_key)
+                if existing is None:
+                    entities_by_key[dedupe_key] = entity_data
+                else:
+                    preferred = choose_preferred_node(existing, entity_data)
+                    if preferred is entity_data:
+                        logger.info(
+                            "graphiti node merged canonical_name=%s preferred_type=%s suppressed_type=%s",
+                            dedupe_key,
+                            entity_data.get("type"),
+                            existing.get("type"),
+                        )
+                        entities_by_key[dedupe_key] = entity_data
+                    else:
+                        logger.info(
+                            "graphiti node suppressed overlapping candidate canonical_name=%s kept_type=%s dropped_type=%s",
+                            dedupe_key,
+                            existing.get("type"),
+                            entity_data.get("type"),
+                        )
+
+            entities = list(entities_by_key.values())[:limit]
             logger.info(f"search_nodes returned {len(entities)} entities (filtered from {len(results)} results)")
             return entities
 
         except Exception as e:
-            logger.error(f"search_nodes failed: {e}")
+            if "Syntax error" in str(e):
+                logger.warning("search_nodes skipped invalid semantic query query=%r error=%s", query, e)
+            else:
+                logger.error(f"search_nodes failed: {e}")
             return []
+
+    async def get_canonical_entity_nodes(
+        self,
+        tenant_id: str,
+        user_id: str,
+        *,
+        name: Optional[str] = None,
+        entity_id: Optional[str] = None,
+        allowed_types: Optional[List[str]] = None,
+        include_internal: bool = False,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Return exact canonical entity matches by UUID or exact name before semantic search."""
+        lookup_name = canonicalize_entity_name(name)
+        lookup_id = str(entity_id or "").strip()
+        if not lookup_name and not lookup_id:
+            return []
+
+        if not self._initialized:
+            await self.initialize()
+        if not self._initialized or self.client is None:
+            logger.warning("Graphiti client unavailable; skipping get_canonical_entity_nodes")
+            return []
+
+        driver = self._group_driver(tenant_id, user_id)
+        if not driver:
+            logger.warning("Graphiti driver unavailable; skipping get_canonical_entity_nodes")
+            return []
+
+        group_id = self._make_composite_user_id(tenant_id, user_id)
+        safe_limit = max(1, min(int(limit or 5), 20))
+
+        conditions: List[str] = ["n.group_id = $group_id"]
+        params: Dict[str, Any] = {"group_id": group_id, "limit": safe_limit}
+        if lookup_id:
+            conditions.append("n.uuid = $entity_id")
+            params["entity_id"] = lookup_id
+        if lookup_name:
+            conditions.append("toLower(coalesce(n.name, '')) = $name_lower")
+            params["name_lower"] = lookup_name.lower()
+
+        where_clause = " OR ".join(f"({condition})" for condition in conditions[1:])
+        if where_clause:
+            where_clause = f"({conditions[0]}) AND ({where_clause})"
+        else:
+            where_clause = conditions[0]
+
+        try:
+            rows = await driver.execute_query(
+                f"""
+                MATCH (n:Entity)
+                WHERE {where_clause}
+                RETURN
+                    n.uuid AS uuid,
+                    n.name AS name,
+                    n.summary AS summary,
+                    n.group_id AS group_id,
+                    n.created_at AS created_at,
+                    n.updated_at AS updated_at,
+                    properties(n) AS attributes,
+                    labels(n) AS labels
+                ORDER BY n.updated_at DESC, n.created_at DESC
+                LIMIT $limit
+                """,
+                **params,
+            )
+            entities_by_key: Dict[str, Dict[str, Any]] = {}
+            for row in self._rows(rows):
+                if not isinstance(row, dict):
+                    continue
+                row_dict = dict(row)
+                labels = row_dict.get("labels") if isinstance(row_dict.get("labels"), list) else []
+                entity_data = {
+                    "uuid": row_dict.get("uuid"),
+                    "name": row_dict.get("name"),
+                    "summary": row_dict.get("summary"),
+                    "group_id": row_dict.get("group_id"),
+                    "created_at": row_dict.get("created_at"),
+                    "updated_at": row_dict.get("updated_at"),
+                    "attributes": row_dict.get("attributes") if isinstance(row_dict.get("attributes"), dict) else {},
+                    "labels": labels,
+                }
+                canonical_name = canonicalize_entity_name(entity_data.get("name") or entity_data.get("summary"))
+                entity_data["summary"] = entity_data.get("summary") or canonical_name or entity_data.get("name")
+                entity_data["canonical_name"] = canonical_name or entity_data.get("name") or entity_data.get("summary")
+                inferred_type = infer_ontology_type(
+                    entity_data.get("type"),
+                    labels=labels,
+                    name=entity_data.get("canonical_name"),
+                )
+                if inferred_type == "other" and allowed_types and len(allowed_types) == 1:
+                    inferred_type = str(allowed_types[0]).strip().lower()
+                entity_data["type"] = inferred_type
+                attrs = entity_data.get("attributes") if isinstance(entity_data.get("attributes"), dict) else {}
+                allowed, canonical_name, disciplined_type, reason, discipline_score = validate_ontology_node(
+                    name=entity_data.get("canonical_name"),
+                    raw_type=inferred_type,
+                    labels=labels,
+                    attributes=attrs,
+                    allowed_types=allowed_types or ONTOLOGY_NODE_TYPES,
+                    include_internal=include_internal,
+                )
+                entity_data["canonical_name"] = canonical_name or entity_data.get("canonical_name")
+                entity_data["type"] = disciplined_type
+                entity_data["discipline_score"] = discipline_score
+                if not allowed:
+                    logger.info(
+                        "graphiti exact node suppressed name=%s type=%s reason=%s",
+                        entity_data.get("canonical_name"),
+                        disciplined_type,
+                        reason,
+                    )
+                    continue
+                dedupe_key = (
+                    str(entity_data.get("canonical_name") or "").strip().lower()
+                    or str(entity_data.get("uuid") or "").strip().lower()
+                )
+                if not dedupe_key:
+                    continue
+                existing = entities_by_key.get(dedupe_key)
+                if existing is None:
+                    entities_by_key[dedupe_key] = entity_data
+                else:
+                    entities_by_key[dedupe_key] = choose_preferred_node(existing, entity_data)
+            entities = list(entities_by_key.values())[:safe_limit]
+            logger.info(
+                "get_canonical_entity_nodes returned %s entities for name=%s entity_id=%s",
+                len(entities),
+                lookup_name,
+                lookup_id,
+            )
+            return entities
+        except Exception as e:
+            logger.error("get_canonical_entity_nodes failed: %s", e)
+            return []
+
+    async def get_ranked_canonical_nodes(
+        self,
+        tenant_id: str,
+        user_id: str,
+        *,
+        allowed_types: Optional[List[str]] = None,
+        include_internal: bool = False,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Return exact canonical nodes ordered by durability/recency, without semantic search."""
+        if not self._initialized:
+            await self.initialize()
+        if not self._initialized or self.client is None:
+            logger.warning("Graphiti client unavailable; skipping get_ranked_canonical_nodes")
+            return []
+
+        driver = self._group_driver(tenant_id, user_id)
+        if not driver:
+            logger.warning("Graphiti driver unavailable; skipping get_ranked_canonical_nodes")
+            return []
+
+        group_id = self._make_composite_user_id(tenant_id, user_id)
+        safe_limit = max(1, min(int(limit or 20), 50))
+        try:
+            rows = await driver.execute_query(
+                """
+                MATCH (n:Entity {group_id: $group_id})
+                RETURN
+                    n.uuid AS uuid,
+                    n.name AS name,
+                    n.summary AS summary,
+                    n.group_id AS group_id,
+                    n.created_at AS created_at,
+                    n.updated_at AS updated_at,
+                    properties(n) AS attributes,
+                    labels(n) AS labels
+                ORDER BY coalesce(n.updated_at, n.created_at) DESC
+                LIMIT $limit
+                """,
+                group_id=group_id,
+                limit=safe_limit,
+            )
+            entities: List[Dict[str, Any]] = []
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                labels = row.get("labels") if isinstance(row.get("labels"), list) else []
+                attrs = row.get("attributes") if isinstance(row.get("attributes"), dict) else {}
+                canonical_name = canonicalize_entity_name(row.get("name") or row.get("summary"))
+                inferred_type = infer_ontology_type(None, labels=labels, name=canonical_name)
+                allowed, disciplined_name, disciplined_type, _reason, discipline_score = validate_ontology_node(
+                    name=canonical_name,
+                    raw_type=inferred_type,
+                    labels=labels,
+                    attributes=attrs,
+                    allowed_types=allowed_types or ONTOLOGY_NODE_TYPES,
+                    include_internal=include_internal,
+                )
+                if not allowed:
+                    continue
+                entities.append(
+                    {
+                        "uuid": row.get("uuid"),
+                        "name": row.get("name"),
+                        "summary": row.get("summary") or disciplined_name,
+                        "canonical_name": disciplined_name,
+                        "type": disciplined_type,
+                        "group_id": row.get("group_id"),
+                        "created_at": row.get("created_at"),
+                        "updated_at": row.get("updated_at"),
+                        "attributes": attrs,
+                        "labels": labels,
+                        "discipline_score": discipline_score,
+                    }
+                )
+            logger.info("get_ranked_canonical_nodes returned %s entities", len(entities))
+            return entities
+        except Exception as e:
+            logger.error("get_ranked_canonical_nodes failed: %s", e)
+            return []
+
+    async def get_exact_named_entity_nodes(
+        self,
+        tenant_id: str,
+        user_id: str,
+        *,
+        names: List[str],
+        allowed_types: Optional[List[str]] = None,
+        include_internal: bool = False,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Return raw exact-name matches for a cluster of candidate aliases."""
+        clean_names = []
+        seen = set()
+        for name in names or []:
+            canonical = canonicalize_entity_name(name)
+            lower = canonical.lower()
+            if not canonical or lower in seen:
+                continue
+            seen.add(lower)
+            clean_names.append(lower)
+        if not clean_names:
+            return []
+
+        if not self._initialized:
+            await self.initialize()
+        if not self._initialized or self.client is None:
+            logger.warning("Graphiti client unavailable; skipping get_exact_named_entity_nodes")
+            return []
+
+        driver = self._group_driver(tenant_id, user_id)
+        if not driver:
+            logger.warning("Graphiti driver unavailable; skipping get_exact_named_entity_nodes")
+            return []
+
+        group_id = self._make_composite_user_id(tenant_id, user_id)
+        safe_limit = max(1, min(int(limit or 50), 100))
+        try:
+            rows = await driver.execute_query(
+                """
+                UNWIND $names AS needle
+                MATCH (n)
+                WHERE n.group_id = $group_id
+                  AND toLower(coalesce(n.name, '')) = needle
+                RETURN
+                    n.uuid AS uuid,
+                    n.name AS name,
+                    n.summary AS summary,
+                    n.group_id AS group_id,
+                    n.created_at AS created_at,
+                    n.updated_at AS updated_at,
+                    properties(n) AS attributes,
+                    labels(n) AS labels
+                ORDER BY coalesce(n.updated_at, n.created_at) DESC
+                LIMIT $limit
+                """,
+                group_id=group_id,
+                names=clean_names,
+                limit=safe_limit,
+            )
+        except Exception as e:
+            logger.error("get_exact_named_entity_nodes failed: %s", e)
+            return []
+
+        out: List[Dict[str, Any]] = []
+        for row in self._rows(rows):
+            if not isinstance(row, dict):
+                continue
+            labels = row.get("labels") if isinstance(row.get("labels"), list) else []
+            attrs = row.get("attributes") if isinstance(row.get("attributes"), dict) else {}
+            canonical_name = canonicalize_entity_name(row.get("name") or row.get("summary"))
+            inferred_type = infer_ontology_type(None, labels=labels, name=canonical_name)
+            if inferred_type == "other" and allowed_types and len(allowed_types) == 1:
+                inferred_type = str(allowed_types[0]).strip().lower()
+            allowed, disciplined_name, disciplined_type, _reason, discipline_score = validate_ontology_node(
+                name=canonical_name,
+                raw_type=inferred_type,
+                labels=labels,
+                attributes=attrs,
+                allowed_types=allowed_types or ONTOLOGY_NODE_TYPES,
+                include_internal=include_internal,
+            )
+            if not allowed:
+                continue
+            out.append(
+                {
+                    "uuid": row.get("uuid"),
+                    "name": row.get("name"),
+                    "summary": row.get("summary") or disciplined_name,
+                    "canonical_name": disciplined_name,
+                    "type": disciplined_type,
+                    "group_id": row.get("group_id"),
+                    "created_at": row.get("created_at"),
+                    "updated_at": row.get("updated_at"),
+                    "attributes": attrs,
+                    "labels": labels,
+                    "discipline_score": discipline_score,
+                }
+            )
+        logger.info("get_exact_named_entity_nodes returned %s entities for names=%s", len(out), clean_names)
+        return out
+
+    @staticmethod
+    def _parse_dt_like(value: Any) -> datetime:
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=dt_timezone.utc)
+        text = str(value or "").strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt_timezone.utc)
+        except Exception:
+            return datetime.now(dt_timezone.utc)
+
+    async def merge_canonical_entity_cluster(
+        self,
+        tenant_id: str,
+        user_id: str,
+        *,
+        canonical_name: str,
+        node_type: str,
+        candidate_names: List[str],
+        summary: str,
+        attributes: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Merge duplicate exact-name nodes into one durable canonical node with edge rewiring."""
+        canonical = canonicalize_entity_name(canonical_name)
+        disciplined_type = str(node_type or "").strip().lower()
+        cluster_names = [canonical, *candidate_names]
+        cluster_nodes = await self.get_exact_named_entity_nodes(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            names=cluster_names,
+            allowed_types=[disciplined_type],
+            limit=100,
+        )
+
+        if not cluster_nodes:
+            return await self.upsert_canonical_entity_node(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                name=canonical,
+                node_type=disciplined_type,
+                summary=summary,
+                attributes=attributes,
+            )
+
+        def _node_sort_key(node: Dict[str, Any]) -> Tuple[int, float, float]:
+            exact = 1 if str(node.get("name") or "").strip().lower() == canonical.lower() else 0
+            updated = self._parse_dt_like(node.get("updated_at") or node.get("created_at")).timestamp()
+            score = float(node.get("discipline_score") or 0.0)
+            return (exact, score, updated)
+
+        survivor = sorted(cluster_nodes, key=_node_sort_key, reverse=True)[0]
+        survivor_uuid = str(survivor.get("uuid") or "").strip()
+        if not survivor_uuid:
+            return None
+
+        if not self._initialized:
+            await self.initialize()
+        if not self._initialized or self.client is None:
+            logger.warning("Graphiti client unavailable; skipping merge_canonical_entity_cluster")
+            return survivor
+
+        driver = self._group_driver(tenant_id, user_id)
+        if not driver:
+            logger.warning("Graphiti driver unavailable; skipping merge_canonical_entity_cluster")
+            return survivor
+
+        group_id = self._make_composite_user_id(tenant_id, user_id)
+        merged_attrs = dict(survivor.get("attributes") if isinstance(survivor.get("attributes"), dict) else {})
+        merged_attrs.update(attributes or {})
+        merged_attrs.setdefault("canonical_name", canonical)
+        merged_attrs.setdefault("profile_summary", summary)
+        merged_attrs.setdefault("aliases", [])
+        alias_bucket = []
+        seen_alias = set()
+        for node in cluster_nodes:
+            for value in [
+                str(node.get("name") or "").strip(),
+                str(node.get("canonical_name") or "").strip(),
+                *(
+                    node.get("attributes", {}).get("aliases", [])
+                    if isinstance(node.get("attributes"), dict) and isinstance(node.get("attributes", {}).get("aliases"), list)
+                    else []
+                ),
+            ]:
+                alias = str(value or "").strip()
+                if not alias or alias.lower() == canonical.lower() or alias.lower() in seen_alias:
+                    continue
+                seen_alias.add(alias.lower())
+                alias_bucket.append(alias)
+        merged_attrs["aliases"] = alias_bucket[:12]
+
+        await driver.execute_query(
+            """
+            MATCH (n {group_id: $group_id, uuid: $uuid})
+            SET n.name = $name,
+                n.summary = $summary,
+                n.updated_at = $updated_at,
+                n += $attributes
+            RETURN n.uuid AS uuid
+            """,
+            group_id=group_id,
+            uuid=survivor_uuid,
+            name=canonical,
+            summary=str(summary or canonical).strip(),
+            updated_at=datetime.now(dt_timezone.utc).isoformat(),
+            attributes=merged_attrs,
+        )
+
+        duplicates = [node for node in cluster_nodes if str(node.get("uuid") or "").strip() and str(node.get("uuid") or "").strip() != survivor_uuid]
+        for duplicate in duplicates:
+            duplicate_uuid = str(duplicate.get("uuid") or "").strip()
+            edge_rows = await driver.execute_query(
+                """
+                MATCH (s)-[e]->(t)
+                WHERE s.group_id = $group_id
+                  AND t.group_id = $group_id
+                  AND (s.uuid = $duplicate_uuid OR t.uuid = $duplicate_uuid)
+                RETURN
+                    s.uuid AS source_uuid,
+                    t.uuid AS target_uuid,
+                    e.name AS edge_name,
+                    e.fact AS fact,
+                    properties(e) AS attributes,
+                    e.created_at AS created_at
+                """,
+                group_id=group_id,
+                duplicate_uuid=duplicate_uuid,
+            )
+            for row in self._rows(edge_rows):
+                if not isinstance(row, dict):
+                    continue
+                source_uuid = survivor_uuid if str(row.get("source_uuid") or "").strip() == duplicate_uuid else str(row.get("source_uuid") or "").strip()
+                target_uuid = survivor_uuid if str(row.get("target_uuid") or "").strip() == duplicate_uuid else str(row.get("target_uuid") or "").strip()
+                if not source_uuid or not target_uuid or source_uuid == target_uuid:
+                    continue
+                edge_name = str(row.get("edge_name") or "").strip()
+                fact = str(row.get("fact") or "").strip()
+                edge_attrs = row.get("attributes") if isinstance(row.get("attributes"), dict) else {}
+                existing = await driver.execute_query(
+                    """
+                    MATCH (s {group_id: $group_id, uuid: $source_uuid})-[e {group_id: $group_id, name: $edge_name}]->(t {group_id: $group_id, uuid: $target_uuid})
+                    WHERE coalesce(e.fact, '') = $fact
+                    RETURN e.uuid AS uuid
+                    LIMIT 1
+                    """,
+                    group_id=group_id,
+                    source_uuid=source_uuid,
+                    target_uuid=target_uuid,
+                    edge_name=edge_name,
+                    fact=fact,
+                )
+                if self._rows(existing):
+                    continue
+                edge = EntityEdge(
+                    group_id=group_id,
+                    source_node_uuid=source_uuid,
+                    target_node_uuid=target_uuid,
+                    created_at=self._parse_dt_like(row.get("created_at")),
+                    name=edge_name,
+                    fact=fact,
+                    attributes=dict(edge_attrs),
+                )
+                saved = edge.save(driver)
+                if inspect.isawaitable(saved):
+                    await saved
+            await driver.execute_query(
+                """
+                MATCH (n {group_id: $group_id, uuid: $duplicate_uuid})
+                DETACH DELETE n
+                """,
+                group_id=group_id,
+                duplicate_uuid=duplicate_uuid,
+            )
+            logger.info("merged duplicate node duplicate_uuid=%s survivor_uuid=%s canonical=%s", duplicate_uuid, survivor_uuid, canonical)
+
+        merged = await self.get_canonical_entity_nodes(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            entity_id=survivor_uuid,
+            name=canonical,
+            allowed_types=[disciplined_type],
+            limit=1,
+        )
+        return merged[0] if merged else survivor
+
+    async def upsert_canonical_entity_node(
+        self,
+        tenant_id: str,
+        user_id: str,
+        *,
+        name: str,
+        node_type: str,
+        summary: str,
+        attributes: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Create a canonical entity node if missing, otherwise return the existing exact node."""
+        canonical_name = canonicalize_entity_name(name)
+        disciplined_type = str(node_type or "").strip().lower()
+        if not canonical_name or disciplined_type not in ONTOLOGY_NODE_TYPES:
+            return None
+
+        existing = await self.get_canonical_entity_nodes(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            name=canonical_name,
+            allowed_types=[disciplined_type],
+            limit=1,
+        )
+        if existing:
+            existing_node = existing[0]
+            existing_uuid = str(existing_node.get("uuid") or "").strip()
+            if existing_uuid:
+                try:
+                    driver = self._group_driver(tenant_id, user_id)
+                    if driver:
+                        merged_attrs = dict(existing_node.get("attributes") if isinstance(existing_node.get("attributes"), dict) else {})
+                        merged_attrs.update(attributes or {})
+                        merged_attrs.setdefault("profile_summary", summary)
+                        await driver.execute_query(
+                            """
+                            MATCH (n:Entity {group_id: $group_id, uuid: $uuid})
+                            SET n.summary = $summary,
+                                n.updated_at = $updated_at,
+                                n += $attributes
+                            RETURN n.uuid AS uuid
+                            """,
+                            group_id=self._make_composite_user_id(tenant_id, user_id),
+                            uuid=existing_uuid,
+                            summary=str(summary or canonical_name).strip(),
+                            updated_at=datetime.utcnow().isoformat(),
+                            attributes=merged_attrs,
+                        )
+                        existing_node["summary"] = str(summary or canonical_name).strip()
+                        existing_node["attributes"] = merged_attrs
+                except Exception as e:
+                    logger.warning("Failed to update canonical entity node name=%s error=%s", canonical_name, e)
+            return existing_node
+
+        if not self._initialized:
+            await self.initialize()
+        if not self._initialized or self.client is None:
+            logger.warning("Graphiti client unavailable; skipping upsert_canonical_entity_node")
+            return None
+
+        driver = self._group_driver(tenant_id, user_id)
+        if not driver:
+            logger.warning("Graphiti driver unavailable; skipping upsert_canonical_entity_node")
+            return None
+
+        entity_attrs = dict(attributes or {})
+        entity_attrs.setdefault("profile_summary", summary)
+        node = EntityNode(
+            name=canonical_name,
+            group_id=self._make_composite_user_id(tenant_id, user_id),
+            labels=[disciplined_type.title()],
+            summary=str(summary or canonical_name).strip(),
+            attributes=entity_attrs,
+        )
+        try:
+            saved = node.save(driver)
+            if inspect.isawaitable(saved):
+                await saved
+            logger.info(
+                "canonical entity node saved name=%s type=%s uuid=%s",
+                canonical_name,
+                disciplined_type,
+                node.uuid,
+            )
+            return {
+                "uuid": str(node.uuid),
+                "summary": canonical_name,
+                "canonical_name": canonical_name,
+                "type": disciplined_type,
+                "labels": ["Entity", disciplined_type.title()],
+                "attributes": entity_attrs,
+                "created_at": getattr(node, "created_at", None),
+                "updated_at": getattr(node, "created_at", None),
+            }
+        except Exception as e:
+            logger.error("Failed to save canonical entity node name=%s error=%s", canonical_name, e)
+            return None
+
+    async def upsert_canonical_fact_edge(
+        self,
+        tenant_id: str,
+        user_id: str,
+        *,
+        source_name: str,
+        source_type: str,
+        target_name: str,
+        target_type: str,
+        edge_name: str,
+        fact: str,
+        reference_time: datetime,
+        source_summary: Optional[str] = None,
+        target_summary: Optional[str] = None,
+        source_attributes: Optional[Dict[str, Any]] = None,
+        target_attributes: Optional[Dict[str, Any]] = None,
+        edge_attributes: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Ensure a canonical grounding edge exists between two canonical nodes."""
+        source_node = await self.upsert_canonical_entity_node(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            name=source_name,
+            node_type=source_type,
+            summary=source_summary or source_name,
+            attributes=source_attributes,
+        )
+        target_node = await self.upsert_canonical_entity_node(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            name=target_name,
+            node_type=target_type,
+            summary=target_summary or target_name,
+            attributes=target_attributes,
+        )
+        if not source_node or not target_node:
+            return False
+
+        if not self._initialized:
+            await self.initialize()
+        if not self._initialized or self.client is None:
+            logger.warning("Graphiti client unavailable; skipping upsert_canonical_fact_edge")
+            return False
+
+        driver = self._group_driver(tenant_id, user_id)
+        if not driver:
+            logger.warning("Graphiti driver unavailable; skipping upsert_canonical_fact_edge")
+            return False
+
+        group_id = self._make_composite_user_id(tenant_id, user_id)
+        edge_type = str(edge_name or "").strip().upper()
+        fact_text = str(fact or "").strip()
+        if not edge_type or not fact_text:
+            return False
+
+        try:
+            existing_rows = await driver.execute_query(
+                """
+                MATCH (s:Entity {group_id: $group_id, uuid: $source_uuid})-[e {group_id: $group_id, name: $edge_name}]->(t:Entity {group_id: $group_id, uuid: $target_uuid})
+                WHERE e.fact = $fact
+                RETURN e.uuid AS uuid
+                LIMIT 1
+                """,
+                group_id=group_id,
+                source_uuid=str(source_node.get("uuid") or ""),
+                target_uuid=str(target_node.get("uuid") or ""),
+                edge_name=edge_type,
+                fact=fact_text,
+            )
+            existing_rows = self._rows(existing_rows)
+            if existing_rows:
+                existing_uuid = None
+                if isinstance(existing_rows[0], dict):
+                    existing_uuid = str(existing_rows[0].get("uuid") or "").strip()
+                if existing_uuid:
+                    try:
+                        await driver.execute_query(
+                            """
+                            MATCH (s:Entity {group_id: $group_id, uuid: $source_uuid})-[e {group_id: $group_id, uuid: $edge_uuid}]->(t:Entity {group_id: $group_id, uuid: $target_uuid})
+                            SET e += $attributes
+                            RETURN e.uuid AS uuid
+                            """,
+                            group_id=group_id,
+                            source_uuid=str(source_node.get("uuid") or ""),
+                            target_uuid=str(target_node.get("uuid") or ""),
+                            edge_uuid=existing_uuid,
+                            attributes=dict(edge_attributes or {}),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "canonical fact edge update failed source=%s target=%s edge=%s error=%s",
+                            source_name,
+                            target_name,
+                            edge_type,
+                            e,
+                        )
+                logger.info(
+                    "canonical fact edge already exists source=%s target=%s edge=%s",
+                    source_name,
+                    target_name,
+                    edge_type,
+                )
+                return True
+        except Exception as e:
+            logger.warning(
+                "canonical fact edge existence check failed source=%s target=%s edge=%s error=%s",
+                source_name,
+                target_name,
+                edge_type,
+                e,
+            )
+
+        edge = EntityEdge(
+            group_id=group_id,
+            source_node_uuid=str(source_node.get("uuid") or ""),
+            target_node_uuid=str(target_node.get("uuid") or ""),
+            created_at=reference_time,
+            name=edge_type,
+            fact=fact_text,
+            attributes=dict(edge_attributes or {}),
+        )
+        try:
+            saved = edge.save(driver)
+            if inspect.isawaitable(saved):
+                await saved
+            logger.info(
+                "canonical fact edge saved source=%s target=%s edge=%s",
+                source_name,
+                target_name,
+                edge_type,
+            )
+            return True
+        except Exception as e:
+            logger.error(
+                "Failed to save canonical fact edge source=%s target=%s edge=%s error=%s",
+                source_name,
+                target_name,
+                edge_type,
+                e,
+            )
+            return False
+
+    async def get_entity_facts_exact(
+        self,
+        tenant_id: str,
+        user_id: str,
+        *,
+        name: Optional[str] = None,
+        entity_id: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Return exact edge facts touching a canonical entity node before semantic fact search."""
+        node_ids = []
+        if entity_id:
+            node_ids.append(str(entity_id).strip())
+        elif name:
+            exact_nodes = await self.get_exact_named_entity_nodes(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                names=[name],
+                allowed_types=ONTOLOGY_NODE_TYPES,
+                limit=50,
+            )
+            node_ids.extend([str(node.get("uuid") or "").strip() for node in exact_nodes if str(node.get("uuid") or "").strip()])
+        else:
+            nodes = await self.get_canonical_entity_nodes(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                name=name,
+                entity_id=None,
+                limit=5,
+                allowed_types=ONTOLOGY_NODE_TYPES,
+            )
+            node_ids.extend([str(node.get("uuid") or "").strip() for node in nodes if str(node.get("uuid") or "").strip()])
+        node_ids = [x for i, x in enumerate(node_ids) if x and x not in node_ids[:i]]
+        if not node_ids:
+            return []
+
+        if not self._initialized:
+            await self.initialize()
+        if not self._initialized or self.client is None:
+            logger.warning("Graphiti client unavailable; skipping get_entity_facts_exact")
+            return []
+
+        driver = self._group_driver(tenant_id, user_id)
+        if not driver:
+            logger.warning("Graphiti driver unavailable; skipping get_entity_facts_exact")
+            return []
+
+        group_id = self._make_composite_user_id(tenant_id, user_id)
+        safe_limit = max(1, min(int(limit or 10), 50))
+        try:
+            rows = await driver.execute_query(
+                """
+                MATCH (s:Entity {group_id: $group_id})-[e]->(t:Entity {group_id: $group_id})
+                WHERE (s.uuid IN $node_ids OR t.uuid IN $node_ids)
+                  AND e.fact IS NOT NULL
+                RETURN e.fact AS fact, e.valid_at AS valid_at, e.invalid_at AS invalid_at, e.created_at AS created_at
+                ORDER BY e.created_at DESC
+                LIMIT $limit
+                """,
+                group_id=group_id,
+                node_ids=node_ids,
+                limit=safe_limit,
+            )
+            facts: List[Dict[str, Any]] = []
+            seen = set()
+            for row in self._rows(rows):
+                if not isinstance(row, dict):
+                    continue
+                fact_text = str(row.get("fact") or "").strip()
+                if not fact_text:
+                    continue
+                fact_key = fact_text.lower()
+                if fact_key in seen:
+                    continue
+                seen.add(fact_key)
+                facts.append(
+                    {
+                        "text": fact_text,
+                        "relevance": 1.0,
+                        "source": "graphiti_exact",
+                        "valid_at": row.get("valid_at"),
+                        "invalid_at": row.get("invalid_at"),
+                        "created_at": row.get("created_at"),
+                    }
+                )
+            logger.info(
+                "get_entity_facts_exact returned %s facts for name=%s entity_id=%s",
+                len(facts),
+                name,
+                entity_id,
+            )
+            return facts
+        except Exception as e:
+            logger.error("get_entity_facts_exact failed: %s", e)
+            return []
+
+    async def get_entity_role_grounding(
+        self,
+        tenant_id: str,
+        user_id: str,
+        *,
+        name: Optional[str] = None,
+        entity_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return exact graph-readable role grounding for a canonical entity."""
+        node_ids = []
+        if entity_id:
+            node_ids.append(str(entity_id).strip())
+        elif name:
+            exact_nodes = await self.get_exact_named_entity_nodes(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                names=[name],
+                allowed_types=ONTOLOGY_NODE_TYPES,
+                limit=50,
+            )
+            node_ids.extend([str(node.get("uuid") or "").strip() for node in exact_nodes if str(node.get("uuid") or "").strip()])
+        else:
+            nodes = await self.get_canonical_entity_nodes(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                name=name,
+                entity_id=None,
+                limit=5,
+                allowed_types=ONTOLOGY_NODE_TYPES,
+            )
+            node_ids.extend([str(node.get("uuid") or "").strip() for node in nodes if str(node.get("uuid") or "").strip()])
+        node_ids = [x for i, x in enumerate(node_ids) if x and x not in node_ids[:i]]
+        if not node_ids:
+            return None
+
+        if not self._initialized:
+            await self.initialize()
+        if not self._initialized or self.client is None:
+            return None
+        driver = self._group_driver(tenant_id, user_id)
+        if not driver:
+            return None
+        group_id = self._make_composite_user_id(tenant_id, user_id)
+        try:
+            rows = await driver.execute_query(
+                """
+                MATCH (s)-[e]->(t)
+                WHERE s.group_id = $group_id
+                  AND t.group_id = $group_id
+                  AND (s.uuid IN $node_ids OR t.uuid IN $node_ids)
+                  AND e.name IN ['RELATED_TO_USER_AS', 'WORKING_ON', 'ABOUT']
+                RETURN
+                    s.uuid AS source_uuid,
+                    coalesce(s.name, '') AS source_name,
+                    t.uuid AS target_uuid,
+                    coalesce(t.name, '') AS target_name,
+                    e.name AS edge_name,
+                    coalesce(e.fact, '') AS fact,
+                    properties(e) AS attributes,
+                    e.created_at AS created_at
+                ORDER BY coalesce(e.created_at, '') DESC
+                LIMIT 20
+                """,
+                group_id=group_id,
+                node_ids=node_ids,
+            )
+        except Exception as e:
+            logger.error("get_entity_role_grounding failed: %s", e)
+            return None
+
+        for row in self._rows(rows):
+            if not isinstance(row, dict):
+                continue
+            attrs = row.get("attributes") if isinstance(row.get("attributes"), dict) else {}
+            edge_name = str(row.get("edge_name") or "").strip().upper()
+            source_name = canonicalize_entity_name(row.get("source_name"))
+            target_name = canonicalize_entity_name(row.get("target_name"))
+            role = str(attrs.get("role_display") or attrs.get("role") or "").strip()
+            importance = attrs.get("importance")
+            if edge_name == "RELATED_TO_USER_AS":
+                if target_name == canonicalize_entity_name(name or target_name) or str(row.get("target_uuid") or "") in node_ids:
+                    return {
+                        "role": role or None,
+                        "relationship": role or None,
+                        "edge_name": edge_name,
+                        "source_name": source_name,
+                        "target_name": target_name,
+                        "importance": importance,
+                    }
+            if edge_name == "WORKING_ON":
+                if target_name == canonicalize_entity_name(name or target_name) or str(row.get("target_uuid") or "") in node_ids:
+                    return {
+                        "role": role or "active_project",
+                        "relationship": role or "active_project",
+                        "edge_name": edge_name,
+                        "source_name": source_name,
+                        "target_name": target_name,
+                        "importance": importance,
+                    }
+            if edge_name == "ABOUT":
+                if target_name == canonicalize_entity_name(name or target_name) or str(row.get("target_uuid") or "") in node_ids:
+                    return {
+                        "role": role or None,
+                        "relationship": role or None,
+                        "edge_name": edge_name,
+                        "source_name": source_name,
+                        "target_name": target_name,
+                        "importance": importance,
+                    }
+            if edge_name == "ABOUT":
+                if target_name == canonicalize_entity_name(name or target_name) or str(row.get("target_uuid") or "") in node_ids:
+                    return {
+                        "role": role or None,
+                        "relationship": role or None,
+                        "edge_name": edge_name,
+                        "source_name": source_name,
+                        "target_name": target_name,
+                        "importance": importance,
+                    }
+        return None
+
+    async def inspect_exact_entity_cluster(
+        self,
+        tenant_id: str,
+        user_id: str,
+        *,
+        canonical_name: str,
+        candidate_names: Optional[List[str]] = None,
+        allowed_types: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        canonical = canonicalize_entity_name(canonical_name)
+        nodes = await self.get_exact_named_entity_nodes(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            names=[canonical, *(candidate_names or [])],
+            allowed_types=allowed_types or ONTOLOGY_NODE_TYPES,
+            limit=100,
+        )
+        survivor = None
+        if nodes:
+            survivor = sorted(
+                nodes,
+                key=lambda node: (
+                    1 if str(node.get("name") or "").strip().lower() == canonical.lower() else 0,
+                    float(node.get("discipline_score") or 0.0),
+                    self._parse_dt_like(node.get("updated_at") or node.get("created_at")).timestamp(),
+                ),
+                reverse=True,
+            )[0]
+        return {
+            "canonical_name": canonical,
+            "node_count": len(nodes),
+            "duplicate_count": max(0, len(nodes) - 1),
+            "survivor_uuid": str((survivor or {}).get("uuid") or "").strip() or None,
+            "survivor_summary": str((survivor or {}).get("summary") or "").strip() or None,
+            "survivor_aliases": (
+                list(((survivor or {}).get("attributes") or {}).get("aliases") or [])
+                if isinstance((survivor or {}).get("attributes"), dict)
+                else []
+            ),
+            "nodes": [
+                {
+                    "uuid": str(node.get("uuid") or "").strip() or None,
+                    "name": str(node.get("name") or "").strip() or None,
+                    "type": str(node.get("type") or "").strip() or None,
+                    "summary": str(node.get("summary") or "").strip() or None,
+                    "labels": list(node.get("labels") or []),
+                    "aliases": list(((node.get("attributes") or {}).get("aliases") or []))
+                    if isinstance(node.get("attributes"), dict)
+                    else [],
+                    "created_at": node.get("created_at"),
+                    "updated_at": node.get("updated_at"),
+                }
+                for node in nodes
+            ],
+        }
+
+    async def inspect_exact_role_edges(
+        self,
+        tenant_id: str,
+        user_id: str,
+        *,
+        entity_name: Optional[str] = None,
+        entity_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        node_ids: List[str] = []
+        if entity_id:
+            node_ids.append(str(entity_id).strip())
+        elif entity_name:
+            nodes = await self.get_exact_named_entity_nodes(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                names=[entity_name],
+                allowed_types=ONTOLOGY_NODE_TYPES,
+                limit=100,
+            )
+            node_ids.extend([str(node.get("uuid") or "").strip() for node in nodes if str(node.get("uuid") or "").strip()])
+        node_ids = [x for i, x in enumerate(node_ids) if x and x not in node_ids[:i]]
+        if not node_ids:
+            return []
+
+        if not self._initialized:
+            await self.initialize()
+        if not self._initialized or self.client is None:
+            return []
+        driver = self._group_driver(tenant_id, user_id)
+        if not driver:
+            return []
+        group_id = self._make_composite_user_id(tenant_id, user_id)
+        rows = await driver.execute_query(
+            """
+            MATCH (s)-[e]->(t)
+            WHERE s.group_id = $group_id
+              AND t.group_id = $group_id
+              AND (s.uuid IN $node_ids OR t.uuid IN $node_ids)
+            RETURN
+                type(e) AS rel_type,
+                e.name AS edge_name,
+                e.uuid AS edge_uuid,
+                e.fact AS fact,
+                properties(e) AS attributes,
+                s.name AS source_name,
+                s.uuid AS source_uuid,
+                t.name AS target_name,
+                t.uuid AS target_uuid
+            ORDER BY coalesce(e.created_at, '') DESC
+            LIMIT 100
+            """,
+            group_id=group_id,
+            node_ids=node_ids,
+        )
+        out: List[Dict[str, Any]] = []
+        for row in self._rows(rows):
+            if not isinstance(row, dict):
+                continue
+            out.append(
+                {
+                    "rel_type": row.get("rel_type"),
+                    "edge_name": row.get("edge_name"),
+                    "edge_uuid": row.get("edge_uuid"),
+                    "fact": row.get("fact"),
+                    "attributes": row.get("attributes") if isinstance(row.get("attributes"), dict) else {},
+                    "source_name": row.get("source_name"),
+                    "source_uuid": row.get("source_uuid"),
+                    "target_name": row.get("target_name"),
+                    "target_uuid": row.get("target_uuid"),
+                }
+            )
+        return out
 
     def _extract_episode_summary(self, episode: Any) -> Dict[str, Any]:
         if isinstance(episode, dict):
@@ -978,8 +2262,35 @@ class GraphitiClient:
                 logger.info(f"Retrieved {len(episodes)} recent episodes for {composite_user_id}")
                 return episodes
 
-            driver = getattr(self.client, "driver", None)
+            driver = self._group_driver(tenant_id, user_id)
             if driver:
+                try:
+                    rows = await driver.execute_query(
+                        """
+                        MATCH (e:Episodic)
+                        RETURN properties(e) AS props
+                        ORDER BY e.created_at DESC
+                        LIMIT $limit
+                        """,
+                        limit=limit,
+                    )
+                    episodes: List[Dict[str, Any]] = []
+                    for row in rows or []:
+                        if isinstance(row, dict):
+                            props = row.get("props")
+                            if isinstance(props, dict):
+                                episodes.append(props)
+                    if episodes:
+                        logger.info(f"Retrieved {len(episodes)} recent episodes for {composite_user_id} via scoped query")
+                        return episodes
+                except Exception as e:
+                    logger.warning(
+                        "Scoped episodic query failed tenant=%s user=%s err=%s; falling back to EpisodicNode.get_by_group_ids",
+                        tenant_id,
+                        user_id,
+                        e,
+                    )
+
                 episodes = await EpisodicNode.get_by_group_ids(
                     driver=driver,
                     group_ids=[composite_user_id],

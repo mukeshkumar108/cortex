@@ -2,6 +2,12 @@
 
 A FastAPI memory service with a sliding‑window session buffer and Graphiti‑native semantic memory. Designed to be reliable, tenant‑isolated, and cheap to run.
 
+Current v2 direction:
+- Postgres owns operational memory: transcripts, loops, explicit state, ingest status.
+- Graphiti owns semantic memory: people, projects, goals, preferences, events, semantic facts, and grounded relationships.
+- `/session/startbrief`, `/memory/query`, `/memory/loops`, `/user/model`, `/entities/profile`, and `/session/ingest` are the canonical surfaces.
+- Empty `/session/ingest` transcripts are skipped explicitly and do not enqueue Graphiti raw-episode jobs.
+
 Implementation evolution log: [docs/IMPROVEMENT_LOG.md](/opt/synapse/docs/IMPROVEMENT_LOG.md)
 
 ## What it does (short)
@@ -152,7 +158,7 @@ Exact response payload shape:
 }
 ```
 
-`entity_hints` is the compact ambient grounding surface. `entity_profiles` is a legacy field kept temporarily for compatibility.
+`entity_hints` is the compact ambient grounding surface. It is Graphiti-first, ontology-filtered, deterministic, and capped to the top canonical entities. `entity_profiles` is a legacy field kept temporarily for compatibility and is empty by default in the structured startup path.
 
 **POST /entities/profile**
 ```bash
@@ -418,8 +424,11 @@ OUTBOX_DRAIN_ENABLED=true
 - **Identity defaults are null** until user states name/home/timezone. Don’t assume name exists.
 - **Graphiti recall is not automatic**: call `/memory/query` to retrieve facts/entities.
 - **/memory/query defaults to clean recall**: include only `facts`, `factItems`, `entities`, `metadata` unless `includeContext=true`.
+- **/memory/query entity retrieval is ontology-filtered**: runtime entity lists are constrained to autobiographical node types (`person`, `project`, `goal`, `loop`, `preference`, `event`) and exclude internal graph classes such as `SessionSummary`, `Tension`, and `Environment`.
 - **/session/brief is Graphiti‑native**: facts are filtered for quality (no single-token/vague fragments), and narrativeSummary is derived from Graphiti episode summaries (de‑duplicated from facts).
 - **/session/startbrief is structured**: use `handover_text` and `ops_context.top_loops_today`; do not expect legacy `bridgeText/items` fields.
+- **/session/startbrief is now structured-truth first**: identity basics, top canonical entities, top loops, and recent high-signal changes are primary. Narrative/user-model/daily-analysis helper text is demoted by default.
+- **/entities/profile is canonical-first**: resolve by exact/canonical Graphiti entity first, then enrich with facts, loops, and evidence-backed role framing.
 - **SessionSummary node fields**: summary content is stored as top-level node props (`summary_text`, `bridge_text`, `session_id`, `summary_quality_tier`, `summary_source`) and also available via Graphiti node attributes.
 - **Outbox won’t drain** unless `/internal/drain` is called or `OUTBOX_DRAIN_ENABLED=true`.
 - **Session close** is legacy/admin-safe enqueue-only; canonical finalization is `/session/ingest`.

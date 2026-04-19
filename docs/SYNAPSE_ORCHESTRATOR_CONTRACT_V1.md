@@ -239,7 +239,7 @@ tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z&sessionId=<optional>&pe
 {
   "handover_text": "string",
   "narrative": "string|null",
-  "handover_depth": "continuation|yesterday|weekly",
+  "handover_depth": "continuation|today|yesterday|multi_day",
   "time_context": {
     "local_time": "HH:MM",
     "time_of_day": "MORNING|AFTERNOON|EVENING|NIGHT",
@@ -255,8 +255,16 @@ tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z&sessionId=<optional>&pe
     "top_loops_today": [],
     "waiting_on": [],
     "user_model_hints": [],
+    "user_model_hint_rows": [
+      {"text": "string", "confidence": 0.0, "updated_at": "ISO-8601|null", "source": "user_model|inferred|manual_update|null"}
+    ],
     "yesterday_themes": [],
-    "steering_note": "string|null"
+    "steering_note": "string|null",
+    "daily_analysis": {
+      "date": "YYYY-MM-DD|null",
+      "confidence": 0.0,
+      "updated_at": "ISO-8601|null"
+    }
   },
   "evidence": {
     "session_summary_ids_used": [],
@@ -317,7 +325,10 @@ tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z&sessionId=<optional>&pe
       "role": "string|null",
       "importance": 0.0,
       "salience": 0.0,
-      "lastSeenAt": "ISO-8601|null"
+      "lastSeenAt": "ISO-8601|null",
+      "source": "graphiti_node|user_model_relationship|summary_recurrence|null",
+      "confidence": 0.0,
+      "updatedAt": "ISO-8601|null"
     }
   ],
   "entity_profiles": []
@@ -335,8 +346,10 @@ tenantId=tenant_a&userId=user_1&now=2026-02-03T18:35:00Z&sessionId=<optional>&pe
     "top_loops_today": [{"kind": "loop", "text": "Finish portfolio site"}],
     "waiting_on": [],
     "user_model_hints": [],
+    "user_model_hint_rows": [],
     "yesterday_themes": [],
-    "steering_note": null
+    "steering_note": null,
+    "daily_analysis": {"date": "2026-02-05", "confidence": 0.72, "updated_at": "2026-02-06T06:10:00Z"}
   },
   "evidence": {
     "session_summary_ids_used": ["session-abc"],
@@ -397,6 +410,8 @@ Notes:
   - `importance` = durable relevance across recurrence/persistence
 - `entity_hints` = compact ambient grounding surface (preferred for startup context).
 - `entity_hints.role` resolves from user-model relationship evidence first, then recent summary mentions.
+- `entity_hints.source/confidence/updatedAt` expose provenance and freshness of each hint for runtime trust decisions.
+- `ops_context.user_model_hint_rows` and `ops_context.daily_analysis` expose freshness metadata; avoid using stale rows as hard steering.
 - `entity_profiles` is legacy compatibility and may be removed after entity_hints migration.
 
 ---

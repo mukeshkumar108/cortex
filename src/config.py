@@ -35,6 +35,15 @@ class Settings(BaseSettings):
     memory_semantic_enabled: bool = True
     memory_semantic_embedding_enabled: bool = True
     memory_semantic_embedding_model: str = "text-embedding-3-small"
+    episodic_embedding_enabled: bool = True
+    episodic_embedding_model: str = "text-embedding-3-small"
+    episodic_embedding_window_size: int = 6
+    episodic_embedding_stride: int = 2
+    episodic_embedding_max_windows: int = 12
+    episodic_embedding_max_chars: int = 1400
+    episodic_embedding_user_turn_centric: bool = True
+    episodic_embedding_include_assistant_turns: bool = True
+    episodic_embedding_assistant_char_weight: float = 0.45
 
     # Session settings
     session_close_gap_minutes: int = 30

@@ -1,5 +1,48 @@
 # Changelog
 
+## 2026-04-11
+
+### Added
+- Pass 1 and episodic memory schema/extensions:
+  - `migrations/034_pass1_tension_and_memory_delta_embedding.sql`
+  - `session_classifications.tension_signal`
+  - `session_classifications.memory_delta_embedding vector(1536)`
+  - `idx_sc_embedding` ivfflat cosine index
+- New runtime memory endpoints:
+  - `GET /session/handover`
+  - `POST /memory/search`
+- New memory scripts:
+  - `scripts/run_episodic_embeddings.py` (backfill + ongoing embedding support)
+  - `scripts/run_identity_synthesis.py`
+  - `scripts/run_living_context.py`
+- New memory docs:
+  - `docs/MEMORY_SYSTEM_OVERVIEW.md`
+  - `docs/MEMORY_OPERATIONS_RUNBOOK.md`
+  - `docs/MEMORY_API_REFERENCE.md`
+  - `docs/MEMORY_DATA_MODEL.md`
+  - `docs/agent/AGENT_MEMORY_RULES.md`
+  - `docs/agent/AGENT_HANDOVER_USAGE.md`
+  - `docs/agent/AGENT_RECOVERY_PLAYBOOK.md`
+
+### Changed
+- `scripts/run_pass1_memory_triage_batch.py`
+  - prompt now requests `tension_signal` for subtle unspoken/avoidance cues
+  - stores `tension_signal` in `session_classifications`
+  - now embeds memory deltas for newly processed memory-worthy sessions
+- `src/main.py`
+  - added handover packet builder integrating living context, threads, people, clustered projects, identity anchors, and episodic recall
+  - added episodic semantic search wiring
+- `scripts/run_scoring_update.py`
+  - lifecycle-aware thread salience/decay behavior
+  - persistent-goal promotion and stale thread auto-snooze behavior
+
+### Data/Backfill Notes
+- Episodic embedding backfill completed for current memory-worthy backlog:
+  - candidates: `91`
+  - embedded: `91`
+  - skipped_empty: `0`
+  - skipped_failed: `0`
+
 ## 2026-04-09
 
 ### Added

@@ -1,6 +1,31 @@
 from typing import Any, Dict, Iterable, List, Optional
 
 
+def extract_query_rows(result: Any) -> List[Any]:
+    """
+    Normalize Falkor/Graphiti query results to the raw row list.
+
+    Common shapes:
+    - tuple(rows, headers, stats)
+    - list[dict]
+    - None
+    """
+    if result is None:
+        return []
+    if isinstance(result, tuple):
+        if not result:
+            return []
+        rows = result[0]
+        if isinstance(rows, list):
+            return rows
+        if rows is None:
+            return []
+        return [rows]
+    if isinstance(result, list):
+        return result
+    return [result]
+
+
 def extract_node_dicts(row: Any, required_keys: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
     """
     Extract candidate node dicts from a Falkor/Graphiti row.

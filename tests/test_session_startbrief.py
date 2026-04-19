@@ -608,3 +608,166 @@ async def test_startbrief_fallback_bounded_and_soft_fail(monkeypatch):
             assert data["handover_text"]
             assert data["evidence"]["fallback_used"] is True
             assert data["evidence"]["fallback_success"] is False
+
+
+@pytest.mark.asyncio
+async def test_startbrief_handover_dedupes_and_strips_low_value_sentences(monkeypatch):
+    now_dt = datetime(2026, 2, 8, 10, 15, tzinfo=timezone.utc)
+    now = now_dt.isoformat().replace("+00:00", "Z")
+    summary = _base_summary((now_dt - timedelta(hours=3)).isoformat().replace("+00:00", "Z"))
+
+    async def _stub_latest_summary_node(*_args, **_kwargs):
+        return summary
+
+    async def _stub_recent_session_summary_nodes(*_args, **_kwargs):
+        return [summary]
+
+    async def _stub_get_top_loops(*_args, **_kwargs):
+        return [_loop("Finish portfolio site", salience=6, horizon="today", now_iso=now)]
+
+    async def _stub_db_fetchone(query, *_args, **_kwargs):
+        if "FROM session_transcript" in query:
+            return {"messages": [{"role": "user", "text": "last", "timestamp": (now_dt - timedelta(hours=3)).isoformat()}]}
+        if "FROM daily_analysis" in query:
+            return {"analysis_date": "2026-02-07", "themes": [], "steering_note": None, "confidence": 0.71, "updated_at": now_dt}
+        return None
+
+    async def _stub_bridge_llm(*_args, **_kwargs):
+        return (
+            "The user checked if the assistant was present, and the assistant confirmed availability. "
+            "The session began with a brief exchange of presence and readiness. "
+            "The user checked if the assistant was present, and the assistant confirmed availability. "
+            "The user then returned to the same portfolio thread."
+        )
+
+    graphiti_client.get_latest_session_summary_node = _stub_latest_summary_node
+    graphiti_client.get_recent_session_summary_nodes = _stub_recent_session_summary_nodes
+
+    async def _stub_search_nodes(*_args, **_kwargs):
+        return []
+
+    graphiti_client.search_nodes = _stub_search_nodes
+    monkeypatch.setattr(loops_module, "get_top_loops_for_startbrief", _stub_get_top_loops, raising=True)
+    monkeypatch.setattr("src.main.db.fetchone", _stub_db_fetchone, raising=False)
+    monkeypatch.setattr("src.main._generate_startbrief_bridge_llm", _stub_bridge_llm, raising=True)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            data = await _make_request(client, now)
+            text = data["handover_text"].lower()
+            assert "brief exchange of presence and readiness" not in text
+            assert text.count("confirmed availability") <= 1
+
+
+@pytest.mark.asyncio
+async def test_startbrief_entity_hints_include_provenance_fields(monkeypatch):
+    now_dt = datetime(2026, 2, 10, 9, 0, tzinfo=timezone.utc)
+    now = now_dt.isoformat().replace("+00:00", "Z")
+    summary = _base_summary((now_dt - timedelta(hours=1)).isoformat().replace("+00:00", "Z"))
+
+    async def _stub_latest_summary_node(*_args, **_kwargs):
+        return summary
+
+    async def _stub_recent_session_summary_nodes(*_args, **_kwargs):
+        return [summary]
+
+    async def _stub_get_top_loops(*_args, **_kwargs):
+        return [_loop("Finish portfolio site", salience=6, horizon="today", now_iso=now)]
+
+    async def _stub_db_fetchone(query, *_args, **_kwargs):
+        if "FROM session_transcript" in query:
+            return {"messages": [{"role": "user", "text": "last", "timestamp": (now_dt - timedelta(hours=1)).isoformat()}]}
+        if "FROM daily_analysis" in query:
+            return {"analysis_date": "2026-02-09", "themes": [], "steering_note": None, "confidence": 0.66, "updated_at": now_dt}
+        return None
+
+    async def _stub_bridge_llm(*_args, **_kwargs):
+        return "The user continued the active thread."
+
+    async def _stub_build_entity_candidates(*_args, **_kwargs):
+        return [
+            {
+                "entityId": "e1",
+                "name": "Ashley",
+                "type": "person",
+                "role": "partner",
+                "importance": 0.9,
+                "salience": 0.88,
+                "lastSeenAt": now,
+                "source": "graphiti_node",
+                "confidence": 0.86,
+                "updatedAt": now,
+            }
+        ]
+
+    graphiti_client.get_latest_session_summary_node = _stub_latest_summary_node
+    graphiti_client.get_recent_session_summary_nodes = _stub_recent_session_summary_nodes
+
+    async def _stub_search_nodes(*_args, **_kwargs):
+        return []
+
+    graphiti_client.search_nodes = _stub_search_nodes
+    monkeypatch.setattr(loops_module, "get_top_loops_for_startbrief", _stub_get_top_loops, raising=True)
+    monkeypatch.setattr("src.main.db.fetchone", _stub_db_fetchone, raising=False)
+    monkeypatch.setattr("src.main._generate_startbrief_bridge_llm", _stub_bridge_llm, raising=True)
+    monkeypatch.setattr("src.main._build_entity_candidates", _stub_build_entity_candidates, raising=True)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            data = await _make_request(client, now)
+            first = (data.get("entity_hints") or [])[0]
+            assert first["source"] == "graphiti_node"
+            assert first["confidence"] == pytest.approx(0.86, rel=1e-6)
+            assert first["updatedAt"] == now
+
+
+@pytest.mark.asyncio
+async def test_startbrief_structured_truth_packet_uses_graphiti_first_entity_hints(monkeypatch):
+    now_dt = datetime(2026, 2, 10, 9, 0, tzinfo=timezone.utc)
+    now = now_dt.isoformat().replace("+00:00", "Z")
+    summary = _base_summary((now_dt - timedelta(hours=1)).isoformat().replace("+00:00", "Z"))
+
+    async def _stub_latest_summary_node(*_args, **_kwargs):
+        return summary
+
+    async def _stub_recent_session_summary_nodes(*_args, **_kwargs):
+        return [summary]
+
+    async def _stub_get_top_loops(*_args, **_kwargs):
+        return [_loop("Finish portfolio site", salience=6, horizon="today", now_iso=now)]
+
+    async def _stub_db_fetchone(query, *_args, **_kwargs):
+        if "FROM session_transcript" in query:
+            return {"messages": [{"role": "user", "text": "last", "timestamp": (now_dt - timedelta(hours=1)).isoformat()}]}
+        return None
+
+    async def _stub_fetch_user_model_rows_for_scope(*_args, **_kwargs):
+        return [{"model": {"preferred_name": "Mukesh"}}]
+
+    async def _stub_build_entity_candidates(*_args, **_kwargs):
+        return [
+            {"entityId": "1", "name": "Ashley", "type": "person", "role": "girlfriend", "importance": 0.95, "salience": 0.9, "lastSeenAt": now, "source": "graphiti_node", "confidence": 0.9, "updatedAt": now},
+            {"entityId": "2", "name": "Jasmine", "type": "person", "role": "daughter", "importance": 0.92, "salience": 0.88, "lastSeenAt": now, "source": "graphiti_node", "confidence": 0.9, "updatedAt": now},
+            {"entityId": "3", "name": "Bluum", "type": "project", "role": "active_project", "importance": 0.91, "salience": 0.87, "lastSeenAt": now, "source": "graphiti_node", "confidence": 0.89, "updatedAt": now},
+            {"entityId": "4", "name": "Sophie", "type": "project", "role": "active_project", "importance": 0.9, "salience": 0.86, "lastSeenAt": now, "source": "graphiti_node", "confidence": 0.89, "updatedAt": now},
+            {"entityId": "5", "name": "Yoshi", "type": "person", "role": "Ashley's daughter", "importance": 0.7, "salience": 0.6, "lastSeenAt": now, "source": "graphiti_node", "confidence": 0.8, "updatedAt": now},
+            {"entityId": "6", "name": "Overflow", "type": "project", "role": None, "importance": 0.6, "salience": 0.5, "lastSeenAt": now, "source": "graphiti_node", "confidence": 0.7, "updatedAt": now},
+        ]
+
+    graphiti_client.get_latest_session_summary_node = _stub_latest_summary_node
+    graphiti_client.get_recent_session_summary_nodes = _stub_recent_session_summary_nodes
+    monkeypatch.setattr(loops_module, "get_top_loops_for_startbrief", _stub_get_top_loops, raising=True)
+    monkeypatch.setattr("src.main.db.fetchone", _stub_db_fetchone, raising=False)
+    monkeypatch.setattr("src.main._fetch_user_model_rows_for_scope", _stub_fetch_user_model_rows_for_scope, raising=True)
+    monkeypatch.setattr("src.main._build_entity_candidates", _stub_build_entity_candidates, raising=True)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            data = await _make_request(client, now)
+            assert data["narrative"] is None
+            assert len(data["entity_hints"]) == 5
+            assert data["entity_hints"][0]["importance"] == "high"
+            assert data["ops_context"]["user_model_hints"] == []
+            assert data["ops_context"]["yesterday_themes"] == []
+            assert data["ops_context"]["recent_changes"]
+            assert "mukesh" in data["handover_text"].lower()

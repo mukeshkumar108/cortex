@@ -24,6 +24,7 @@ from .db import Database
 from .models import Message
 from .config import get_settings
 from .openrouter_client import get_llm_client
+from .episodic_memory import upsert_session_episode_embeddings
 from . import loops
 
 logger = logging.getLogger(__name__)
@@ -314,6 +315,12 @@ class SessionManager:
         ended_at: Optional[str],
     ) -> None:
         messages_payload = messages or []
+        valid_messages = [
+            m for m in messages_payload
+            if isinstance(m, dict)
+            and str((m.get("text") or "")).strip()
+            and str((m.get("role") or "")).strip()
+        ]
         reference_time = self._parse_ts(ended_at)
         if reference_time is None:
             ts_values = [self._parse_ts((m or {}).get("timestamp")) for m in messages_payload if isinstance(m, dict)]
@@ -345,6 +352,14 @@ class SessionManager:
                     user_id,
                     messages_payload
                 )
+                if not valid_messages:
+                    logger.warning(
+                        "Skipping session_raw_episode enqueue for empty transcript tenant=%s user=%s session=%s",
+                        tenant_id,
+                        user_id,
+                        session_id,
+                    )
+                    return
                 await conn.execute(
                     """
                     INSERT INTO graphiti_outbox (
@@ -1040,6 +1055,42 @@ class SessionManager:
                 e,
             )
         episode_uuid = response.get("episode_uuid") if isinstance(response, dict) else None
+        try:
+            if bool(self.settings.episodic_embedding_enabled):
+                embedding_result = await upsert_session_episode_embeddings(
+                    db=self.db,
+                    tenant_id=row["tenant_id"],
+                    user_id=row["user_id"],
+                    session_id=row["session_id"],
+                    episode_uuid=episode_uuid,
+                    reference_time=reference_time,
+                    messages=messages,
+                    model=self.settings.episodic_embedding_model,
+                    window_size=int(self.settings.episodic_embedding_window_size),
+                    stride=int(self.settings.episodic_embedding_stride),
+                    max_windows=int(self.settings.episodic_embedding_max_windows),
+                    max_chars=int(self.settings.episodic_embedding_max_chars),
+                    user_turn_centric=bool(self.settings.episodic_embedding_user_turn_centric),
+                    include_assistant_turns=bool(self.settings.episodic_embedding_include_assistant_turns),
+                    assistant_char_weight=float(self.settings.episodic_embedding_assistant_char_weight),
+                )
+                logger.info(
+                    "episodic embedding index tenant=%s user=%s session=%s indexed=%s attempted=%s model=%s",
+                    row["tenant_id"],
+                    row["user_id"],
+                    row["session_id"],
+                    embedding_result.get("indexed"),
+                    embedding_result.get("attempted"),
+                    embedding_result.get("embedding_model"),
+                )
+        except Exception as e:
+            logger.warning(
+                "episodic embedding index soft-failed tenant=%s user=%s session=%s err=%s",
+                row["tenant_id"],
+                row["user_id"],
+                row["session_id"],
+                e,
+            )
         await self._enqueue_post_ingest_hook_jobs(
             tenant_id=row["tenant_id"],
             user_id=row["user_id"],
