@@ -29,6 +29,63 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-19 15:09 UTC — T0
+- Summary of what changed:
+  - Replaced remaining `uuid5`-based local hashing in `main.py` with canonicalization SDK hashing.
+  - Updated session digest payload construction to hash canonical structured payloads (timestamp passed as native value, normalized in SDK), removing preformatted timestamp hashing.
+  - Added timestamp field semantics in canonicalization (`valid` / `missing` / `invalid`) so invalid and missing timestamps hash differently.
+  - Refactored local text-normalization helpers in `main.py`, `episodic_memory.py`, and `memory_ontology.py` to delegate to canonicalization SDK.
+  - Added enforcement test that blocks `hashlib`/`uuid5` usage outside `src/canonicalization.py`.
+  - Added 1000+ fixture deterministic/variation stress tests.
+- Files changed:
+  - `src/canonicalization.py`
+  - `src/main.py`
+  - `src/session.py`
+  - `src/episodic_memory.py`
+  - `src/memory_ontology.py`
+  - `tests/test_canonicalization.py`
+  - `tests/test_canonicalization_enforcement.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+- Tests added/updated:
+  - `tests/test_canonicalization.py`:
+    - timestamp equivalence variants
+    - missing vs invalid timestamp semantic separation
+    - event-key missing-vs-invalid differentiation
+    - 1200-fixture slot-key determinism stress test
+    - 1000-fixture event-key variation sensitivity stress test
+  - `tests/test_canonicalization_enforcement.py`:
+    - bans `hashlib`/`uuid5` usage outside canonicalization module in `src/`
+- Acceptance criteria satisfied:
+  - Canonicalization SDK is the single hashing/key authority for current write/replay hashing paths.
+  - Determinism stress coverage exceeds 1,000 randomized fixtures.
+  - Local hashing primitives (`hashlib`/`uuid5`) are enforced out of non-canonicalization modules.
+- Known remaining gaps:
+  - None for T0 scope.
+- Status: done
+
+### 2026-04-19 15:03 UTC — T0
+- Summary of what changed:
+  - Added canonicalization SDK module with deterministic normalization and key generation primitives.
+  - Implemented `generate_claim_slot_key(...)`, `generate_claim_event_key(...)`, timestamp normalization, subject/object normalization, and versioned deterministic hashing.
+  - Migrated local session hash generation for episode/summary names to use shared canonicalization hash utility.
+- Files changed:
+  - `src/canonicalization.py`
+  - `src/session.py`
+  - `tests/test_canonicalization.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+- Tests added/updated:
+  - `tests/test_canonicalization.py`:
+    - deterministic key output tests
+    - variation tests for object/timestamp changes
+    - normalization tests for case/spacing/unicode and UTC timestamp formatting
+- Acceptance criteria satisfied:
+  - Shared canonicalization module exists with deterministic slot/event key generation and normalization primitives.
+  - Deterministic and variation test coverage added for canonicalization behavior.
+- Known remaining gaps:
+  - Full adoption across all write/replay claim/entity paths is pending (resolver/extraction paths not yet implemented).
+  - 1,000-fixture determinism stress test is not yet added.
+- Status: partially done
+
 ### 2026-04-19 14:54 UTC — T1
 - Summary of what changed:
   - Removed factual candidate injection from session-summary prose and `user_model` prose in `/memory/query`.

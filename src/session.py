@@ -14,7 +14,6 @@ Rolling summary is a compressor, not a memory:
 
 from typing import Dict, Any, List, Optional, Set, Callable, Awaitable
 from datetime import datetime, timedelta, date
-import hashlib
 import inspect
 import json
 import logging
@@ -25,6 +24,7 @@ from .models import Message
 from .config import get_settings
 from .openrouter_client import get_llm_client
 from .episodic_memory import upsert_session_episode_embeddings
+from .canonicalization import stable_short_hash
 from . import loops
 
 logger = logging.getLogger(__name__)
@@ -1422,8 +1422,16 @@ class SessionManager:
         ts: datetime,
         text: str
     ) -> str:
-        payload = f"{tenant_id}|{user_id}|{session_id}|{role}|{ts.isoformat()}|{text}"
-        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+        payload = {
+            "kind": "episode",
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "role": role,
+            "timestamp": ts,
+            "text": text,
+        }
+        digest = stable_short_hash(payload, length=16)
         return f"episode_{digest}"
 
     def _build_session_summary_name(
@@ -1434,8 +1442,15 @@ class SessionManager:
         ts: datetime,
         summary: str
     ) -> str:
-        payload = f"{tenant_id}|{user_id}|{session_id}|session_summary|{ts.isoformat()}|{summary}"
-        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+        payload = {
+            "kind": "session_summary",
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "timestamp": ts,
+            "summary": summary,
+        }
+        digest = stable_short_hash(payload, length=16)
         return f"session_summary_{digest}"
 
     async def _fold_into_summary(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import re
+from .canonicalization import normalize_text as canonicalize_text
 
 
 ONTOLOGY_NODE_TYPES: List[str] = [
@@ -222,11 +223,7 @@ CANONICAL_SUPPORT_ATTRIBUTE_KEYS: Set[str] = {
 
 
 def normalize_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if not isinstance(value, str):
-        value = str(value)
-    return re.sub(r"\s+", " ", value).strip()
+    return canonicalize_text(value, casefold=False)
 
 
 def canonicalize_entity_name(name: Any) -> str:

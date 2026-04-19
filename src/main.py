@@ -74,6 +74,7 @@ from .memory_ontology import (
     infer_query_node_types,
     is_allowed_runtime_node,
 )
+from .canonicalization import normalize_text as canonicalize_text, stable_short_hash
 
 # Configure logging
 logging.basicConfig(
@@ -110,11 +111,7 @@ ENERGY_HINT_TERMS = (
 
 
 def _normalize_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if not isinstance(value, str):
-        value = str(value)
-    return re.sub(r"\s+", " ", value).strip()
+    return canonicalize_text(value, casefold=False)
 
 
 def _format_vector(vector: List[float]) -> str:
@@ -9056,7 +9053,12 @@ def _classify_signal_sensitivity(text: str) -> str:
 
 
 def _signal_id(signal_class: str, source: str, text: str) -> str:
-    return uuid.uuid5(uuid.NAMESPACE_URL, f"{signal_class}|{source}|{_normalize_text(text).lower()}").hex[:16]
+    payload = {
+        "signal_class": _normalize_text(signal_class).lower(),
+        "source": _normalize_text(source).lower(),
+        "text": _normalize_text(text).lower(),
+    }
+    return stable_short_hash(payload, length=16)
 
 
 def _record_signal_rejection(debug: Dict[str, Any], signal_class: str, reason: str, source: str) -> None:
@@ -9854,10 +9856,15 @@ async def _build_signals_pack(
             chosen = stale_items[0]
             evidence = chosen.get("evidence") if isinstance(chosen.get("evidence"), dict) else {}
             stale_entity = _normalize_text(evidence.get("stale_entity")) or _normalize_text(chosen.get("text"))
-            thread_key = _normalize_text(chosen.get("id")) or uuid.uuid5(
-                uuid.NAMESPACE_URL,
-                f"{tenantId}|{userId}|{stale_entity}",
-            ).hex
+            thread_key = _normalize_text(chosen.get("id")) or stable_short_hash(
+                {
+                    "kind": "checkin_tactic_thread",
+                    "tenant_id": tenantId,
+                    "user_id": userId,
+                    "stale_entity": stale_entity,
+                },
+                length=32,
+            )
             cooldown_cutoff = reference_now - timedelta(hours=72)
             latest_fire = await db.fetchone(
                 """

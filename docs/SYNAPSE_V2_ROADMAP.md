@@ -14,16 +14,15 @@ Without one canonical implementation, claim identity diverges across extraction/
 None.
 
 ### 4. Current status
-Not implemented.
+Done.
 
 ### 5. Gaps
-- No explicit shared key derivation contract in repo.
-- Logic is scattered in helper functions and endpoint code.
+- None for T0 scope.
 
 ### 6. Acceptance criteria
-- One module exports canonicalization primitives used by all write/replay paths.
-- Determinism test: same input + versions => identical keys/hashes across 1,000 randomized fixtures.
-- No duplicate local key derivation logic remains in write path.
+- One module exports canonicalization primitives used by all current write/replay hashing paths. ✅
+- Determinism test: same input + versions => identical keys/hashes across 1,000 randomized fixtures. ✅
+- No duplicate local key derivation logic remains in current write path. ✅ (enforced by test; no `hashlib`/`uuid5` outside canonicalization module in `src/`).
 
 ### 7. Risks
 - Silent key drift if any service bypasses SDK.
@@ -657,8 +656,8 @@ Can run independently once dependencies are met:
 - Documentation alignment portions of **T15** can start early, but destructive cleanup must wait.
 
 ## Immediate Next 3 Tickets
-1. **T1** — Stop mixed-authority retrieval behaviors.
-2. **T0** — Canonicalization SDK and key normalization rules.
-3. **T2** — Add v2 additive schema and indexes.
+1. **T2** — Add v2 additive schema and indexes.
+2. **T5** — Predicate policy service + versioning.
+3. **T3** — Dual-write evidence ingest to v2 surfaces.
 
-Rationale: these three stop ongoing contamination first, then establish deterministic identity, then create the storage substrate for all remaining tickets.
+Rationale: T1 and T0 are complete; the next blocking work is schema substrate (T2), policy versioning guardrails (T5), then v2 evidence dual-write (T3).

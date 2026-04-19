@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import Any, Dict, List, Optional
 
@@ -11,15 +10,12 @@ except Exception:  # pragma: no cover - optional dependency fallback
     openai = None
 
 from .config import get_settings
+from .canonicalization import normalize_text as canonicalize_text
 from .db import Database
 
 
 def _normalize_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if not isinstance(value, str):
-        value = str(value)
-    return re.sub(r"\s+", " ", value).strip()
+    return canonicalize_text(value, casefold=False)
 
 
 def _shorten_text(value: str, max_chars: int) -> str:

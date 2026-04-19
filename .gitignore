@@ -9,4 +9,5 @@ logs/
 backups/
 data/
 tmp_*
+tmp/
 *.local.json
