@@ -1,6 +1,7 @@
 import asyncio
 import os
 from datetime import datetime
+from types import SimpleNamespace
 from uuid import uuid4
 
 import asyncpg
@@ -58,17 +59,43 @@ async def test_brief_is_minimal_without_query():
 
 
 @pytest.mark.asyncio
-async def test_memory_query_uses_graphiti():
-    class _FakeGraph:
-        async def search_facts(self, **_kwargs):
-            return [{"text": "User likes birds", "relevance": 0.9, "source": "graphiti"}]
+async def test_memory_query_uses_evidence_backed_factual_rows(monkeypatch):
+    async def _stub_semantic(items, **_kwargs):
+        return [
+            SimpleNamespace(
+                domain="relationships",
+                intent="share_update",
+                memory_type="fact",
+                domain_scores={"relationships": 0.7},
+                confidence=0.8,
+                classification_method="fallback",
+            )
+            for _ in items
+        ]
 
-        async def search_nodes(self, **_kwargs):
-            return [{"summary": "Ashley", "type": "Entity", "labels": ["Entity"], "uuid": "u1"}]
+    async def _stub_pg_search_facts(**_kwargs):
+        return [
+            {
+                "text": "User likes birds",
+                "relevance": 0.9,
+                "source": "claim_store",
+                "source_type": "canonical factual",
+                "derived": False,
+                "evidence_backed": True,
+                "data_classification": "canonical factual",
+            }
+        ]
 
-    fake = _FakeGraph()
-    graphiti_client.search_facts = fake.search_facts
-    graphiti_client.search_nodes = fake.search_nodes
+    async def _stub_pg_search_nodes(**_kwargs):
+        return [{"summary": "Ashley", "type": "Entity", "labels": ["Entity"], "uuid": "u1"}]
+
+    async def _stub_user_model_rows(**_kwargs):
+        return []
+
+    monkeypatch.setattr("src.main._pg_search_facts", _stub_pg_search_facts, raising=True)
+    monkeypatch.setattr("src.main._pg_search_nodes", _stub_pg_search_nodes, raising=True)
+    monkeypatch.setattr("src.main._fetch_user_model_rows_for_scope", _stub_user_model_rows, raising=True)
+    monkeypatch.setattr("src.main.classify_memory_candidates_semantic", _stub_semantic, raising=True)
 
     from src.main import memory_query
     from src.models import MemoryQueryRequest
@@ -621,53 +648,62 @@ async def test_memory_query_focus_query_is_configurable():
 
 
 @pytest.mark.asyncio
-async def test_memory_query_surfaces_session_summary_and_user_model_with_provenance(monkeypatch):
-    class _FakeGraph:
-        async def search_facts(self, **kwargs):
-            tenant_id = kwargs.get("tenant_id")
-            if tenant_id == "default":
-                return [{"text": "User recently left hospital", "relevance": 0.55, "source": "graphiti"}]
-            return []
+async def test_memory_query_blocks_session_summary_and_user_model_fact_injection(monkeypatch):
+    async def _stub_semantic(items, **_kwargs):
+        return [
+            SimpleNamespace(
+                domain="relationships",
+                intent="share_update",
+                memory_type="fact",
+                domain_scores={"relationships": 0.7},
+                confidence=0.75,
+                classification_method="fallback",
+            )
+            for _ in items
+        ]
 
-        async def search_nodes(self, **kwargs):
-            tenant_id = kwargs.get("tenant_id")
-            if tenant_id != "default":
-                return []
-            return [
-                {
-                    "summary": "session summary",
-                    "type": "SessionSummary",
-                    "labels": ["SessionSummary"],
-                    "attributes": {
-                        "summary_facts": "Recently out of hospital with kidney stones.",
-                        "reference_time": "2026-04-08T09:00:00Z",
-                    },
-                }
-            ]
+    async def _stub_pg_search_facts(**_kwargs):
+        return [
+            {
+                "text": "Ashley is the user's long-term girlfriend.",
+                "relevance": 0.91,
+                "source": "claim_store",
+                "source_type": "canonical factual",
+                "derived": False,
+                "evidence_backed": True,
+                "data_classification": "canonical factual",
+            }
+        ]
 
-    async def _stub_db_fetch(query, *args, **_kwargs):
-        if "FROM user_model" in query:
-            return [
-                {
-                    "tenant_id": "default",
-                    "model": {
-                        "narrative_current": "Recently out of hospital with kidney stones.",
-                        "recent_signals": [{"text": "Hydration helps with kidney stone recovery."}],
-                    },
-                    "version": 3,
-                    "created_at": None,
-                    "updated_at": None,
-                    "last_source": "enrichment",
-                    "narrative_stable": None,
-                    "narrative_current": None,
-                }
-            ]
-        return []
+    async def _stub_pg_search_nodes(**_kwargs):
+        return [
+            {
+                "summary": "session summary",
+                "type": "SessionSummary",
+                "labels": ["SessionSummary"],
+                "attributes": {
+                    "summary_facts": "Recently out of hospital with kidney stones.",
+                    "reference_time": "2026-04-08T09:00:00Z",
+                },
+            },
+            {"summary": "Ashley", "type": "person", "uuid": "p1", "labels": ["Person"]},
+        ]
 
-    fake = _FakeGraph()
-    graphiti_client.search_facts = fake.search_facts
-    graphiti_client.search_nodes = fake.search_nodes
-    monkeypatch.setattr("src.main.db.fetch", _stub_db_fetch, raising=False)
+    async def _stub_user_model_rows(**_kwargs):
+        return [
+            {
+                "tenant_id": "default",
+                "model": {
+                    "narrative_current": "Recently out of hospital with kidney stones.",
+                    "recent_signals": [{"text": "Hydration helps with kidney stone recovery."}],
+                },
+            }
+        ]
+
+    monkeypatch.setattr("src.main._pg_search_facts", _stub_pg_search_facts, raising=True)
+    monkeypatch.setattr("src.main._pg_search_nodes", _stub_pg_search_nodes, raising=True)
+    monkeypatch.setattr("src.main._fetch_user_model_rows_for_scope", _stub_user_model_rows, raising=True)
+    monkeypatch.setattr("src.main.classify_memory_candidates_semantic", _stub_semantic, raising=True)
 
     from src.main import memory_query
     from src.models import MemoryQueryRequest
@@ -676,18 +712,93 @@ async def test_memory_query_surfaces_session_summary_and_user_model_with_provena
         MemoryQueryRequest(
             tenantId="default",
             userId="u",
-            query="why did I go to hospital",
+            query="who is Ashley",
             includeContext=False,
             limit=5,
         )
     )
 
-    lower_facts = [f.lower() for f in resp.facts]
-    assert any("kidney stones" in text for text in lower_facts)
+    assert resp.facts == ["Ashley is the user's long-term girlfriend."]
     sources = {item.source for item in resp.factItems}
-    assert "graphiti_session_summary" in sources or "user_model" in sources
-    assert "provenanceCounts" in (resp.metadata or {})
+    assert "graphiti_session_summary" not in sources
+    assert "user_model" not in sources
+    assert all("kidney stone" not in item.text.lower() for item in resp.factItems)
     assert not any((e.type or "").lower() == "sessionsummary" for e in resp.entities)
+
+
+@pytest.mark.asyncio
+async def test_memory_query_factual_output_requires_evidence_backed_rows(monkeypatch):
+    async def _stub_semantic(items, **_kwargs):
+        return [
+            SimpleNamespace(
+                domain="work",
+                intent="share_update",
+                memory_type="fact",
+                domain_scores={"work": 0.6},
+                confidence=0.7,
+                classification_method="fallback",
+            )
+            for _ in items
+        ]
+
+    async def _stub_pg_search_facts(**_kwargs):
+        return [
+            {
+                "text": "Unsupported derived fact.",
+                "relevance": 0.9,
+                "source": "derived_projection",
+                "source_type": "derived continuity/projection",
+                "derived": True,
+                "evidence_backed": False,
+                "data_classification": "derived continuity/projection",
+            },
+            {
+                "text": "Evidence-backed canonical fact.",
+                "relevance": 0.8,
+                "source": "claim_store",
+                "source_type": "canonical factual",
+                "derived": False,
+                "evidence_backed": True,
+                "data_classification": "canonical factual",
+            },
+        ]
+
+    async def _stub_pg_search_nodes(**_kwargs):
+        return []
+
+    async def _stub_user_model_rows(**_kwargs):
+        return []
+
+    monkeypatch.setattr("src.main._pg_search_facts", _stub_pg_search_facts, raising=True)
+    monkeypatch.setattr("src.main._pg_search_nodes", _stub_pg_search_nodes, raising=True)
+    monkeypatch.setattr("src.main._fetch_user_model_rows_for_scope", _stub_user_model_rows, raising=True)
+    monkeypatch.setattr("src.main.classify_memory_candidates_semantic", _stub_semantic, raising=True)
+
+    from src.main import memory_query
+    from src.models import MemoryQueryRequest
+
+    resp = await memory_query(
+        MemoryQueryRequest(
+            tenantId="default",
+            userId="u",
+            query="what do you know",
+            includeContext=False,
+            limit=5,
+        )
+    )
+
+    assert resp.facts == ["Evidence-backed canonical fact."]
+    assert all((item.source or "") != "derived_projection" for item in resp.factItems)
+
+
+@pytest.mark.asyncio
+async def test_memory_search_endpoint_is_disabled():
+    from fastapi import HTTPException
+    from src.main import memory_search
+
+    with pytest.raises(HTTPException) as exc:
+        await memory_search({"user_id": "u", "query": "q", "limit": 3})
+    assert exc.value.status_code == 410
 
 
 @pytest.mark.asyncio
@@ -730,6 +841,533 @@ async def test_memory_query_alias_scope_queries_canonical_and_alias(monkeypatch)
     assert set(called_tenants) >= {"default", "sophie-prod"}
     assert captured_scope["value"] and set(captured_scope["value"]) >= {"default", "sophie-prod"}
     assert (resp.metadata or {}).get("tenantCanonical") == "default"
+
+
+@pytest.mark.asyncio
+async def test_memory_query_people_scope_filters_non_person_nodes(monkeypatch):
+    class _FakeGraph:
+        async def search_facts(self, **_kwargs):
+            return []
+
+        async def search_nodes(self, **kwargs):
+            allowed_types = kwargs.get("allowed_types")
+            if allowed_types == ["person"]:
+                return [
+                    {"summary": "Ashley", "type": "person", "uuid": "p1", "labels": ["Person"]},
+                    {"summary": "Bluum", "type": "project", "uuid": "pr1", "labels": ["Project"]},
+                    {"summary": "session_summary_1", "type": "SessionSummary", "uuid": "s1", "labels": ["SessionSummary"]},
+                ]
+            return []
+
+    async def _stub_db_fetch(query, *args, **_kwargs):
+        if "FROM user_model" in query:
+            return []
+        return []
+
+    fake = _FakeGraph()
+    graphiti_client.search_facts = fake.search_facts
+    graphiti_client.search_nodes = fake.search_nodes
+    monkeypatch.setattr("src.main.db.fetch", _stub_db_fetch, raising=False)
+
+    from src.main import memory_query
+    from src.models import MemoryQueryRequest
+
+    resp = await memory_query(
+        MemoryQueryRequest(
+            tenantId="default",
+            userId="u",
+            query="important people in this user's life",
+            includeContext=False,
+            limit=5,
+        )
+    )
+
+    assert [e.summary for e in resp.entities] == ["Ashley"]
+    assert (resp.metadata or {}).get("rankingSignals", {}).get("ontologyNodeTypes") == ["person"]
+
+
+@pytest.mark.asyncio
+async def test_memory_query_episodic_mode_returns_ranked_episodes(monkeypatch):
+    async def _stub_db_fetch(_query, *_args, **_kwargs):
+        return []
+
+    class _FakeGraph:
+        async def search_facts(self, **_kwargs):
+            return [{"text": "should be skipped in episodic mode", "relevance": 0.9, "source": "graphiti"}]
+
+        async def search_nodes(self, **_kwargs):
+            return [{"summary": "Jasmine", "type": "person", "uuid": "p1", "labels": ["Person"]}]
+
+        async def get_recent_episodes(self, **_kwargs):
+            return [
+                {
+                    "uuid": "ep-recent",
+                    "name": "session_raw_recent",
+                    "summary": "Conversation about life and spirituality.",
+                    "content": "User: What was I saying about God the other day?\nAssistant: You were exploring life and spirituality deeply.",
+                    "reference_time": "2026-04-09T20:00:00Z",
+                },
+                {
+                    "uuid": "ep-older",
+                    "name": "session_raw_old",
+                    "summary": "Work update and deployment.",
+                    "content": "User: Deployed a patch.",
+                    "reference_time": "2026-03-10T20:00:00Z",
+                },
+            ]
+
+    fake = _FakeGraph()
+    graphiti_client.search_facts = fake.search_facts
+    graphiti_client.search_nodes = fake.search_nodes
+    graphiti_client.get_recent_episodes = fake.get_recent_episodes
+    monkeypatch.setattr("src.main.db.fetch", _stub_db_fetch, raising=False)
+
+    from src.main import memory_query
+    from src.models import MemoryQueryRequest
+
+    resp = await memory_query(
+        MemoryQueryRequest(
+            tenantId="default",
+            userId="u",
+            query="what was I saying about God the other day?",
+            memoryIntent="episodic",
+            limit=3,
+        )
+    )
+
+    assert resp.facts == []
+    assert resp.factItems == []
+    assert len(resp.episodes) >= 1
+    assert resp.episodes[0].episodeId == "ep-recent"
+    assert any("god" in ev.lower() for ev in (resp.episodes[0].evidence or []))
+    assert (resp.metadata or {}).get("memoryIntent") == "episodic"
+
+
+@pytest.mark.asyncio
+async def test_memory_query_exact_mode_skips_episodic_fetch(monkeypatch):
+    calls = {"episodes": 0}
+
+    async def _stub_db_fetch(_query, *_args, **_kwargs):
+        return []
+
+    class _FakeGraph:
+        async def search_facts(self, **_kwargs):
+            return [{"text": "Ashley is user's girlfriend.", "relevance": 0.9, "source": "graphiti"}]
+
+        async def search_nodes(self, **_kwargs):
+            return [{"summary": "Ashley", "type": "person", "uuid": "p1", "labels": ["Person"]}]
+
+        async def get_recent_episodes(self, **_kwargs):
+            calls["episodes"] += 1
+            return []
+
+    fake = _FakeGraph()
+    graphiti_client.search_facts = fake.search_facts
+    graphiti_client.search_nodes = fake.search_nodes
+    graphiti_client.get_recent_episodes = fake.get_recent_episodes
+    monkeypatch.setattr("src.main.db.fetch", _stub_db_fetch, raising=False)
+
+    from src.main import memory_query
+    from src.models import MemoryQueryRequest
+
+    resp = await memory_query(
+        MemoryQueryRequest(
+            tenantId="default",
+            userId="u",
+            query="who is Ashley",
+            memoryIntent="exact",
+            limit=3,
+        )
+    )
+
+    assert len(resp.facts) >= 1
+    assert resp.episodes == []
+    assert calls["episodes"] == 0
+
+
+@pytest.mark.asyncio
+async def test_memory_query_narrow_identity_scopes_to_direct_entity_facts(monkeypatch):
+    async def _stub_semantic(items, **_kwargs):
+        return [
+            SimpleNamespace(
+                domain="relationships",
+                intent="ask_help",
+                memory_type="relationship",
+                domain_scores={"relationships": 0.9},
+                confidence=0.8,
+                classification_method="fallback",
+            )
+            for _ in items
+        ]
+
+    async def _stub_user_model_rows(**_kwargs):
+        return [
+            {
+                "tenant_id": "default",
+                "model": {
+                    "narrative_current": "Long autobiographical blob about diaspora, spirituality, and many unrelated life themes.",
+                    "key_relationships": [{"name": "Ashley", "who": "girlfriend"}],
+                },
+            }
+        ]
+
+    class _FakeGraph:
+        async def search_facts(self, **_kwargs):
+            return [
+                {"text": "Diaspora is important to the user.", "relevance": 0.99, "source": "graphiti"},
+                {"text": "Ashley is connected to spring and general reflection.", "relevance": 0.88, "source": "graphiti"},
+            ]
+
+        async def search_nodes(self, **_kwargs):
+            return [
+                {"summary": "Ashley", "type": "person", "uuid": "ash-1", "labels": ["Person"]},
+                {"summary": "diaspora", "type": "project", "uuid": "dia-1", "labels": ["Project"]},
+            ]
+
+        async def get_canonical_entity_nodes(self, **_kwargs):
+            return [
+                {
+                    "summary": "Ashley",
+                    "name": "Ashley",
+                    "type": "person",
+                    "uuid": "ash-1",
+                    "labels": ["Person"],
+                    "attributes": {"profile_summary": "Ashley is a central person in the user's life."},
+                }
+            ]
+
+        async def get_entity_role_grounding(self, **_kwargs):
+            return {"role": "girlfriend", "relationship": "girlfriend", "edge_name": "RELATED_TO_USER_AS"}
+
+        async def get_entity_facts_exact(self, **_kwargs):
+            return [
+                {"text": "Ashley is the user's girlfriend.", "relevance": 1.0, "source": "graphiti_exact"},
+                {"text": "Ashley is an important relationship in the user's life.", "relevance": 0.95, "source": "graphiti_exact"},
+            ]
+
+    fake = _FakeGraph()
+    graphiti_client.search_facts = fake.search_facts
+    graphiti_client.search_nodes = fake.search_nodes
+    graphiti_client.get_canonical_entity_nodes = fake.get_canonical_entity_nodes
+    graphiti_client.get_entity_role_grounding = fake.get_entity_role_grounding
+    graphiti_client.get_entity_facts_exact = fake.get_entity_facts_exact
+    monkeypatch.setattr("src.main._fetch_user_model_rows_for_scope", _stub_user_model_rows, raising=True)
+    monkeypatch.setattr("src.main.classify_memory_candidates_semantic", _stub_semantic, raising=True)
+
+    from src.main import memory_query
+    from src.models import MemoryQueryRequest
+
+    resp = await memory_query(
+        MemoryQueryRequest(
+            tenantId="default",
+            userId="u",
+            query="who is Ashley?",
+            memoryIntent="exact",
+            limit=5,
+        )
+    )
+
+    texts = [item.text for item in resp.factItems]
+    assert texts
+    assert "Ashley is the user's girlfriend." in texts
+    assert all("diaspora" not in text.lower() for text in texts)
+    assert all("blob" not in text.lower() for text in texts)
+    assert len(resp.entities) == 1
+    assert resp.entities[0].summary == "Ashley"
+    assert (resp.metadata or {}).get("rankingSignals", {}).get("exactEntityScoped") is True
+    assert (resp.metadata or {}).get("rankingSignals", {}).get("exactEntityTarget") == "Ashley"
+
+
+@pytest.mark.asyncio
+async def test_memory_query_narrow_project_identity_prefers_direct_project_grounding(monkeypatch):
+    async def _stub_semantic(items, **_kwargs):
+        return [
+            SimpleNamespace(
+                domain="work",
+                intent="ask_help",
+                memory_type="fact",
+                domain_scores={"work": 0.8},
+                confidence=0.8,
+                classification_method="fallback",
+            )
+            for _ in items
+        ]
+
+    async def _stub_user_model_rows(**_kwargs):
+        return []
+
+    class _FakeGraph:
+        async def search_facts(self, **_kwargs):
+            return [{"text": "Bluum is discussed near unrelated finance history.", "relevance": 0.9, "source": "graphiti"}]
+
+        async def search_nodes(self, **_kwargs):
+            return [{"summary": "Bluum", "type": "project", "uuid": "blu-1", "labels": ["Project"]}]
+
+        async def get_canonical_entity_nodes(self, **_kwargs):
+            return [
+                {
+                    "summary": "Bluum",
+                    "name": "Bluum",
+                    "type": "project",
+                    "uuid": "blu-1",
+                    "labels": ["Project"],
+                    "attributes": {"profile_summary": "Bluum is a project the user is actively building."},
+                }
+            ]
+
+        async def get_entity_role_grounding(self, **_kwargs):
+            return {"role": "active_project", "relationship": "active_project", "edge_name": "WORKING_ON"}
+
+        async def get_entity_facts_exact(self, **_kwargs):
+            return [{"text": "Bluum is a project the user is working on.", "relevance": 1.0, "source": "graphiti_exact"}]
+
+    fake = _FakeGraph()
+    graphiti_client.search_facts = fake.search_facts
+    graphiti_client.search_nodes = fake.search_nodes
+    graphiti_client.get_canonical_entity_nodes = fake.get_canonical_entity_nodes
+    graphiti_client.get_entity_role_grounding = fake.get_entity_role_grounding
+    graphiti_client.get_entity_facts_exact = fake.get_entity_facts_exact
+    monkeypatch.setattr("src.main._fetch_user_model_rows_for_scope", _stub_user_model_rows, raising=True)
+    monkeypatch.setattr("src.main.classify_memory_candidates_semantic", _stub_semantic, raising=True)
+
+    from src.main import memory_query
+    from src.models import MemoryQueryRequest
+
+    resp = await memory_query(
+        MemoryQueryRequest(
+            tenantId="default",
+            userId="u",
+            query="what is Bluum?",
+            memoryIntent="exact",
+            limit=4,
+        )
+    )
+
+    texts = [item.text for item in resp.factItems]
+    assert texts
+    assert "Bluum is a project the user is working on." in texts
+    assert all("finance" not in text.lower() for text in texts)
+    assert len(resp.entities) == 1
+    assert resp.entities[0].summary == "Bluum"
+
+
+@pytest.mark.asyncio
+async def test_memory_query_broader_ashley_prompt_does_not_force_narrow_identity_scope(monkeypatch):
+    async def _stub_db_fetch(_query, *_args, **_kwargs):
+        return []
+
+    async def _stub_user_model_rows(**_kwargs):
+        return [
+            {
+                "tenant_id": "default",
+                "model": {
+                    "key_relationships": [{"name": "Ashley", "who": "girlfriend"}],
+                    "narrative_current": "Ashley came up in recent conversation context.",
+                },
+            }
+        ]
+
+    class _FakeGraph:
+        async def search_facts(self, **_kwargs):
+            return [{"text": "Ashley is the user's girlfriend.", "relevance": 0.9, "source": "graphiti"}]
+
+        async def search_nodes(self, **_kwargs):
+            return [{"summary": "Ashley", "type": "person", "uuid": "ash-1", "labels": ["Person"]}]
+
+        async def get_recent_episodes(self, **_kwargs):
+            return []
+
+    fake = _FakeGraph()
+    graphiti_client.search_facts = fake.search_facts
+    graphiti_client.search_nodes = fake.search_nodes
+    graphiti_client.get_recent_episodes = fake.get_recent_episodes
+    monkeypatch.setattr("src.main.db.fetch", _stub_db_fetch, raising=False)
+    monkeypatch.setattr("src.main._fetch_user_model_rows_for_scope", _stub_user_model_rows, raising=True)
+
+    from src.main import memory_query
+    from src.models import MemoryQueryRequest
+
+    resp = await memory_query(
+        MemoryQueryRequest(
+            tenantId="default",
+            userId="u",
+            query="what do you remember about Ashley lately?",
+            memoryIntent="exact",
+            limit=4,
+        )
+    )
+
+    assert (resp.metadata or {}).get("rankingSignals", {}).get("exactEntityScoped") is False
+
+
+@pytest.mark.asyncio
+async def test_memory_query_episodic_embedding_signal_promotes_older_candidate(monkeypatch):
+    async def _stub_db_fetch(_query, *_args, **_kwargs):
+        return []
+
+    async def _stub_embedding_candidates(**_kwargs):
+        return [
+            {
+                "tenant_id": "default",
+                "session_id": "s_old",
+                "episode_uuid": "",
+                "unit_text": "User: We explored life meaning and spiritual direction.",
+                "embedding_similarity": 0.96,
+            }
+        ]
+
+    class _FakeGraph:
+        async def search_facts(self, **_kwargs):
+            return []
+
+        async def search_nodes(self, **_kwargs):
+            return [{"summary": "Jasmine", "type": "person", "uuid": "p1", "labels": ["Person"]}]
+
+        async def get_recent_episodes(self, **_kwargs):
+            return [
+                {
+                    "uuid": "ep-recent",
+                    "name": "session_raw_s_recent",
+                    "summary": "Quick logistics check-in.",
+                    "content": "User: groceries and schedule.",
+                    "reference_time": "2026-04-09T22:00:00Z",
+                },
+                {
+                    "uuid": "ep-old",
+                    "name": "session_raw_s_old",
+                    "summary": "Earlier discussion.",
+                    "content": "User: We were exploring deeper ideas.",
+                    "reference_time": "2026-03-01T10:00:00Z",
+                },
+            ]
+
+    fake = _FakeGraph()
+    graphiti_client.search_facts = fake.search_facts
+    graphiti_client.search_nodes = fake.search_nodes
+    graphiti_client.get_recent_episodes = fake.get_recent_episodes
+    monkeypatch.setattr("src.main.db.fetch", _stub_db_fetch, raising=False)
+    monkeypatch.setattr("src.main.search_episode_embedding_candidates", _stub_embedding_candidates, raising=True)
+
+    from src.main import memory_query
+    from src.models import MemoryQueryRequest
+
+    resp = await memory_query(
+        MemoryQueryRequest(
+            tenantId="default",
+            userId="u",
+            query="remember that idea we were exploring before",
+            memoryIntent="episodic",
+            limit=3,
+        )
+    )
+
+    assert len(resp.episodes) >= 1
+    assert resp.episodes[0].sessionId == "s_old"
+    assert any("spiritual" in ev.lower() or "meaning" in ev.lower() for ev in (resp.episodes[0].evidence or []))
+
+
+@pytest.mark.asyncio
+async def test_memory_query_episodic_diversifies_sessions(monkeypatch):
+    async def _stub_db_fetch(_query, *_args, **_kwargs):
+        return []
+
+    async def _stub_embedding_candidates(**_kwargs):
+        return [
+            {"tenant_id": "default", "session_id": "s1", "episode_uuid": "", "unit_text": "User: life purpose talk", "embedding_similarity": 0.91},
+            {"tenant_id": "default", "session_id": "s2", "episode_uuid": "", "unit_text": "User: jasmine future worries", "embedding_similarity": 0.90},
+        ]
+
+    async def _stub_embedding_stats(**_kwargs):
+        return {"rows": 20, "sessions": 2}
+
+    class _FakeGraph:
+        async def search_facts(self, **_kwargs):
+            return []
+
+        async def search_nodes(self, **_kwargs):
+            return []
+
+        async def get_recent_episodes(self, **_kwargs):
+            return [
+                {"uuid": "ep1", "name": "session_raw_s1", "summary": "Life and spirituality", "content": "User: life purpose", "reference_time": "2026-04-09T22:00:00Z"},
+                {"uuid": "ep1b", "name": "session_raw_s1", "summary": "More life and spirituality", "content": "User: meaning", "reference_time": "2026-04-09T21:55:00Z"},
+                {"uuid": "ep2", "name": "session_raw_s2", "summary": "Jasmine future planning", "content": "User: jasmine future", "reference_time": "2026-04-08T20:00:00Z"},
+            ]
+
+    fake = _FakeGraph()
+    graphiti_client.search_facts = fake.search_facts
+    graphiti_client.search_nodes = fake.search_nodes
+    graphiti_client.get_recent_episodes = fake.get_recent_episodes
+    monkeypatch.setattr("src.main.db.fetch", _stub_db_fetch, raising=False)
+    monkeypatch.setattr("src.main.search_episode_embedding_candidates", _stub_embedding_candidates, raising=True)
+    monkeypatch.setattr("src.main.get_user_episodic_embedding_stats", _stub_embedding_stats, raising=True)
+
+    from src.main import memory_query
+    from src.models import MemoryQueryRequest
+
+    resp = await memory_query(
+        MemoryQueryRequest(
+            tenantId="default",
+            userId="u",
+            query="remember what we discussed before",
+            memoryIntent="episodic",
+            limit=2,
+        )
+    )
+
+    assert len(resp.episodes) == 2
+    session_ids = [e.sessionId for e in resp.episodes]
+    assert len(set(session_ids)) == 2
+
+
+@pytest.mark.asyncio
+async def test_memory_query_episodic_sets_weak_recall_flag_on_low_signal(monkeypatch):
+    async def _stub_db_fetch(_query, *_args, **_kwargs):
+        return []
+
+    async def _stub_embedding_candidates(**_kwargs):
+        return []
+
+    async def _stub_embedding_stats(**_kwargs):
+        return {"rows": 0, "sessions": 0}
+
+    class _FakeGraph:
+        async def search_facts(self, **_kwargs):
+            return []
+
+        async def search_nodes(self, **_kwargs):
+            return []
+
+        async def get_recent_episodes(self, **_kwargs):
+            return [
+                {"uuid": "ep1", "name": "session_raw_s1", "summary": "Random quick update", "content": "User: hi", "reference_time": "2026-04-09T22:00:00Z"},
+            ]
+
+    fake = _FakeGraph()
+    graphiti_client.search_facts = fake.search_facts
+    graphiti_client.search_nodes = fake.search_nodes
+    graphiti_client.get_recent_episodes = fake.get_recent_episodes
+    monkeypatch.setattr("src.main.db.fetch", _stub_db_fetch, raising=False)
+    monkeypatch.setattr("src.main.search_episode_embedding_candidates", _stub_embedding_candidates, raising=True)
+    monkeypatch.setattr("src.main.get_user_episodic_embedding_stats", _stub_embedding_stats, raising=True)
+
+    from src.main import memory_query
+    from src.models import MemoryQueryRequest
+
+    resp = await memory_query(
+        MemoryQueryRequest(
+            tenantId="default",
+            userId="u",
+            query="remember the deep spiritual thread",
+            memoryIntent="episodic",
+            limit=3,
+        )
+    )
+
+    ranking = (resp.metadata or {}).get("episodicRanking") or {}
+    audit = ranking.get("audit") if isinstance(ranking, dict) else {}
+    assert (resp.metadata or {}).get("episodicWeakRecall") is True
+    assert (audit or {}).get("weakRecall") is True
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,7 @@ from .models import (
     MemoryLoopItem,
     Fact,
     Entity,
+    EpisodeRecallItem,
     SessionStartBriefResponse,
     SessionStartBriefItem,
     SessionStartBriefEntityProfile,
@@ -58,6 +59,20 @@ from .memory_taxonomy import (
     classify_memory_candidates_semantic,
     summarize_domain_distribution,
     summarize_label_distribution,
+)
+from .episodic_memory import (
+    search_episode_embedding_candidates,
+    get_user_episodic_embedding_stats,
+    embed_texts,
+)
+from .memory_ontology import (
+    ONTOLOGY_DOMAIN_FACETS,
+    ONTOLOGY_EDGE_TYPES,
+    ONTOLOGY_NODE_TYPES,
+    canonicalize_entity_name,
+    infer_ontology_type,
+    infer_query_node_types,
+    is_allowed_runtime_node,
 )
 
 # Configure logging
@@ -100,6 +115,239 @@ def _normalize_text(value: Any) -> str:
     if not isinstance(value, str):
         value = str(value)
     return re.sub(r"\s+", " ", value).strip()
+
+
+def _format_vector(vector: List[float]) -> str:
+    return "[" + ",".join(str(float(x)) for x in vector) + "]"
+
+
+SOPHIE_CLUSTER_NAMES = {
+    "sophie",
+    "sophie repository",
+    "synapse",
+    "relational continuity engine",
+}
+
+
+def _cluster_projects(projects: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sophie_cluster: List[Dict[str, Any]] = []
+    other_projects: List[Dict[str, Any]] = []
+
+    for p in projects or []:
+        name = _normalize_text(p.get("canonical_name")).lower()
+        aliases = p.get("aliases") if isinstance(p.get("aliases"), list) else []
+        alias_norm = {_normalize_text(a).lower() for a in aliases if _normalize_text(a)}
+        in_sophie_cluster = (
+            name in SOPHIE_CLUSTER_NAMES
+            or any(a in SOPHIE_CLUSTER_NAMES for a in alias_norm)
+            or ("sophie" in name)
+            or ("synapse" in name)
+        )
+        if in_sophie_cluster:
+            sophie_cluster.append(p)
+        else:
+            other_projects.append(p)
+
+    result: List[Dict[str, Any]] = []
+    if sophie_cluster:
+        primary = max(
+            sophie_cluster,
+            key=lambda x: float(x.get("salience_score") or 0.0),
+        )
+        result.append(
+            {
+                "cluster_name": "Sophie / Synapse",
+                "components": [_normalize_text(p.get("canonical_name")) for p in sophie_cluster if _normalize_text(p.get("canonical_name"))],
+                "primary_profile": _normalize_text(primary.get("profile_text")) or None,
+                "current_status": _normalize_text(primary.get("last_known_status")) or None,
+                "salience": max(float(p.get("salience_score") or 0.0) for p in sophie_cluster),
+            }
+        )
+
+    for p in other_projects:
+        result.append(
+            {
+                "cluster_name": _normalize_text(p.get("canonical_name")),
+                "components": [_normalize_text(p.get("canonical_name"))],
+                "primary_profile": _normalize_text(p.get("profile_text")) or None,
+                "current_status": _normalize_text(p.get("last_known_status")) or None,
+                "salience": float(p.get("salience_score") or 0.0),
+            }
+        )
+
+    return sorted(result, key=lambda x: float(x.get("salience") or 0.0), reverse=True)
+
+
+async def _episodic_search(
+    *,
+    user_id: str,
+    query: str,
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    text = _normalize_text(query)
+    if not _normalize_text(user_id) or not text:
+        return []
+    model = _normalize_text(get_settings().memory_semantic_embedding_model) or "text-embedding-3-small"
+    vectors = await embed_texts([text], model=model)
+    if not vectors or not isinstance(vectors, list) or not vectors or not isinstance(vectors[0], list):
+        return []
+    query_vec = _format_vector(vectors[0])
+    rows = await db.fetch(
+        """
+        SELECT
+          session_id,
+          session_date,
+          session_kind,
+          emotional_weight,
+          raw_triage_output->'memory_deltas' AS deltas,
+          1 - (memory_delta_embedding <=> $1::vector) AS similarity
+        FROM session_classifications
+        WHERE user_id = $2
+          AND is_memory_worthy = true
+          AND memory_delta_embedding IS NOT NULL
+        ORDER BY memory_delta_embedding <=> $1::vector
+        LIMIT $3
+        """,
+        query_vec,
+        user_id,
+        max(1, min(int(limit or 5), 20)),
+    )
+    out: List[Dict[str, Any]] = []
+    for row in rows or []:
+        out.append(
+            {
+                "session_id": _normalize_text(row.get("session_id")),
+                "session_date": row.get("session_date").isoformat() if isinstance(row.get("session_date"), datetime) else _normalize_text(row.get("session_date")),
+                "session_kind": _normalize_text(row.get("session_kind")),
+                "emotional_weight": _normalize_text(row.get("emotional_weight")),
+                "memory_deltas": row.get("deltas") if isinstance(row.get("deltas"), list) else [],
+                "similarity": float(row.get("similarity") or 0.0),
+            }
+        )
+    return out
+
+
+async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
+    living = await db.fetchone(
+        """
+        SELECT current_focus, recent_narrative,
+               relationship_pulse, emotional_texture,
+               primary_tension, what_theyre_avoiding,
+               unspoken_goal, why_it_matters,
+               active_contradictions, sophie_directives
+        FROM living_context
+        WHERE user_id = $1
+        """,
+        user_id,
+    )
+    threads = await db.fetch(
+        """
+        SELECT title, detail, category, priority,
+               thread_type, salience_score,
+               follow_up_after, related_entities
+        FROM open_threads
+        WHERE user_id = $1
+          AND status = 'open'
+        ORDER BY
+          CASE thread_type
+            WHEN 'persistent_goal' THEN 0
+            ELSE 1
+          END,
+          salience_score DESC
+        LIMIT 5
+        """,
+        user_id,
+    )
+    people = await db.fetch(
+        """
+        SELECT canonical_name, relationship_to_user,
+               profile_text, last_known_status,
+               key_facts, open_questions,
+               salience_score
+        FROM entity_profiles
+        WHERE user_id = $1
+          AND type = 'person'
+          AND status = 'active'
+          AND salience_score >= 0.4
+        ORDER BY salience_score DESC
+        LIMIT 6
+        """,
+        user_id,
+    )
+    projects = await db.fetch(
+        """
+        SELECT canonical_name, relationship_to_user,
+               profile_text, last_known_status,
+               salience_score, aliases
+        FROM entity_profiles
+        WHERE user_id = $1
+          AND type = 'project'
+          AND status = 'active'
+        ORDER BY salience_score DESC
+        """,
+        user_id,
+    )
+    identity = await db.fetchone(
+        """
+        SELECT current_chapter, core_values,
+               persistent_goals, recurring_fears,
+               what_they_want
+        FROM identity_profile
+        WHERE user_id = $1
+        """,
+        user_id,
+    )
+
+    living = living or {}
+    identity = identity or {}
+
+    living_focus = _normalize_text(living.get("primary_tension")) or _normalize_text(living.get("current_focus"))
+    episodic_recall = await _episodic_search(user_id=user_id, query=living_focus, limit=3) if living_focus else []
+
+    return {
+        "generated_at": datetime.now(dt_timezone.utc).isoformat(),
+        "living_context": {
+            "current_focus": _normalize_text(living.get("current_focus")) or None,
+            "primary_tension": _normalize_text(living.get("primary_tension")) or None,
+            "unspoken_goal": _normalize_text(living.get("unspoken_goal")) or None,
+            "emotional_texture": _normalize_text(living.get("emotional_texture")) or None,
+            "relationship_pulse": _normalize_text(living.get("relationship_pulse")) or None,
+        },
+        "sophie_directives": living.get("sophie_directives") if isinstance(living.get("sophie_directives"), list) else [],
+        "active_contradictions": living.get("active_contradictions") if isinstance(living.get("active_contradictions"), list) else [],
+        "open_threads": [
+            {
+                "title": _normalize_text(t.get("title")),
+                "detail": _normalize_text(t.get("detail")),
+                "category": _normalize_text(t.get("category")),
+                "priority": _normalize_text(t.get("priority")),
+                "thread_type": _normalize_text(t.get("thread_type")),
+                "follow_up_after": t.get("follow_up_after").isoformat() if isinstance(t.get("follow_up_after"), datetime) else _normalize_text(t.get("follow_up_after")),
+                "salience": float(t.get("salience_score") or 0.0),
+            }
+            for t in threads
+        ],
+        "people": [
+            {
+                "name": _normalize_text(p.get("canonical_name")),
+                "relationship": _normalize_text(p.get("relationship_to_user")),
+                "profile": _normalize_text(p.get("profile_text")),
+                "current_status": _normalize_text(p.get("last_known_status")),
+                "key_facts": p.get("key_facts") if isinstance(p.get("key_facts"), list) else [],
+                "open_questions": p.get("open_questions") if isinstance(p.get("open_questions"), list) else [],
+                "salience": float(p.get("salience_score") or 0.0),
+            }
+            for p in people
+        ],
+        "projects": _cluster_projects(projects),
+        "episodic_recall": episodic_recall,
+        "identity": {
+            "current_chapter": _normalize_text(identity.get("current_chapter")) or None,
+            "core_values": (identity.get("core_values") if isinstance(identity.get("core_values"), list) else [])[:3],
+            "persistent_goals": identity.get("persistent_goals") if isinstance(identity.get("persistent_goals"), list) else [],
+            "what_they_want": _normalize_text(identity.get("what_they_want")) or None,
+        },
+    }
 
 
 TENANT_ALIASES: Dict[str, str] = {
@@ -786,6 +1034,10 @@ _RELATIONSHIP_SIGNAL_TEXT_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _INVALID_RELATIONSHIP_ENTITIES = {"and", "or", "but", "the", "a", "an", "of", "in", "to"}
+_INVALID_RELATIONSHIP_NAMES = {
+    "was", "is", "are", "be", "been", "being", "the", "a", "an", "this", "that",
+    "he", "she", "they", "it", "someone", "person", "relationship",
+}
 
 
 def _build_relationship_signal_text(name: Any, who: Any, status: Any) -> Optional[str]:
@@ -795,6 +1047,14 @@ def _build_relationship_signal_text(name: Any, who: Any, status: Any) -> Optiona
     if not normalized_name or not normalized_who or not normalized_status:
         return None
     if normalized_name.lower() in _INVALID_RELATIONSHIP_ENTITIES:
+        return None
+    if normalized_name.lower() in _INVALID_RELATIONSHIP_NAMES:
+        return None
+    if normalized_name != canonicalize_entity_name(normalized_name) and canonicalize_entity_name(normalized_name).lower() in _INVALID_RELATIONSHIP_NAMES:
+        return None
+    if not re.search(r"[A-Za-z]", normalized_name):
+        return None
+    if normalized_name.islower() and normalized_name.lower() not in {"ashley", "jasmine", "sophie", "bluum", "yoshi", "mukesh"}:
         return None
     text = f"{normalized_name} ({normalized_who}): {normalized_status}"
     match = _RELATIONSHIP_SIGNAL_TEXT_RE.match(text)
@@ -1048,10 +1308,44 @@ _QUERY_STOPWORDS = {
     "remember",
 }
 
+_NARROW_ENTITY_IDENTITY_RE = re.compile(
+    r"^\s*(?:who|what)\s+(?:is|are|'s)\s+(.+?)\s*\??\s*$",
+    flags=re.IGNORECASE,
+)
+
 
 def _query_terms(query: str) -> List[str]:
     terms = re.findall(r"[A-Za-z0-9]+", _normalize_text(query).lower())
     return [term for term in terms if len(term) >= 3 and term not in _QUERY_STOPWORDS]
+
+
+def _extract_narrow_entity_identity_target(query: str) -> Optional[str]:
+    text = _normalize_text(query)
+    if not text:
+        return None
+    lower = text.lower()
+    if any(
+        token in lower
+        for token in (
+            "remember",
+            "lately",
+            "recently",
+            "other day",
+            "continue",
+            "thread",
+        )
+    ):
+        return None
+    match = _NARROW_ENTITY_IDENTITY_RE.match(text)
+    if not match:
+        return None
+    target = canonicalize_entity_name(match.group(1))
+    target = re.sub(r"\s+[?.!]+$", "", target).strip()
+    if not target:
+        return None
+    if len(_query_terms(target)) > 4:
+        return None
+    return target
 
 
 def _query_overlap_score(text: str, query_terms: List[str]) -> float:
@@ -1146,6 +1440,1508 @@ def _extract_session_summary_candidate_texts(node: Dict[str, Any]) -> List[str]:
             if _allow_claim(claim) and _allow_fact_text(claim) and not _is_explicit_user_state_claim(claim):
                 candidates.append(claim)
     return _dedupe_keep_order(candidates, limit=8)
+
+
+def _resolve_memory_intent(value: Optional[str]) -> str:
+    intent = _normalize_text(value).lower()
+    if intent in {"exact", "episodic", "hybrid"}:
+        return intent
+    return "exact"
+
+
+def _extract_session_id_from_episode_name(name: str) -> Optional[str]:
+    clean = _normalize_text(name)
+    if not clean:
+        return None
+    match = re.match(r"^session_raw_(.+?)(?:_\d{9,})?$", clean)
+    if match:
+        value = _normalize_text(match.group(1))
+        return value or None
+    return None
+
+
+def _normalize_episode_reference_time(value: Any) -> Optional[str]:
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = _normalize_text(value)
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=dt_timezone.utc)
+    return dt.astimezone(dt_timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _episode_text_overlap_score(text: str, query_terms: List[str]) -> float:
+    clean = _normalize_text(text).lower()
+    if not clean or not query_terms:
+        return 0.0
+    terms = []
+    seen = set()
+    for term in query_terms:
+        t = _normalize_text(term).lower()
+        if t and t not in seen:
+            terms.append(t)
+            seen.add(t)
+    if not terms:
+        return 0.0
+    hits = sum(1 for term in terms if term in clean)
+    if hits <= 0:
+        return 0.0
+    return min(1.0, hits / float(len(terms)))
+
+
+def _extract_episode_evidence_lines(
+    text: Optional[str],
+    query_terms: List[str],
+    *,
+    limit: int = 2,
+) -> List[str]:
+    raw = text if isinstance(text, str) else ""
+    lines = [_normalize_text(line) for line in raw.splitlines() if _normalize_text(line)]
+    if not lines:
+        return []
+
+    selected: List[str] = []
+    lowered_terms = [_normalize_text(term).lower() for term in query_terms if _normalize_text(term)]
+    for line in lines:
+        lower = line.lower()
+        if lowered_terms and not any(term in lower for term in lowered_terms):
+            continue
+        if line not in selected:
+            selected.append(_shorten_line(line, 180))
+        if len(selected) >= limit:
+            return selected
+
+    if selected:
+        return selected[:limit]
+
+    # Fallback: keep one user line and one assistant line for grounding.
+    for prefix in ("User:", "Assistant:"):
+        for line in lines:
+            if line.startswith(prefix):
+                selected.append(_shorten_line(line, 180))
+                break
+        if len(selected) >= limit:
+            break
+    return selected[:limit]
+
+
+def _extract_transcript_evidence_lines(
+    messages: List[Dict[str, Any]],
+    query_terms: List[str],
+    *,
+    limit: int = 2,
+) -> List[str]:
+    if not isinstance(messages, list) or not messages:
+        return []
+    lines: List[str] = []
+    for row in messages:
+        if not isinstance(row, dict):
+            continue
+        role = _normalize_text(row.get("role")).lower()
+        text = _normalize_text(row.get("text"))
+        if role not in {"user", "assistant"} or not text:
+            continue
+        lines.append(f"{'User' if role == 'user' else 'Assistant'}: {text}")
+    return _extract_episode_evidence_lines("\n".join(lines), query_terms, limit=limit)
+
+
+def _entity_profile_to_node_type(value: Any) -> str:
+    raw = _normalize_text(value).lower()
+    if raw in {"person", "project", "goal", "loop", "preference", "event"}:
+        return raw
+    if raw == "place":
+        return "other"
+    return "other"
+
+
+def _allowed_node_type(node_type: str, allowed_types: Optional[List[str]]) -> bool:
+    if not allowed_types:
+        return True
+    allowed = {_normalize_text(x).lower() for x in (allowed_types or []) if _normalize_text(x)}
+    if not allowed:
+        return True
+    return _normalize_text(node_type).lower() in allowed
+
+
+def _score_text_match(
+    *,
+    text: str,
+    query_terms: List[str],
+    reference_ts: Optional[datetime] = None,
+    now_utc: Optional[datetime] = None,
+    base_score: float = 0.0,
+) -> float:
+    overlap = _query_overlap_score(text, query_terms)
+    score = float(base_score) + min(0.8, overlap)
+    if isinstance(reference_ts, datetime):
+        now = now_utc or datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+        ts = reference_ts if reference_ts.tzinfo else reference_ts.replace(tzinfo=dt_timezone.utc)
+        age_days = max(0.0, (now - ts.astimezone(dt_timezone.utc)).total_seconds() / 86400.0)
+        recency = 1.0 / (1.0 + (age_days / 21.0))
+        score += 0.2 * recency
+    return max(0.0, min(1.5, score))
+
+
+def _format_session_transcript_content(messages: Any, *, max_lines: int = 24, max_chars: int = 2400) -> str:
+    if isinstance(messages, str):
+        try:
+            messages = json.loads(messages)
+        except Exception:
+            messages = []
+    if not isinstance(messages, list):
+        return ""
+    lines: List[str] = []
+    for row in messages:
+        if not isinstance(row, dict):
+            continue
+        role = _normalize_text(row.get("role")).lower()
+        if role not in {"user", "assistant"}:
+            continue
+        text = _normalize_text(row.get("text"))
+        if not text:
+            continue
+        prefix = "User" if role == "user" else "Assistant"
+        lines.append(f"{prefix}: {text}")
+        if len(lines) >= max_lines:
+            break
+    content = "\n".join(lines).strip()
+    return _shorten_line(content, max_chars) if content else ""
+
+
+def _retrieval_row_metadata(
+    *,
+    source_type: str,
+    derived: bool,
+    evidence_backed: bool,
+    data_classification: str,
+) -> Dict[str, Any]:
+    return {
+        "source_type": _normalize_text(source_type),
+        "derived": bool(derived),
+        "evidence_backed": bool(evidence_backed),
+        "data_classification": _normalize_text(data_classification),
+    }
+
+
+def _is_canonical_factual_row(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    return (
+        _normalize_text(row.get("source_type")).lower() == "canonical factual"
+        and bool(row.get("evidence_backed"))
+        and not bool(row.get("derived"))
+    )
+
+
+async def _pg_get_entity_role_grounding(
+    *,
+    tenant_id: str,
+    user_id: str,
+    name: Optional[str],
+    entity_id: Optional[str],
+) -> Dict[str, Any]:
+    # GRAPHITI_REPLACED: get_entity_role_grounding (entity relationship role lookup)
+    # TEMPORARY_DEGRADED_REPLACEMENT: entity role grounding is inferred from profile aggregates, not claim-store evidence.
+    return await _pg_get_entity_role_hint(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        name=name,
+        entity_id=entity_id,
+    )
+
+
+async def _pg_get_entity_role_hint(
+    *,
+    tenant_id: str,
+    user_id: str,
+    name: Optional[str],
+    entity_id: Optional[str],
+) -> Dict[str, Any]:
+    del tenant_id
+    normalized_name = canonicalize_entity_name(name)
+    normalized_id = _normalize_text(entity_id)
+    row = None
+    if normalized_id:
+        row = await db.fetchone(
+            """
+            SELECT canonical_name, type, relationship_to_user, confidence
+            FROM entity_profiles
+            WHERE user_id = $1
+              AND entity_id = $2
+            LIMIT 1
+            """,
+            user_id,
+            normalized_id,
+        )
+    if row is None and normalized_name:
+        row = await db.fetchone(
+            """
+            SELECT canonical_name, type, relationship_to_user, confidence
+            FROM entity_profiles
+            WHERE user_id = $1
+              AND lower(canonical_name) = lower($2)
+            ORDER BY mention_count DESC NULLS LAST
+            LIMIT 1
+            """,
+            user_id,
+            normalized_name,
+        )
+    if not isinstance(row, dict):
+        return {}
+    role = _normalize_text(row.get("relationship_to_user")) or None
+    entity_type = _normalize_text(row.get("type")).lower()
+    edge_name = "WORKING_ON" if entity_type == "project" else "RELATED_TO_USER_AS"
+    return {
+        "entity_name": _normalize_text(row.get("canonical_name")) or normalized_name,
+        "role": role,
+        "relationship": role,
+        "edge_name": edge_name,
+        "confidence": _normalize_confidence(row.get("confidence"), default=0.65),
+        "source": "entity_profiles",
+        **_retrieval_row_metadata(
+            source_type="derived continuity/projection",
+            derived=True,
+            evidence_backed=False,
+            data_classification="derived continuity/projection",
+        ),
+    }
+
+
+async def _pg_get_entity_facts_exact(
+    *,
+    tenant_id: str,
+    user_id: str,
+    name: Optional[str],
+    entity_id: Optional[str],
+    limit: int,
+    include_derived: bool = False,
+) -> List[Dict[str, Any]]:
+    # GRAPHITI_REPLACED: get_entity_facts_exact (exact facts tied to one entity)
+    # T1 containment: fail-closed for factual retrieval until v2 claim-store facts exist.
+    # Continuity rows remain available only for explicit derived/debug flows.
+    if not include_derived:
+        return []
+    return await _pg_get_entity_continuity_facts(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        name=name,
+        entity_id=entity_id,
+        limit=limit,
+    )
+
+
+async def _pg_get_entity_continuity_facts(
+    *,
+    tenant_id: str,
+    user_id: str,
+    name: Optional[str],
+    entity_id: Optional[str],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    del tenant_id
+    safe_limit = max(1, min(int(limit or 8), 40))
+    normalized_name = canonicalize_entity_name(name)
+    normalized_id = _normalize_text(entity_id)
+    entity_row = None
+    if normalized_id:
+        entity_row = await db.fetchone(
+            """
+            SELECT entity_id, canonical_name, type, relationship_to_user, key_facts,
+                   last_known_status, confidence, last_seen_at
+            FROM entity_profiles
+            WHERE user_id = $1
+              AND entity_id = $2
+            LIMIT 1
+            """,
+            user_id,
+            normalized_id,
+        )
+    if entity_row is None and normalized_name:
+        entity_row = await db.fetchone(
+            """
+            SELECT entity_id, canonical_name, type, relationship_to_user, key_facts,
+                   last_known_status, confidence, last_seen_at
+            FROM entity_profiles
+            WHERE user_id = $1
+              AND lower(canonical_name) = lower($2)
+            ORDER BY mention_count DESC NULLS LAST
+            LIMIT 1
+            """,
+            user_id,
+            normalized_name,
+        )
+    if not isinstance(entity_row, dict):
+        return []
+    canonical_name = canonicalize_entity_name(entity_row.get("canonical_name")) or normalized_name
+    out: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _append_fact(
+        text: str,
+        relevance: float,
+        source: str,
+        valid_at: Any = None,
+        *,
+        source_type: str = "derived continuity/projection",
+        derived: bool = True,
+        evidence_backed: bool = False,
+        data_classification: str = "derived continuity/projection",
+    ) -> None:
+        claim = _normalize_text(text)
+        if not claim:
+            return
+        key = claim.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(
+            {
+                "text": claim,
+                "relevance": max(0.0, min(1.0, float(relevance))),
+                "source": source,
+                "valid_at": valid_at,
+                "invalid_at": None,
+                **_retrieval_row_metadata(
+                    source_type=source_type,
+                    derived=derived,
+                    evidence_backed=evidence_backed,
+                    data_classification=data_classification,
+                ),
+            }
+        )
+
+    relationship = _normalize_text(entity_row.get("relationship_to_user"))
+    if relationship:
+        _append_fact(
+            f"{canonical_name} is the user's {relationship}.",
+            _normalize_confidence(entity_row.get("confidence"), default=0.85),
+            "postgres_entity_profile",
+            entity_row.get("last_seen_at"),
+        )
+    status = _normalize_text(entity_row.get("last_known_status"))
+    if status:
+        _append_fact(
+            f"{canonical_name}: {status}",
+            _normalize_confidence(entity_row.get("confidence"), default=0.7),
+            "postgres_entity_profile",
+            entity_row.get("last_seen_at"),
+        )
+
+    key_facts = entity_row.get("key_facts")
+    if isinstance(key_facts, list):
+        for fact in key_facts:
+            if isinstance(fact, dict):
+                text = _normalize_text(fact.get("fact") or fact.get("text"))
+                conf = _normalize_confidence(fact.get("confidence"), default=0.72)
+                ts = fact.get("last_confirmed") or fact.get("last_seen_at")
+            else:
+                text = _normalize_text(fact)
+                conf = 0.68
+                ts = entity_row.get("last_seen_at")
+            if text:
+                _append_fact(text, conf, "postgres_entity_profile_fact", ts)
+            if len(out) >= safe_limit:
+                return out[:safe_limit]
+
+    thread_rows = await db.fetch(
+        """
+        SELECT title, detail, category, priority, status, last_mentioned_at
+        FROM open_threads
+        WHERE user_id = $1
+          AND $2 = ANY(COALESCE(related_entities, ARRAY[]::text[]))
+        ORDER BY last_mentioned_at DESC NULLS LAST, created_at DESC
+        LIMIT 12
+        """,
+        user_id,
+        canonical_name,
+    )
+    for row in thread_rows or []:
+        title = _normalize_text(row.get("title"))
+        detail = _normalize_text(row.get("detail"))
+        category = _normalize_text(row.get("category")).lower()
+        status = _normalize_text(row.get("status")).lower()
+        label = f"[{category}] " if category else ""
+        text = f"{label}{title}" if title else detail
+        if detail and detail.lower() not in text.lower():
+            text = f"{text}. {detail}"
+        if status:
+            text = f"{text} (thread: {status})"
+        _append_fact(text, 0.62, "postgres_open_threads", row.get("last_mentioned_at"))
+        if len(out) >= safe_limit:
+            return out[:safe_limit]
+
+    session_rows = await db.fetch(
+        """
+        SELECT session_date, raw_triage_output->'memory_deltas' AS deltas
+        FROM session_classifications
+        WHERE user_id = $1
+          AND EXISTS (
+            SELECT 1
+            FROM unnest(COALESCE(entity_mentions, ARRAY[]::text[])) AS m
+            WHERE lower(m) = lower($2)
+          )
+        ORDER BY session_date DESC
+        LIMIT 16
+        """,
+        user_id,
+        canonical_name,
+    )
+    for row in session_rows or []:
+        deltas = row.get("deltas")
+        if not isinstance(deltas, list):
+            continue
+        for delta in deltas:
+            text = _normalize_text(delta)
+            if not text:
+                continue
+            if canonical_name.lower() not in text.lower():
+                continue
+            _append_fact(
+                text,
+                0.58,
+                "postgres_session_classifications",
+                row.get("session_date"),
+                data_classification="mixed/unsafe",
+            )
+            if len(out) >= safe_limit:
+                return out[:safe_limit]
+    return out[:safe_limit]
+
+
+async def _pg_search_nodes(
+    *,
+    tenant_id: str,
+    user_id: str,
+    query: str,
+    limit: int,
+    reference_time: Optional[datetime] = None,
+    allowed_types: Optional[List[str]] = None,
+    search_filter: Any = None,
+) -> List[Dict[str, Any]]:
+    # GRAPHITI_REPLACED: search_nodes (semantic node retrieval)
+    # TEMPORARY_DEGRADED_REPLACEMENT: node retrieval is synthesized from continuity tables, not canonical claim-store graph nodes.
+    del tenant_id, search_filter  # Postgres tables used here are user-scoped.
+    safe_limit = max(1, min(int(limit or 10), 50))
+    query_terms = _query_terms(query)
+    now_utc = (
+        reference_time.astimezone(dt_timezone.utc)
+        if isinstance(reference_time, datetime) and reference_time.tzinfo
+        else datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+    )
+    candidates: List[Dict[str, Any]] = []
+
+    entity_rows = await db.fetch(
+        """
+        SELECT entity_id, canonical_name, type, relationship_to_user, profile_text,
+               last_known_status, confidence, mention_count, first_seen_at, last_seen_at,
+               created_at, last_updated_at, aliases, status
+        FROM entity_profiles
+        WHERE user_id = $1
+          AND status IN ('active', 'tentative')
+        ORDER BY mention_count DESC NULLS LAST, last_seen_at DESC NULLS LAST, created_at DESC
+        LIMIT 200
+        """,
+        user_id,
+    )
+    for row in entity_rows or []:
+        node_type = _entity_profile_to_node_type(row.get("type"))
+        if not _allowed_node_type(node_type, allowed_types):
+            continue
+        name = canonicalize_entity_name(row.get("canonical_name"))
+        if not name:
+            continue
+        profile_text = _normalize_text(row.get("profile_text"))
+        status_text = _normalize_text(row.get("last_known_status"))
+        summary = profile_text or status_text or name
+        search_blob = " ".join([name, profile_text, status_text])
+        score = _score_text_match(
+            text=search_blob,
+            query_terms=query_terms,
+            reference_ts=row.get("last_seen_at") or row.get("last_updated_at") or row.get("created_at"),
+            now_utc=now_utc,
+            base_score=min(0.25, float((row.get("mention_count") or 0)) * 0.02),
+        )
+        if query_terms and score < 0.08:
+            continue
+        attrs = {
+            "relationship_to_user": _normalize_text(row.get("relationship_to_user")) or None,
+            "last_known_status": status_text or None,
+            "mention_count": int(row.get("mention_count") or 0),
+            "confidence": _normalize_confidence(row.get("confidence"), default=0.6),
+            "aliases": row.get("aliases") if isinstance(row.get("aliases"), list) else [],
+            "source": "entity_profiles",
+            **_retrieval_row_metadata(
+                source_type="derived continuity/projection",
+                derived=True,
+                evidence_backed=False,
+                data_classification="derived continuity/projection",
+            ),
+        }
+        candidates.append(
+            {
+                "uuid": _normalize_text(row.get("entity_id")) or None,
+                "name": name,
+                "summary": summary,
+                "canonical_name": name,
+                "type": node_type,
+                "group_id": f"pg:{user_id}",
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("last_updated_at") or row.get("last_seen_at"),
+                "attributes": attrs,
+                "labels": ["Entity", node_type.title()],
+                "discipline_score": round(score, 4),
+                "_score": score,
+                **_retrieval_row_metadata(
+                    source_type="derived continuity/projection",
+                    derived=True,
+                    evidence_backed=False,
+                    data_classification="derived continuity/projection",
+                ),
+            }
+        )
+
+    thread_rows = await db.fetch(
+        """
+        SELECT thread_id, title, detail, category, priority, status, thread_type,
+               salience_score, importance_score, times_mentioned, follow_up_after,
+               last_mentioned_at, created_at, last_updated_at, related_entities
+        FROM open_threads
+        WHERE user_id = $1
+          AND status IN ('open', 'snoozed')
+        ORDER BY salience_score DESC NULLS LAST, last_mentioned_at DESC NULLS LAST
+        LIMIT 200
+        """,
+        user_id,
+    )
+    for row in thread_rows or []:
+        thread_type = _normalize_text(row.get("thread_type")).lower()
+        node_type = "goal" if thread_type == "persistent_goal" else "loop"
+        if not _allowed_node_type(node_type, allowed_types):
+            continue
+        title = _normalize_text(row.get("title"))
+        detail = _normalize_text(row.get("detail"))
+        summary = title or detail
+        if not summary:
+            continue
+        search_blob = " ".join([summary, detail, _normalize_text(row.get("category")), _normalize_text(row.get("priority"))])
+        score = _score_text_match(
+            text=search_blob,
+            query_terms=query_terms,
+            reference_ts=row.get("last_mentioned_at") or row.get("last_updated_at") or row.get("created_at"),
+            now_utc=now_utc,
+            base_score=min(0.3, float(row.get("salience_score") or 0.0) * 0.25),
+        )
+        if query_terms and score < 0.08:
+            continue
+        attrs = {
+            "status": _normalize_text(row.get("status")) or None,
+            "category": _normalize_text(row.get("category")) or None,
+            "priority": _normalize_text(row.get("priority")) or None,
+            "thread_type": thread_type or None,
+            "times_mentioned": int(row.get("times_mentioned") or 1),
+            "follow_up_after": row.get("follow_up_after").isoformat() if isinstance(row.get("follow_up_after"), datetime) else _normalize_text(row.get("follow_up_after")) or None,
+            "related_entities": row.get("related_entities") if isinstance(row.get("related_entities"), list) else [],
+            "source": "open_threads",
+            "salience": float(row.get("salience_score") or 0.0),
+            "importance": float(row.get("importance_score") or 0.0),
+            **_retrieval_row_metadata(
+                source_type="derived continuity/projection",
+                derived=True,
+                evidence_backed=False,
+                data_classification="derived continuity/projection",
+            ),
+        }
+        candidates.append(
+            {
+                "uuid": _normalize_text(row.get("thread_id")) or None,
+                "name": summary[:120],
+                "summary": summary,
+                "canonical_name": summary[:120],
+                "type": node_type,
+                "group_id": f"pg:{user_id}",
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("last_updated_at") or row.get("last_mentioned_at"),
+                "attributes": attrs,
+                "labels": ["Entity", node_type.title()],
+                "discipline_score": round(score, 4),
+                "_score": score,
+                **_retrieval_row_metadata(
+                    source_type="derived continuity/projection",
+                    derived=True,
+                    evidence_backed=False,
+                    data_classification="derived continuity/projection",
+                ),
+            }
+        )
+
+    session_rows = await db.fetch(
+        """
+        SELECT session_id, session_date, one_line_summary, session_kind, emotional_weight,
+               tension_signal, raw_triage_output->'memory_deltas' AS deltas,
+               raw_triage_output->'thread_signals' AS thread_signals,
+               entity_mentions, processed_at
+        FROM session_classifications
+        WHERE user_id = $1
+          AND is_memory_worthy = true
+        ORDER BY session_date DESC NULLS LAST
+        LIMIT 220
+        """,
+        user_id,
+    )
+    for row in session_rows or []:
+        node_type = "event"
+        if not _allowed_node_type(node_type, allowed_types):
+            continue
+        deltas = row.get("deltas")
+        if not isinstance(deltas, list):
+            deltas = []
+        summary = _normalize_text(row.get("one_line_summary")) or _normalize_text(deltas[0] if deltas else None) or _normalize_text(row.get("tension_signal"))
+        if not summary:
+            continue
+        search_blob = " ".join(
+            [
+                summary,
+                " ".join([_normalize_text(x) for x in deltas[:4] if _normalize_text(x)]),
+                _normalize_text(row.get("session_kind")),
+                _normalize_text(row.get("emotional_weight")),
+                _normalize_text(row.get("tension_signal")),
+            ]
+        )
+        score = _score_text_match(
+            text=search_blob,
+            query_terms=query_terms,
+            reference_ts=row.get("session_date") or row.get("processed_at"),
+            now_utc=now_utc,
+            base_score=0.15,
+        )
+        if query_terms and score < 0.07:
+            continue
+        attrs = {
+            "session_id": _normalize_text(row.get("session_id")) or None,
+            "session_kind": _normalize_text(row.get("session_kind")) or None,
+            "emotional_weight": _normalize_text(row.get("emotional_weight")) or None,
+            "memory_deltas": deltas,
+            "thread_signals": row.get("thread_signals") if isinstance(row.get("thread_signals"), list) else [],
+            "entity_mentions": row.get("entity_mentions") if isinstance(row.get("entity_mentions"), list) else [],
+            "tension_signal": _normalize_text(row.get("tension_signal")) or None,
+            "source": "session_classifications",
+            **_retrieval_row_metadata(
+                source_type="derived continuity/projection",
+                derived=True,
+                evidence_backed=False,
+                data_classification="mixed/unsafe",
+            ),
+        }
+        session_id = _normalize_text(row.get("session_id"))
+        candidates.append(
+            {
+                "uuid": f"session_classification:{session_id}" if session_id else None,
+                "name": summary[:120],
+                "summary": summary,
+                "canonical_name": summary[:120],
+                "type": node_type,
+                "group_id": f"pg:{user_id}",
+                "created_at": row.get("session_date"),
+                "updated_at": row.get("processed_at") or row.get("session_date"),
+                "attributes": attrs,
+                "labels": ["Entity", node_type.title()],
+                "discipline_score": round(score, 4),
+                "_score": score,
+                **_retrieval_row_metadata(
+                    source_type="derived continuity/projection",
+                    derived=True,
+                    evidence_backed=False,
+                    data_classification="mixed/unsafe",
+                ),
+            }
+        )
+
+    candidates.sort(
+        key=lambda row: (
+            float(row.get("_score") or 0.0),
+            _normalize_text(row.get("updated_at")),
+            _normalize_text(row.get("created_at")),
+        ),
+        reverse=True,
+    )
+    trimmed = candidates[:safe_limit]
+    for row in trimmed:
+        row.pop("_score", None)
+    return trimmed
+
+
+async def _pg_search_facts(
+    *,
+    tenant_id: str,
+    user_id: str,
+    query: str,
+    limit: int,
+    reference_time: Optional[datetime] = None,
+    include_derived: bool = False,
+) -> List[Dict[str, Any]]:
+    # GRAPHITI_REPLACED: search_facts (semantic fact retrieval)
+    # T1 containment: fail-closed for factual retrieval until v2 claim-store facts exist.
+    # Continuity rows remain available only for explicit derived/debug flows.
+    if not include_derived:
+        return []
+    return await _pg_search_continuity_facts(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        query=query,
+        limit=limit,
+        reference_time=reference_time,
+    )
+
+
+async def _pg_search_continuity_facts(
+    *,
+    tenant_id: str,
+    user_id: str,
+    query: str,
+    limit: int,
+    reference_time: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    del tenant_id  # Postgres fact tables used here are user-scoped.
+    safe_limit = max(1, min(int(limit or 10), 50))
+    query_terms = _query_terms(query)
+    now_utc = (
+        reference_time.astimezone(dt_timezone.utc)
+        if isinstance(reference_time, datetime) and reference_time.tzinfo
+        else datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+    )
+    out: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _append_fact(
+        text: str,
+        source: str,
+        valid_at: Any,
+        base_score: float = 0.2,
+        *,
+        source_type: str = "derived continuity/projection",
+        derived: bool = True,
+        evidence_backed: bool = False,
+        data_classification: str = "derived continuity/projection",
+    ) -> None:
+        claim = _normalize_text(text)
+        if not claim:
+            return
+        if not _allow_claim(claim) or not _allow_fact_text(claim):
+            return
+        key = claim.lower()
+        if key in seen:
+            return
+        score = _score_text_match(
+            text=claim,
+            query_terms=query_terms,
+            reference_ts=valid_at if isinstance(valid_at, datetime) else None,
+            now_utc=now_utc,
+            base_score=base_score,
+        )
+        if query_terms and score < 0.08:
+            return
+        seen.add(key)
+        out.append(
+            {
+                "text": claim,
+                "relevance": max(0.0, min(1.0, score)),
+                "source": source,
+                "valid_at": valid_at,
+                "invalid_at": None,
+                **_retrieval_row_metadata(
+                    source_type=source_type,
+                    derived=derived,
+                    evidence_backed=evidence_backed,
+                    data_classification=data_classification,
+                ),
+            }
+        )
+
+    entity_rows = await db.fetch(
+        """
+        SELECT canonical_name, type, relationship_to_user, key_facts, profile_text,
+               last_known_status, confidence, last_seen_at, mention_count
+        FROM entity_profiles
+        WHERE user_id = $1
+          AND status IN ('active', 'tentative')
+        ORDER BY mention_count DESC NULLS LAST, last_seen_at DESC NULLS LAST
+        LIMIT 200
+        """,
+        user_id,
+    )
+    for row in entity_rows or []:
+        name = canonicalize_entity_name(row.get("canonical_name"))
+        if not name:
+            continue
+        relationship = _normalize_text(row.get("relationship_to_user"))
+        if relationship:
+            _append_fact(
+                f"{name} is the user's {relationship}.",
+                "postgres_entity_profile",
+                row.get("last_seen_at"),
+                base_score=0.35,
+            )
+        status = _normalize_text(row.get("last_known_status"))
+        if status:
+            _append_fact(
+                f"{name}: {status}",
+                "postgres_entity_profile",
+                row.get("last_seen_at"),
+                base_score=0.3,
+            )
+        key_facts = row.get("key_facts")
+        if isinstance(key_facts, list):
+            for fact in key_facts[:8]:
+                if isinstance(fact, dict):
+                    text = _normalize_text(fact.get("fact") or fact.get("text"))
+                    conf = _normalize_confidence(fact.get("confidence"), default=0.65)
+                    valid_at = fact.get("last_confirmed") or row.get("last_seen_at")
+                else:
+                    text = _normalize_text(fact)
+                    conf = 0.6
+                    valid_at = row.get("last_seen_at")
+                if text:
+                    _append_fact(text, "postgres_entity_profile_fact", valid_at, base_score=conf * 0.5)
+
+    thread_rows = await db.fetch(
+        """
+        SELECT title, detail, category, priority, status, last_mentioned_at, follow_up_after, thread_type
+        FROM open_threads
+        WHERE user_id = $1
+          AND status IN ('open', 'snoozed')
+        ORDER BY salience_score DESC NULLS LAST, last_mentioned_at DESC NULLS LAST
+        LIMIT 180
+        """,
+        user_id,
+    )
+    for row in thread_rows or []:
+        title = _normalize_text(row.get("title"))
+        detail = _normalize_text(row.get("detail"))
+        category = _normalize_text(row.get("category")).lower()
+        priority = _normalize_text(row.get("priority")).lower()
+        status = _normalize_text(row.get("status")).lower()
+        thread_type = _normalize_text(row.get("thread_type")).lower()
+        label = f"[{category}] " if category else ""
+        text = f"{label}{title}" if title else detail
+        if detail and detail.lower() not in text.lower():
+            text = f"{text}. {detail}"
+        if status:
+            text = f"{text} (thread: {status})"
+        if thread_type == "persistent_goal":
+            text = f"Persistent goal: {text}"
+        base = 0.28
+        if priority == "high":
+            base += 0.12
+        elif priority == "medium":
+            base += 0.06
+        _append_fact(text, "postgres_open_threads", row.get("last_mentioned_at") or row.get("follow_up_after"), base_score=base)
+
+    session_rows = await db.fetch(
+        """
+        SELECT session_date, one_line_summary, emotional_weight, emotional_note, session_kind,
+               tension_signal, raw_triage_output->'memory_deltas' AS deltas
+        FROM session_classifications
+        WHERE user_id = $1
+          AND is_memory_worthy = true
+          AND ($2::timestamptz IS NULL OR session_date <= $2::timestamptz)
+        ORDER BY session_date DESC
+        LIMIT 220
+        """,
+        user_id,
+        reference_time,
+    )
+    for row in session_rows or []:
+        deltas = row.get("deltas")
+        if isinstance(deltas, list):
+            for delta in deltas[:6]:
+                text = _normalize_text(delta)
+                if text:
+                    _append_fact(
+                        text,
+                        "postgres_session_classifications",
+                        row.get("session_date"),
+                        base_score=0.26,
+                        data_classification="mixed/unsafe",
+                    )
+        one_line = _normalize_text(row.get("one_line_summary"))
+        if one_line:
+            _append_fact(
+                one_line,
+                "postgres_session_classifications",
+                row.get("session_date"),
+                base_score=0.2,
+                data_classification="mixed/unsafe",
+            )
+        tension = _normalize_text(row.get("tension_signal"))
+        if tension:
+            _append_fact(
+                tension,
+                "postgres_session_classifications",
+                row.get("session_date"),
+                base_score=0.22,
+                data_classification="mixed/unsafe",
+            )
+        emotional_note = _normalize_text(row.get("emotional_note"))
+        if emotional_note and _normalize_text(row.get("emotional_weight")).lower() in {"medium", "high"}:
+            _append_fact(
+                emotional_note,
+                "postgres_session_classifications",
+                row.get("session_date"),
+                base_score=0.18,
+                data_classification="mixed/unsafe",
+            )
+
+    out.sort(
+        key=lambda row: (
+            float(row.get("relevance") or 0.0),
+            _normalize_text(row.get("valid_at")),
+        ),
+        reverse=True,
+    )
+    return out[:safe_limit]
+
+
+async def _pg_get_recent_episodes(
+    *,
+    tenant_id: str,
+    user_id: str,
+    since: Optional[datetime],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    # GRAPHITI_REPLACED: get_recent_episodes (episodic retrieval list for ranking)
+    # TEMPORARY_DEGRADED_REPLACEMENT: summary fields may be triage-derived; transcript body is evidence-backed.
+    safe_limit = max(1, min(int(limit or 20), 200))
+    rows = await db.fetch(
+        """
+        SELECT
+          st.session_id,
+          st.updated_at,
+          st.messages,
+          sc.session_date,
+          sc.one_line_summary,
+          sc.raw_triage_output->'memory_deltas' AS deltas
+        FROM session_transcript st
+        LEFT JOIN session_classifications sc
+          ON sc.session_id = st.session_id
+         AND sc.user_id = st.user_id
+        WHERE st.tenant_id = $1
+          AND st.user_id = $2
+          AND ($3::timestamptz IS NULL OR COALESCE(sc.session_date, st.updated_at) >= $3::timestamptz)
+        ORDER BY COALESCE(sc.session_date, st.updated_at) DESC, st.updated_at DESC
+        LIMIT $4
+        """,
+        tenant_id,
+        user_id,
+        since,
+        safe_limit,
+    )
+    episodes: List[Dict[str, Any]] = []
+    for row in rows or []:
+        session_id = _normalize_text(row.get("session_id"))
+        deltas = row.get("deltas")
+        if not isinstance(deltas, list):
+            deltas = []
+        summary = _normalize_text(row.get("one_line_summary")) or _normalize_text(deltas[0] if deltas else None)
+        content = _format_session_transcript_content(row.get("messages"))
+        if not summary:
+            if deltas:
+                summary = _shorten_line(" ".join([_normalize_text(x) for x in deltas[:2] if _normalize_text(x)]), 220)
+            if not summary:
+                summary = _shorten_line(content, 220)
+        ref = row.get("session_date") or row.get("updated_at")
+        ref_iso = ref.isoformat() if isinstance(ref, datetime) else _normalize_text(ref) or None
+        episodes.append(
+            {
+                "name": f"session_raw_{session_id}" if session_id else "session_raw_unknown",
+                "summary": summary,
+                "reference_time": ref_iso,
+                "episode_body": content,
+                "uuid": f"pg_episode:{session_id}" if session_id else None,
+                "source": "session_transcript+session_classifications",
+                **_retrieval_row_metadata(
+                    source_type="episodic",
+                    derived=(not bool(content)),
+                    evidence_backed=bool(content),
+                    data_classification=("episodic" if bool(content) else "mixed/unsafe"),
+                ),
+            }
+        )
+    return episodes
+
+
+async def _build_episodic_recall_items(
+    *,
+    tenant_scope: List[str],
+    canonical_tenant: str,
+    user_id: str,
+    query: str,
+    query_terms: List[str],
+    reference_time: Optional[datetime],
+    entity_hints: List[str],
+    limit: int,
+) -> Tuple[List[EpisodeRecallItem], Dict[str, Any]]:
+    if not tenant_scope:
+        return [], {"weakRecall": True, "reason": "empty_tenant_scope"}
+    settings = get_settings()
+    safe_limit = max(1, min(int(limit or 10), 20))
+    candidate_limit = max(24, min(safe_limit * 8, 120))
+    since = None
+    if isinstance(reference_time, datetime):
+        since = reference_time - timedelta(days=180)
+
+    embedding_hits: Dict[str, Dict[str, Any]] = {}
+    embedding_model_used = _normalize_text(settings.episodic_embedding_model) or "text-embedding-3-small"
+    embedding_rows_count = 0
+    if bool(settings.episodic_embedding_enabled):
+        try:
+            embedding_rows = await search_episode_embedding_candidates(
+                db=db,
+                tenant_scope=tenant_scope,
+                user_id=user_id,
+                query=query,
+                model=embedding_model_used,
+                limit=max(candidate_limit, 40),
+                reference_time=reference_time,
+            )
+            embedding_rows_count = len(embedding_rows or [])
+            for row in embedding_rows:
+                session_id = _normalize_text(row.get("session_id"))
+                episode_uuid = _normalize_text(row.get("episode_uuid"))
+                similarity = float(row.get("embedding_similarity") or 0.0)
+                if similarity <= 0:
+                    continue
+                for key in (
+                    f"session:{session_id}" if session_id else "",
+                    f"episode:{episode_uuid}" if episode_uuid else "",
+                ):
+                    if not key:
+                        continue
+                    existing = embedding_hits.get(key)
+                    if existing is None or similarity > float(existing.get("embedding_similarity") or 0.0):
+                        embedding_hits[key] = {
+                            "embedding_similarity": similarity,
+                            "unit_text": _normalize_text(row.get("unit_text")),
+                            "source_tenant": _normalize_text(row.get("tenant_id")),
+                            "embedding_model": _normalize_text(row.get("embedding_model")) or embedding_model_used,
+                            "user_char_ratio": float(((row.get("metadata") or {}).get("user_char_ratio") or 0.0)),
+                            "user_turn_count": int(((row.get("metadata") or {}).get("user_turn_count") or 0)),
+                        }
+        except Exception as e:
+            logger.warning("episodic recall embedding candidate lookup failed tenant_scope=%s user=%s err=%s", tenant_scope, user_id, e)
+
+    # GRAPHITI_REPLACED: get_recent_episodes (episodic candidates for recall ranking)
+    # TEMPORARY_DEGRADED_REPLACEMENT: episodic summaries include derived triage context; evidence lines are transcript-backed.
+    episode_tasks = [
+        _pg_get_recent_episodes(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            since=since,
+            limit=candidate_limit,
+        )
+        for tenant_id in tenant_scope
+    ]
+    episode_results = await asyncio.gather(*episode_tasks, return_exceptions=True)
+
+    query_text = _normalize_text(query).lower()
+    continuation_query = any(
+        phrase in query_text
+        for phrase in (
+            "remember",
+            "other day",
+            "that conversation",
+            "we were exploring",
+            "continue that idea",
+            "continue that",
+        )
+    )
+    relationship_query = any(
+        token in query_text
+        for token in (
+            "ashley",
+            "jasmine",
+            "yoshi",
+            "girlfriend",
+            "daughter",
+            "wife",
+            "husband",
+            "mother",
+            "father",
+            "mom",
+            "dad",
+            "sister",
+            "brother",
+            "friend",
+            "relationship",
+            "lately",
+        )
+    )
+    reflective_query = any(
+        token in query_text
+        for token in (
+            "spiritual",
+            "spirituality",
+            "god",
+            "faith",
+            "meaning",
+            "purpose",
+            "life",
+            "moat",
+            "soul",
+            "inner",
+            "reflect",
+        )
+    )
+    query_profile = "default"
+    if relationship_query:
+        query_profile = "relationship"
+    elif reflective_query:
+        query_profile = "reflective"
+    elif continuation_query:
+        query_profile = "continuation"
+
+    profile_weights: Dict[str, Dict[str, float]] = {
+        "relationship": {
+            "embeddingSimilarity": 0.44,
+            "lexicalOverlap": 0.22,
+            "recency": 0.18,
+            "linkedEntityOverlap": 0.16,
+            "userTurnDensity": 0.02,
+            "continuationIntentBonus": 0.03,
+        },
+        "reflective": {
+            "embeddingSimilarity": 0.58,
+            "lexicalOverlap": 0.12,
+            "recency": 0.10,
+            "linkedEntityOverlap": 0.12,
+            "userTurnDensity": 0.08,
+            "continuationIntentBonus": 0.06,
+        },
+        "continuation": {
+            "embeddingSimilarity": 0.54,
+            "lexicalOverlap": 0.15,
+            "recency": 0.11,
+            "linkedEntityOverlap": 0.14,
+            "userTurnDensity": 0.06,
+            "continuationIntentBonus": 0.08,
+        },
+        "default": {
+            "embeddingSimilarity": 0.50,
+            "lexicalOverlap": 0.20,
+            "recency": 0.12,
+            "linkedEntityOverlap": 0.18,
+            "userTurnDensity": 0.04,
+            "continuationIntentBonus": 0.05,
+        },
+    }
+    profile_thresholds: Dict[str, Dict[str, float]] = {
+        "relationship": {
+            "minScore": 0.30,
+            "minEmbedding": 0.24,
+            "minLexical": 0.12,
+            "minAnchor": 0.12,
+            "minUserDensity": 0.35,
+            "weakTopScore": 0.37,
+            "weakEmbedding": 0.27,
+            "weakLexical": 0.14,
+            "weakAnchor": 0.14,
+            "weakUserDensity": 0.35,
+        },
+        "reflective": {
+            "minScore": 0.26,
+            "minEmbedding": 0.22,
+            "minLexical": 0.06,
+            "minAnchor": 0.06,
+            "minUserDensity": 0.50,
+            "weakTopScore": 0.33,
+            "weakEmbedding": 0.24,
+            "weakLexical": 0.08,
+            "weakAnchor": 0.08,
+            "weakUserDensity": 0.45,
+        },
+        "continuation": {
+            "minScore": 0.27,
+            "minEmbedding": 0.22,
+            "minLexical": 0.07,
+            "minAnchor": 0.07,
+            "minUserDensity": 0.45,
+            "weakTopScore": 0.35,
+            "weakEmbedding": 0.25,
+            "weakLexical": 0.08,
+            "weakAnchor": 0.08,
+            "weakUserDensity": 0.45,
+        },
+        "default": {
+            "minScore": 0.28,
+            "minEmbedding": 0.24,
+            "minLexical": 0.12,
+            "minAnchor": 0.10,
+            "minUserDensity": 0.40,
+            "weakTopScore": 0.37,
+            "weakEmbedding": 0.27,
+            "weakLexical": 0.12,
+            "weakAnchor": 0.12,
+            "weakUserDensity": 0.40,
+        },
+    }
+    active_weights = profile_weights.get(query_profile, profile_weights["default"])
+    active_thresholds = profile_thresholds.get(query_profile, profile_thresholds["default"])
+    embedding_weight = float(active_weights.get("embeddingSimilarity") or 0.0)
+    lexical_weight = float(active_weights.get("lexicalOverlap") or 0.0)
+    recency_weight = float(active_weights.get("recency") or 0.0)
+    anchor_weight = float(active_weights.get("linkedEntityOverlap") or 0.0)
+    user_density_weight = float(active_weights.get("userTurnDensity") or 0.0)
+    continuation_bonus = float(active_weights.get("continuationIntentBonus") or 0.0)
+    anchor_terms = [_normalize_text(x).lower() for x in (entity_hints or []) if _normalize_text(x)]
+
+    now_utc = (
+        reference_time.astimezone(dt_timezone.utc)
+        if isinstance(reference_time, datetime) and reference_time.tzinfo is not None
+        else (
+            reference_time.replace(tzinfo=dt_timezone.utc)
+            if isinstance(reference_time, datetime)
+            else datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+        )
+    )
+
+    ranked_rows: List[Dict[str, Any]] = []
+    seen_keys = set()
+    candidates_seen = 0
+
+    for tenant_id, episodes in zip(tenant_scope, episode_results):
+        if isinstance(episodes, Exception):
+            logger.warning("episodic recall: get_recent_episodes failed tenant=%s user=%s err=%s", tenant_id, user_id, episodes)
+            continue
+        for raw in episodes or []:
+            if isinstance(raw, dict):
+                name = _normalize_text(raw.get("name") or raw.get("episode_name"))
+                summary = _normalize_text(raw.get("summary") or raw.get("episode_summary"))
+                content = _normalize_text(raw.get("episode_body") or raw.get("content") or raw.get("text"))
+                uuid = _normalize_text(raw.get("uuid"))
+                reference_value = raw.get("reference_time") or raw.get("created_at")
+            else:
+                name = _normalize_text(getattr(raw, "name", None))
+                summary = _normalize_text(getattr(raw, "summary", None) or getattr(raw, "episode_summary", None))
+                content = _normalize_text(getattr(raw, "episode_body", None) or getattr(raw, "content", None) or getattr(raw, "text", None))
+                uuid = _normalize_text(getattr(raw, "uuid", None))
+                reference_value = getattr(raw, "reference_time", None) or getattr(raw, "created_at", None)
+
+            if name.startswith("session_summary_"):
+                continue
+            if not (summary or content):
+                continue
+            candidates_seen += 1
+
+            session_id = _extract_session_id_from_episode_name(name)
+            ref_iso = _normalize_episode_reference_time(reference_value)
+            search_text = f"{summary}\n{content}".strip()
+            lexical_score = _episode_text_overlap_score(search_text, query_terms)
+            embedding_match = (
+                embedding_hits.get(f"session:{session_id}") if session_id else None
+            ) or (
+                embedding_hits.get(f"episode:{uuid}") if uuid else None
+            )
+            embedding_score = float((embedding_match or {}).get("embedding_similarity") or 0.0)
+            user_density_score = float((embedding_match or {}).get("user_char_ratio") or 0.5)
+            user_density_score = min(1.0, max(0.0, user_density_score))
+            anchor_hits = 0
+            if anchor_terms and search_text:
+                lowered = search_text.lower()
+                anchor_hits = sum(1 for term in anchor_terms if term and term in lowered)
+            anchor_score = min(1.0, (anchor_hits / float(max(1, len(anchor_terms))))) if anchor_terms else 0.0
+
+            recency_score = 0.0
+            ref_dt = _parse_utc_ts(ref_iso) if ref_iso else None
+            if ref_dt is not None:
+                age_days = max(0.0, (now_utc - ref_dt).total_seconds() / 86400.0)
+                recency_score = 1.0 / (1.0 + (age_days / 14.0))
+            score = (
+                (embedding_weight * embedding_score)
+                + (lexical_weight * lexical_score)
+                + (recency_weight * recency_score)
+                + (anchor_weight * anchor_score)
+                + (user_density_weight * user_density_score)
+            )
+            if continuation_query and lexical_score < 0.20:
+                continuation_score = (0.56 * embedding_score) + (0.18 * recency_score) + (0.16 * anchor_score) + (0.10 * user_density_score) + 0.04
+                if embedding_score >= 0.20 or lexical_score >= 0.08 or anchor_score >= 0.08:
+                    score = max(score, continuation_score)
+            if continuation_query and embedding_score >= 0.46 and (lexical_score >= 0.08 or user_density_score >= 0.55):
+                score += continuation_bonus
+
+            evidence = _extract_episode_evidence_lines(search_text, query_terms, limit=2)
+            embedding_evidence = _normalize_text((embedding_match or {}).get("unit_text"))
+            if embedding_evidence and embedding_evidence not in evidence and len(evidence) < 2:
+                evidence.append(_shorten_line(embedding_evidence, 180))
+            linked_entities: List[str] = []
+            if anchor_terms and search_text:
+                lowered = search_text.lower()
+                for hint in entity_hints:
+                    term = _normalize_text(hint).lower()
+                    if term and term in lowered and hint not in linked_entities:
+                        linked_entities.append(hint)
+                    if len(linked_entities) >= 4:
+                        break
+
+            dedupe_key = uuid or f"{name}|{ref_iso}|{tenant_id}"
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+
+            ranked_rows.append(
+                {
+                    "episode_id": uuid or None,
+                    "session_id": session_id,
+                    "reference_time": ref_iso,
+                    "score": score,
+                    "summary": summary or _shorten_line(search_text, 220),
+                    "content": content,
+                    "evidence": evidence,
+                    "linked_entities": linked_entities,
+                    "source_tenant": _normalize_text((embedding_match or {}).get("source_tenant")) or tenant_id,
+                    "embedding_similarity": embedding_score,
+                    "lexical_overlap": lexical_score,
+                    "recency_score": recency_score,
+                    "anchor_score": anchor_score,
+                    "user_density_score": user_density_score,
+                }
+            )
+
+    ranked_rows.sort(
+        key=lambda row: (
+            float(row.get("score") or 0.0),
+            _normalize_text(row.get("reference_time")),
+        ),
+        reverse=True,
+    )
+    gated_rows: List[Dict[str, Any]] = []
+    for row in ranked_rows:
+        emb = float(row.get("embedding_similarity") or 0.0)
+        lex = float(row.get("lexical_overlap") or 0.0)
+        anc = float(row.get("anchor_score") or 0.0)
+        dens = float(row.get("user_density_score") or 0.0)
+        total = float(row.get("score") or 0.0)
+        # Guardrail against low-signal episodic hallucination.
+        if (
+            total < float(active_thresholds.get("minScore") or 0.28)
+            and emb < float(active_thresholds.get("minEmbedding") or 0.24)
+            and lex < float(active_thresholds.get("minLexical") or 0.12)
+            and anc < float(active_thresholds.get("minAnchor") or 0.10)
+            and dens < float(active_thresholds.get("minUserDensity") or 0.40)
+        ):
+            continue
+        gated_rows.append(row)
+    ranked_rows = gated_rows
+
+    # Session diversity pass: enforce diversity early, then allow repeats for strong same-session continuity.
+    diverse_rows: List[Dict[str, Any]] = []
+    used_sessions: set[str] = set()
+    diverse_target = min(safe_limit, 4)
+    for row in ranked_rows:
+        sid = _normalize_text(row.get("session_id"))
+        if sid and sid in used_sessions and len(diverse_rows) < diverse_target:
+            continue
+        diverse_rows.append(row)
+        if sid:
+            used_sessions.add(sid)
+        if len(diverse_rows) >= safe_limit:
+            break
+    ranked_rows = diverse_rows[:safe_limit]
+
+    # If top candidates have weak/no evidence, use transcript tail by session id as backup grounding.
+    for row in ranked_rows[: min(3, len(ranked_rows))]:
+        if row.get("evidence"):
+            continue
+        session_id = _normalize_text(row.get("session_id"))
+        if not session_id:
+            continue
+        transcript_row = await db.fetchone(
+            """
+            SELECT tenant_id, messages
+            FROM session_transcript
+            WHERE tenant_id = ANY($1::text[]) AND user_id = $2 AND session_id = $3
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            tenant_scope,
+            user_id,
+            session_id,
+        )
+        messages = transcript_row.get("messages") if isinstance(transcript_row, dict) else None
+        if isinstance(messages, str):
+            try:
+                messages = json.loads(messages)
+            except Exception:
+                messages = []
+        evidence = _extract_transcript_evidence_lines(messages if isinstance(messages, list) else [], query_terms, limit=2)
+        if evidence:
+            row["evidence"] = evidence
+            if isinstance(transcript_row, dict):
+                row["source_tenant"] = _normalize_text(transcript_row.get("tenant_id")) or row.get("source_tenant")
+
+    items = [
+        EpisodeRecallItem(
+            episodeId=row.get("episode_id"),
+            sessionId=row.get("session_id"),
+            referenceTime=row.get("reference_time"),
+            score=round(float(row.get("score") or 0.0), 4),
+            summary=_normalize_text(row.get("summary")),
+            evidence=[_normalize_text(x) for x in (row.get("evidence") or []) if _normalize_text(x)],
+            linkedEntities=[_normalize_text(x) for x in (row.get("linked_entities") or []) if _normalize_text(x)],
+            sourceTenant=_normalize_text(row.get("source_tenant")) or canonical_tenant,
+        )
+        for row in ranked_rows
+    ]
+    top_score = float((ranked_rows[0].get("score") if ranked_rows else 0.0) or 0.0)
+    top_embedding = float((ranked_rows[0].get("embedding_similarity") if ranked_rows else 0.0) or 0.0)
+    top_lexical = float((ranked_rows[0].get("lexical_overlap") if ranked_rows else 0.0) or 0.0)
+    top_anchor = float((ranked_rows[0].get("anchor_score") if ranked_rows else 0.0) or 0.0)
+    top_user_density = float((ranked_rows[0].get("user_density_score") if ranked_rows else 0.0) or 0.0)
+    weak_recall = (
+        (not ranked_rows)
+        or (top_score < float(active_thresholds.get("weakTopScore") or 0.37))
+        or (
+            top_embedding < float(active_thresholds.get("weakEmbedding") or 0.27)
+            and top_lexical < float(active_thresholds.get("weakLexical") or 0.12)
+            and top_anchor < float(active_thresholds.get("weakAnchor") or 0.12)
+            and top_user_density < float(active_thresholds.get("weakUserDensity") or 0.40)
+        )
+    )
+    weak_reason = "no_candidates"
+    if ranked_rows:
+        if top_score < float(active_thresholds.get("weakTopScore") or 0.37):
+            weak_reason = "low_top_score"
+        elif (
+            top_embedding < float(active_thresholds.get("weakEmbedding") or 0.27)
+            and top_lexical < float(active_thresholds.get("weakLexical") or 0.12)
+            and top_anchor < float(active_thresholds.get("weakAnchor") or 0.12)
+            and top_user_density < float(active_thresholds.get("weakUserDensity") or 0.40)
+        ):
+            weak_reason = "weak_match_signals"
+        else:
+            weak_reason = ""
+    return items, {
+        "weakRecall": weak_recall,
+        "weakRecallReason": weak_reason,
+        "topScore": round(top_score, 4) if ranked_rows else 0.0,
+        "topEmbeddingSimilarity": round(top_embedding, 4) if ranked_rows else 0.0,
+        "topLexicalOverlap": round(top_lexical, 4) if ranked_rows else 0.0,
+        "topAnchorScore": round(top_anchor, 4) if ranked_rows else 0.0,
+        "topUserDensityScore": round(top_user_density, 4) if ranked_rows else 0.0,
+        "candidatesSeen": int(candidates_seen),
+        "candidatesRanked": int(len(ranked_rows)),
+        "diverseSessions": int(len({_normalize_text(r.get('session_id')) for r in ranked_rows if _normalize_text(r.get('session_id'))})),
+        "embeddingRowsMatched": int(embedding_rows_count),
+        "embeddingSessionHits": int(len(embedding_hits)),
+        "queryProfile": query_profile,
+        "effectiveWeights": active_weights,
+        "thresholds": active_thresholds,
+    }
 
 
 async def _fetch_user_model_rows_for_scope(
@@ -1247,18 +3043,7 @@ def _build_entity_profile_text(name: str, facts: List[str], relationship_type: O
 
 
 def _entity_type_bucket(raw: Any) -> str:
-    lower = _normalize_text(raw).lower()
-    if not lower:
-        return "other"
-    if any(token in lower for token in ("person", "people", "human", "user")):
-        return "person"
-    if any(token in lower for token in ("project", "product", "startup", "app", "tool")):
-        return "project"
-    if any(token in lower for token in ("company", "organization", "org", "business")):
-        return "company"
-    if any(token in lower for token in ("place", "location", "city", "country", "environment")):
-        return "place"
-    return "other"
+    return infer_ontology_type(raw)
 
 
 _ENTITY_HINT_REJECT_TOKENS = {
@@ -1280,7 +3065,7 @@ _RELATIONSHIP_ROLE_ALIASES = {
 
 
 def _allow_entity_hint_name(name: str, entity_type: str) -> bool:
-    clean = _normalize_text(name)
+    clean = canonicalize_entity_name(name)
     if not clean:
         return False
     lower = clean.lower()
@@ -1293,7 +3078,9 @@ def _allow_entity_hint_name(name: str, entity_type: str) -> bool:
     if "__" in clean or clean.count("_") >= 2:
         return False
     if entity_type != "person":
-        if len(re.findall(r"[A-Za-z0-9]+", clean)) < 2 and len(clean) < 8:
+        if lower in {"bluum", "sophie"}:
+            return True
+        if len(re.findall(r"[A-Za-z0-9]+", clean)) < 2 and len(clean) < 5:
             return False
         if re.search(r"\b(quick update|major update|code base)\b", lower):
             return False
@@ -1305,10 +3092,16 @@ def _extract_hints_from_summary_texts(
     existing_names: set[str],
     relationship_names: set[str],
     relationship_roles: Optional[Dict[str, str]] = None,
+    min_mentions: int = 2,
     limit: int = 4,
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     role_index = relationship_roles if isinstance(relationship_roles, dict) else {}
+    candidate_mentions: Dict[str, int] = {}
+    candidate_last_seen: Dict[str, Optional[str]] = {}
+    candidate_role: Dict[str, Optional[str]] = {}
+    candidate_type: Dict[str, str] = {}
+
     for row in summaries or []:
         summary_text = _normalize_text(row.get("summary_facts") or row.get("summary_text") or row.get("moment"))
         if not summary_text:
@@ -1330,20 +3123,40 @@ def _extract_hints_from_summary_texts(
                 entity_type = "other"
             if not _allow_entity_hint_name(clean, entity_type):
                 continue
-            existing_names.add(lower)
-            out.append(
-                {
-                    "entityId": None,
-                    "name": clean,
-                    "type": entity_type,
-                    "role": role,
-                    "importance": 0.72 if role else 0.62,
-                    "salience": 0.72 if role else 0.62,
-                    "lastSeenAt": _normalize_text(row.get("created_at")) or None,
-                }
-            )
-            if len(out) >= limit:
-                return out
+            candidate_mentions[lower] = int(candidate_mentions.get(lower) or 0) + 1
+            candidate_last_seen[lower] = _normalize_text(row.get("created_at")) or candidate_last_seen.get(lower)
+            candidate_role[lower] = role or candidate_role.get(lower)
+            candidate_type[lower] = entity_type
+
+    for lower, mentions in sorted(candidate_mentions.items(), key=lambda x: x[1], reverse=True):
+        role = _normalize_text(candidate_role.get(lower)).lower() or None
+        is_relationship = lower in relationship_names or bool(role)
+        if mentions < max(1, int(min_mentions)) and not is_relationship:
+            continue
+        if lower in existing_names:
+            continue
+        existing_names.add(lower)
+        pretty_name = next((c for c in re.split(r"\s+", lower) if c), lower)
+        if " " in lower:
+            pretty_name = " ".join([part.capitalize() for part in lower.split(" ") if part])
+        else:
+            pretty_name = lower.capitalize()
+        out.append(
+            {
+                "entityId": None,
+                "name": pretty_name,
+                "type": candidate_type.get(lower) or ("person" if is_relationship else "other"),
+                "role": role,
+                "importance": 0.74 if is_relationship else 0.64,
+                "salience": 0.74 if is_relationship else 0.6,
+                "lastSeenAt": candidate_last_seen.get(lower),
+                "source": "summary_recurrence",
+                "confidence": 0.7 if is_relationship else 0.58,
+                "updatedAt": candidate_last_seen.get(lower),
+            }
+        )
+        if len(out) >= limit:
+            return out
     return out
 
 
@@ -1397,9 +3210,24 @@ def _coerce_salience_float(raw: Any, default: float = 0.5) -> float:
     return max(0.0, min(1.0, v))
 
 
+def _coerce_importance_float(raw: Any, default: float = 0.5) -> float:
+    text = _normalize_text(raw).lower()
+    if text in {"high", "h"}:
+        return 1.0
+    if text in {"medium", "med", "m"}:
+        return 0.7
+    if text in {"low", "l"}:
+        return 0.4
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except Exception:
+        return default
+
+
 def _parse_entity_node_ts(node: Dict[str, Any]) -> Optional[datetime]:
-    for key in ("updated_at", "reference_time", "created_at"):
-        value = node.get(key)
+    attrs = node.get("attributes") if isinstance(node.get("attributes"), dict) else {}
+    for key in ("last_seen_at", "updated_at", "reference_time", "created_at", "first_seen_at"):
+        value = attrs.get(key) if key in attrs else node.get(key)
         dt = _parse_optional_dt(value)
         if dt:
             if dt.tzinfo is None:
@@ -1467,6 +3295,7 @@ async def _build_entity_candidates(
     user_model: Optional[Dict[str, Any]] = None,
     context_texts: Optional[List[str]] = None,
     max_hints: int = 8,
+    graphiti_only: bool = False,
 ) -> List[Dict[str, Any]]:
     loop_rows = await loops.get_top_loops_for_startbrief(
         tenant_id=tenant_id,
@@ -1493,22 +3322,39 @@ async def _build_entity_candidates(
             relationship_role_index.setdefault(rel_name, rel_role)
 
     context_terms = _query_terms(" ".join(context_rows))
-    query_fragments = [
-        " ".join(context_rows[:2]),
-        " ".join(loop_texts[:2]),
-        " ".join(seed_names[:3]),
+    exact_seed_nodes: List[Dict[str, Any]] = []
+    for seed_name in seed_names[:8]:
+        exact_seed_nodes.extend(
+            await graphiti_client.get_canonical_entity_nodes(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                name=seed_name,
+                allowed_types=["person", "project", "goal", "loop", "preference", "event"],
+                limit=1,
+            )
+        )
+    ranked_nodes = await graphiti_client.get_ranked_canonical_nodes(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        allowed_types=["person", "project", "goal", "loop", "preference", "event"],
+        limit=20,
+    )
+    queries = [
+        "important people in the user's life",
+        "active projects and products the user is working on",
+        "important goals and loops in the user's life",
     ]
-    queries = [q for q in query_fragments if _normalize_text(q)]
-    if not queries:
-        queries = [" ".join(loop_texts[:2]) or " ".join(seed_names[:2]) or "important person project"]
 
+        # GRAPHITI_REPLACED: search_nodes (entity candidate retrieval for start surfaces)
+        # TEMPORARY_DEGRADED_REPLACEMENT: start-surface entities are continuity hints from Postgres aggregates.
     search_tasks = [
-        graphiti_client.search_nodes(
+        _pg_search_nodes(
             tenant_id=tenant_id,
             user_id=user_id,
             query=q,
             limit=10,
             reference_time=reference_time,
+            allowed_types=["person", "project", "goal", "loop", "preference", "event"],
         )
         for q in queries[:3]
     ]
@@ -1516,36 +3362,63 @@ async def _build_entity_candidates(
     seen = set()
     candidates: List[Dict[str, Any]] = []
     text_pool: List[str] = []
+    role_grounding_cache: Dict[str, Dict[str, Any]] = {}
+    node_results: List[List[Dict[str, Any]]] = [exact_seed_nodes, ranked_nodes]
     for result in search_results:
         if isinstance(result, Exception):
             continue
+        node_results.append(result or [])
+    for result in node_results:
         for node in (result or []):
             if not isinstance(node, dict):
                 continue
-            name = _normalize_text(node.get("summary"))
+            name = canonicalize_entity_name(node.get("canonical_name") or node.get("name") or node.get("summary"))
             if not name:
                 continue
-            key = (_normalize_text(node.get("uuid")) or name).lower()
+            key = canonicalize_entity_name(name).lower()
             if key in seen:
                 continue
             seen.add(key)
+            role_grounding = role_grounding_cache.get(key)
+            if role_grounding is None:
+                # GRAPHITI_REPLACED: get_entity_role_grounding (entity relationship grounding)
+                # TEMPORARY_DEGRADED_REPLACEMENT: role grounding is inferred from profile aggregates.
+                role_grounding = await _pg_get_entity_role_grounding(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    name=name,
+                    entity_id=_normalize_text(node.get("uuid")) or None,
+                ) or {}
+                role_grounding_cache[key] = role_grounding
             role = (
-                relationship_role_index.get(name.lower())
+                _normalize_text(role_grounding.get("role"))
+                or _normalize_text(role_grounding.get("relationship"))
+                or relationship_role_index.get(name.lower())
                 or _entity_role_from_user_model(user_model or {}, name)
             )
+            role = role or None
             labels = node.get("labels") if isinstance(node.get("labels"), list) else []
             raw_type = _normalize_text(node.get("type"))
-            if not raw_type and labels:
-                raw_type = " ".join([_normalize_text(x) for x in labels if _normalize_text(x)])
-            entity_type = _entity_type_bucket(raw_type)
-            if role:
+            entity_type = infer_ontology_type(raw_type, labels=labels, name=name)
+            if role and entity_type != "project":
                 entity_type = "person"
+            if entity_type == "project" and _normalize_text(role_grounding.get("edge_name")).upper() == "WORKING_ON":
+                role = role or "active_project"
             if not _allow_entity_hint_name(name, entity_type):
                 continue
-            if context_terms and _query_overlap_score(name, context_terms) < 0.2 and not role:
+            if not is_allowed_runtime_node(
+                name=name,
+                raw_type=entity_type,
+                labels=labels,
+                allowed_types=["person", "project", "goal", "loop", "preference", "event"],
+                include_internal=False,
+            ):
+                continue
+            if context_terms and _query_overlap_score(name, context_terms) < 0.2 and not role and entity_type not in {"person", "project"}:
                 continue
             ts = _parse_entity_node_ts(node)
-            salience = _coerce_salience_float((node.get("attributes") or {}).get("salience") if isinstance(node.get("attributes"), dict) else None)
+            attrs = node.get("attributes") if isinstance(node.get("attributes"), dict) else {}
+            salience = _coerce_salience_float(attrs.get("salience"))
             recency = 0.3
             if ts:
                 age_hours = max(0.0, (reference_time.astimezone(dt_timezone.utc) - ts).total_seconds() / 3600.0)
@@ -1563,8 +3436,10 @@ async def _build_entity_candidates(
                 loop_texts=loop_texts,
                 candidate_texts=text_pool,
             )
-            confidence = 0.85 if _normalize_text(node.get("uuid")) else 0.6
-            score = (0.35 * recency) + (0.2 * salience) + (0.35 * importance) + (0.1 * confidence)
+            importance = max(importance, _coerce_importance_float(attrs.get("importance"), default=0.0))
+            confidence = _normalize_confidence(attrs.get("confidence"), default=(0.85 if _normalize_text(node.get("uuid")) else 0.6))
+            type_boost = 0.15 if entity_type in {"person", "project"} else 0.0
+            score = (0.3 * recency) + (0.15 * salience) + (0.3 * importance) + (0.1 * confidence) + type_boost
             candidates.append(
                 {
                     "entityId": _normalize_text(node.get("uuid")) or None,
@@ -1574,54 +3449,395 @@ async def _build_entity_candidates(
                     "importance": round(float(importance), 4),
                     "salience": round(float(salience), 4),
                     "lastSeenAt": _iso_or_none(ts),
+                    "source": "graphiti_node",
+                    "confidence": round(float(confidence), 4),
+                    "updatedAt": _iso_or_none(ts),
                     "score": round(float(score), 4),
                     "raw": node,
+                    "relationshipEdge": _normalize_text(role_grounding.get("edge_name")) or None,
                 }
             )
 
-    for rel in relationship_entities:
-        name = _normalize_text(rel.get("name"))
-        role = _normalize_relationship_role(rel.get("who"))
-        if not name:
-            continue
-        if not _allow_entity_hint_name(name, "person"):
-            continue
-        key = name.lower()
-        if any(_normalize_text(c.get("name")).lower() == key for c in candidates):
-            continue
-        importance = _entity_importance_score(
-            entity_name=name,
-            entity_type="person",
-            role=role,
-            loop_texts=loop_texts,
-            candidate_texts=text_pool,
-        )
-        salience = 0.7
-        score = (0.35 * 0.6) + (0.2 * salience) + (0.35 * importance) + (0.1 * 0.65)
-        candidates.append(
-            {
-                "entityId": None,
-                "name": name,
-                "type": "person",
-                "role": role or None,
-                "importance": round(float(importance), 4),
-                "salience": round(float(salience), 4),
-                "lastSeenAt": None,
-                "score": round(float(score), 4),
-                "raw": {},
-            }
-        )
+    if not graphiti_only:
+        for rel in relationship_entities:
+            name = canonicalize_entity_name(rel.get("name"))
+            role = _normalize_relationship_role(rel.get("who"))
+            if not name:
+                continue
+            if not _allow_entity_hint_name(name, "person"):
+                continue
+            key = name.lower()
+            if any(_normalize_text(c.get("name")).lower() == key for c in candidates):
+                continue
+            importance = _entity_importance_score(
+                entity_name=name,
+                entity_type="person",
+                role=role,
+                loop_texts=loop_texts,
+                candidate_texts=text_pool,
+            )
+            salience = 0.7
+            score = (0.35 * 0.6) + (0.2 * salience) + (0.35 * importance) + (0.1 * 0.65)
+            candidates.append(
+                {
+                    "entityId": None,
+                    "name": name,
+                    "type": "person",
+                    "role": role or None,
+                    "importance": round(float(importance), 4),
+                    "salience": round(float(salience), 4),
+                    "lastSeenAt": None,
+                    "source": "user_model_relationship",
+                    "confidence": 0.68,
+                    "updatedAt": None,
+                    "score": round(float(score), 4),
+                    "raw": {},
+                }
+            )
 
     candidates.sort(
         key=lambda x: (
-            float(x.get("salience") or 0.0),
             float(x.get("importance") or 0.0),
+            float(x.get("salience") or 0.0),
             float(x.get("score") or 0.0),
             _normalize_text(x.get("lastSeenAt")),
+            _normalize_text(x.get("name")).lower(),
         ),
         reverse=True,
     )
     return candidates[: max(1, min(int(max_hints or 8), 10))]
+
+
+def _importance_label(value: Any) -> str:
+    try:
+        score = float(value or 0.0)
+    except Exception:
+        return "low"
+    if score >= 0.8:
+        return "high"
+    if score >= 0.55:
+        return "medium"
+    return "low"
+
+
+def _trusted_identity_basics(user_model: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    model = user_model if isinstance(user_model, dict) else {}
+    basics: Dict[str, Any] = {}
+    for key in ("name", "preferred_name", "timezone", "home"):
+        value = _normalize_text(model.get(key))
+        if value:
+            basics[key] = value
+    relationships = []
+    for rel in _extract_valid_relationship_entities(model, limit=8):
+        name = canonicalize_entity_name(rel.get("name"))
+        role = _normalize_relationship_role(rel.get("who"))
+        if name and role:
+            relationships.append({"name": name, "role": role})
+    if relationships:
+        basics["key_relationships"] = relationships[:5]
+    return basics
+
+
+def _build_recent_high_signal_changes(
+    recent_session_summaries: List[Dict[str, Any]],
+    loop_items: List[Dict[str, Any]],
+    max_items: int = 3,
+) -> List[str]:
+    changes: List[str] = []
+    for summary in recent_session_summaries[:2]:
+        text = _normalize_text(summary.get("summary_facts") or summary.get("summary_text") or summary.get("moment"))
+        if text and _allow_fact_text(text):
+            changes.append(_shorten_line(text, 180))
+    for loop in loop_items[:2]:
+        text = _normalize_text(loop.get("text"))
+        if text:
+            reason = _normalize_text(loop.get("reason"))
+            if reason:
+                changes.append(_shorten_line(f"{text}. {reason}", 180))
+            else:
+                changes.append(_shorten_line(text, 180))
+    return _dedupe_keep_order(changes, limit=max_items)
+
+
+def _compose_structured_handover_text(
+    *,
+    depth_label: str,
+    time_of_day_label: str,
+    time_gap_human: Optional[str],
+    identity_basics: Dict[str, Any],
+    entity_hints: List[SessionStartBriefEntityHint],
+    top_loops: List[Dict[str, Any]],
+    recent_changes: List[str],
+) -> str:
+    intro = _natural_time_phrase(time_of_day_label, time_gap_human)
+    if depth_label == "continuation":
+        intro += " You last spoke with the user in the current thread."
+    elif depth_label == "today":
+        intro += " You last spoke with the user earlier today."
+    elif depth_label == "yesterday":
+        intro += " You last spoke with the user yesterday."
+    else:
+        intro += " You have not spoken with the user recently."
+
+    parts: List[str] = [intro]
+    preferred_name = _normalize_text(identity_basics.get("preferred_name") or identity_basics.get("name"))
+    if preferred_name:
+        parts.append(f"The user's name is {preferred_name}.")
+    if recent_changes:
+        parts.append(f"Recent change: {recent_changes[0]}")
+    if top_loops:
+        top_loop_text = _normalize_text(top_loops[0].get("text"))
+        if top_loop_text:
+            parts.append(f"Top active loop: {top_loop_text}.")
+    if entity_hints:
+        top_entities = ", ".join([hint.name for hint in entity_hints[:3] if _normalize_text(hint.name)])
+        if top_entities:
+            parts.append(f"Key entities in view: {top_entities}.")
+    return _compress_handover_text(" ".join([p for p in parts if p]).strip(), depth_label) or " ".join([p for p in parts if p]).strip()
+
+
+async def _resolve_canonical_entity_candidate(
+    tenant_id: str,
+    user_id: str,
+    reference_time: datetime,
+    entity_id: Optional[str],
+    name: Optional[str],
+    user_model: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    normalized_id = _normalize_text(entity_id)
+    normalized_name = canonicalize_entity_name(name)
+    exact_candidates = await graphiti_client.get_canonical_entity_nodes(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        name=normalized_name or None,
+        entity_id=normalized_id or None,
+        limit=5,
+        allowed_types=["person", "project", "goal", "loop", "preference", "event"],
+    )
+    if exact_candidates:
+        for node in exact_candidates:
+            name_value = canonicalize_entity_name(node.get("summary"))
+            if normalized_id and _normalize_text(node.get("uuid")) == normalized_id:
+                return {
+                    "entityId": _normalize_text(node.get("uuid")) or None,
+                    "name": name_value,
+                    "type": _normalize_text(node.get("type")) or "other",
+                    "role": _entity_role_from_user_model(user_model or {}, name_value),
+                    "importance": 0.8,
+                    "salience": 0.8,
+                    "lastSeenAt": _iso_or_none(_parse_entity_node_ts(node)),
+                    "source": "graphiti_exact_node",
+                    "confidence": 0.95,
+                    "updatedAt": _iso_or_none(_parse_entity_node_ts(node)),
+                    "score": 0.95,
+                    "raw": node,
+                }
+            if normalized_name and name_value.lower() == normalized_name.lower():
+                return {
+                    "entityId": _normalize_text(node.get("uuid")) or None,
+                    "name": name_value,
+                    "type": _normalize_text(node.get("type")) or "other",
+                    "role": _entity_role_from_user_model(user_model or {}, name_value),
+                    "importance": 0.8,
+                    "salience": 0.8,
+                    "lastSeenAt": _iso_or_none(_parse_entity_node_ts(node)),
+                    "source": "graphiti_exact_node",
+                    "confidence": 0.95,
+                    "updatedAt": _iso_or_none(_parse_entity_node_ts(node)),
+                    "score": 0.95,
+                    "raw": node,
+                }
+
+    search_queries = [normalized_name] if normalized_name else []
+    if not search_queries:
+        search_queries = ["important person project goal loop preference event"]
+
+    direct_candidates: List[Dict[str, Any]] = []
+    for query in search_queries[:2]:
+        # GRAPHITI_REPLACED: search_nodes (direct entity lookup candidates)
+        # TEMPORARY_DEGRADED_REPLACEMENT: direct entity lookup uses continuity nodes (derived) until claim-store retrieval is restored.
+        rows = await _pg_search_nodes(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            query=query,
+            limit=10,
+            reference_time=reference_time,
+            allowed_types=["person", "project", "goal", "loop", "preference", "event"],
+        )
+        direct_candidates.extend([row for row in (rows or []) if isinstance(row, dict)])
+
+    candidates = await _build_entity_candidates(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        reference_time=reference_time,
+        user_model=user_model,
+        context_texts=[normalized_name] if normalized_name else None,
+        max_hints=10,
+    )
+
+    if direct_candidates:
+        for node in direct_candidates:
+            name_value = canonicalize_entity_name(node.get("summary"))
+            if normalized_id and _normalize_text(node.get("uuid")) == normalized_id:
+                return {
+                    "entityId": _normalize_text(node.get("uuid")) or None,
+                    "name": name_value,
+                    "type": _normalize_text(node.get("type")) or "other",
+                    "role": _entity_role_from_user_model(user_model or {}, name_value),
+                    "importance": 0.8,
+                    "salience": 0.8,
+                    "lastSeenAt": _iso_or_none(_parse_entity_node_ts(node)),
+                    "source": "graphiti_node",
+                    "confidence": 0.9,
+                    "updatedAt": _iso_or_none(_parse_entity_node_ts(node)),
+                    "score": 0.9,
+                    "raw": node,
+                }
+            if normalized_name and name_value.lower() == normalized_name.lower():
+                return {
+                    "entityId": _normalize_text(node.get("uuid")) or None,
+                    "name": name_value,
+                    "type": _normalize_text(node.get("type")) or "other",
+                    "role": _entity_role_from_user_model(user_model or {}, name_value),
+                    "importance": 0.8,
+                    "salience": 0.8,
+                    "lastSeenAt": _iso_or_none(_parse_entity_node_ts(node)),
+                    "source": "graphiti_node",
+                    "confidence": 0.9,
+                    "updatedAt": _iso_or_none(_parse_entity_node_ts(node)),
+                    "score": 0.9,
+                    "raw": node,
+                }
+
+    return _resolve_entity_candidate(candidates, entity_id=entity_id, name=normalized_name)
+
+
+async def _build_narrow_identity_fact_candidates(
+    *,
+    tenant_id: str,
+    user_id: str,
+    selected_entity: Dict[str, Any],
+    user_model: Optional[Dict[str, Any]],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    canonical_name = canonicalize_entity_name(selected_entity.get("name"))
+    entity_id = _normalize_text(selected_entity.get("entityId")) or None
+    raw_node = selected_entity.get("raw") if isinstance(selected_entity.get("raw"), dict) else {}
+    raw_attrs = raw_node.get("attributes") if isinstance(raw_node.get("attributes"), dict) else {}
+
+    # GRAPHITI_REPLACED: get_entity_role_grounding (entity relationship grounding)
+    # TEMPORARY_DEGRADED_REPLACEMENT: role hints are derived and not claim-store-backed.
+    role_grounding = await _pg_get_entity_role_grounding(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        name=canonical_name or None,
+        entity_id=entity_id,
+    ) or {}
+    # GRAPHITI_REPLACED: get_entity_facts_exact (exact facts for selected entity)
+    # TEMPORARY_DEGRADED_REPLACEMENT: strict factual mode filters out derived continuity rows.
+    direct_rows = await _pg_get_entity_facts_exact(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        name=canonical_name or None,
+        entity_id=entity_id,
+        limit=max(limit * 3, 8),
+        include_derived=False,
+    )
+
+    target_type = _normalize_text(selected_entity.get("type")).lower()
+    role = (
+        _normalize_text(role_grounding.get("role"))
+        or _normalize_text(role_grounding.get("relationship"))
+        or _normalize_text(selected_entity.get("role"))
+        or _entity_role_from_user_model(user_model or {}, canonical_name)
+    )
+
+    seeded_rows: List[Dict[str, Any]] = []
+    if canonical_name and role and target_type == "person":
+        seeded_rows.append(
+            {
+                "text": f"{canonical_name} is the user's {role}.",
+                "relevance": 1.0,
+                "source": "graphiti_relationship",
+                "relevance_tier": "persistent",
+                "tenant_id": tenant_id,
+            }
+        )
+    elif canonical_name and _normalize_text(role_grounding.get("edge_name")).upper() == "WORKING_ON":
+        seeded_rows.append(
+            {
+                "text": f"{canonical_name} is an active project the user is working on.",
+                "relevance": 1.0,
+                "source": "graphiti_relationship",
+                "relevance_tier": "persistent",
+                "tenant_id": tenant_id,
+            }
+        )
+
+    profile_summary = _normalize_text(raw_attrs.get("profile_summary"))
+    raw_summary = _normalize_text(raw_node.get("summary") or raw_node.get("name"))
+    summary_text = profile_summary or raw_summary
+    if summary_text and canonical_name and canonical_name.lower() in summary_text.lower() and _allow_fact_text(summary_text):
+        seeded_rows.append(
+            {
+                "text": _shorten_line(summary_text, 220),
+                "relevance": 0.92,
+                "source": "graphiti_node",
+                "relevance_tier": "persistent",
+                "tenant_id": tenant_id,
+            }
+        )
+
+    entity_terms = _query_terms(canonical_name)
+    out: List[Dict[str, Any]] = []
+    seen = set()
+
+    def _push(row: Dict[str, Any]) -> None:
+        text = _normalize_text(row.get("text"))
+        if not text:
+            return
+        key = text.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(row)
+
+    for row in seeded_rows:
+        # TEMPORARY_DEGRADED_REPLACEMENT: seeded rows are synthetic continuity hints; excluded from strict factual output.
+        if _is_canonical_factual_row(row):
+            _push(row)
+
+    for row in direct_rows or []:
+        if not isinstance(row, dict):
+            continue
+        if not _is_canonical_factual_row(row):
+            continue
+        text = _normalize_text(row.get("text"))
+        if not text:
+            continue
+        if not (_allow_claim(text) and _allow_fact_text(text)):
+            continue
+        if _is_explicit_user_state_claim(text):
+            continue
+        if canonical_name.lower() not in text.lower() and (entity_terms and _query_overlap_score(text, entity_terms) < 0.35):
+            continue
+        _push(
+            {
+                "text": text,
+                "relevance": row.get("relevance") or 1.0,
+                "source": _normalize_text(row.get("source")) or "graphiti_exact",
+                "relevance_tier": "persistent",
+                "tenant_id": tenant_id,
+                "source_type": row.get("source_type"),
+                "derived": row.get("derived"),
+                "evidence_backed": row.get("evidence_backed"),
+                "data_classification": row.get("data_classification"),
+            }
+        )
+        if len(out) >= max(1, limit):
+            break
+
+    return out[: max(1, limit)]
 
 
 def _resolve_entity_candidate(
@@ -5185,7 +7401,7 @@ async def _get_yesterday_analysis_context(
     yesterday_date = reference_date - timedelta(days=1)
     row = await db.fetchone(
         """
-        SELECT analysis_date, themes, steering_note
+        SELECT analysis_date, themes, steering_note, confidence, updated_at
         FROM daily_analysis
         WHERE tenant_id = $1
           AND user_id = $2
@@ -5198,6 +7414,8 @@ async def _get_yesterday_analysis_context(
     )
     themes: List[str] = []
     steering_note: Optional[str] = None
+    confidence: Optional[float] = None
+    updated_at: Optional[str] = None
     if row:
         raw_themes = row.get("themes") or []
         if isinstance(raw_themes, list):
@@ -5208,29 +7426,51 @@ async def _get_yesterday_analysis_context(
                 if len(themes) >= 4:
                     break
         steering_note = _normalize_text(row.get("steering_note")) or None
+        confidence = _normalize_confidence(row.get("confidence"), default=0.0) if row.get("confidence") is not None else None
+        updated_value = row.get("updated_at")
+        if isinstance(updated_value, datetime):
+            updated_at = updated_value.astimezone(dt_timezone.utc).isoformat().replace("+00:00", "Z")
+        else:
+            updated_at = _normalize_text(updated_value) or None
     return {
         "date": yesterday_date.isoformat(),
         "themes": themes,
-        "steering_note": steering_note
+        "steering_note": steering_note,
+        "confidence": confidence,
+        "updated_at": updated_at,
     }
 
 
-def _extract_high_confidence_user_model_hints(model: Dict[str, Any], threshold: float) -> List[str]:
-    hints: List[str] = []
+def _build_user_model_hint_rows(model: Dict[str, Any], threshold: float, max_items: int = 8) -> List[Dict[str, Any]]:
+    hints: List[Dict[str, Any]] = []
 
     current_focus = model.get("current_focus")
     if isinstance(current_focus, dict):
         conf = _normalize_confidence(current_focus.get("confidence"), default=0.0)
         focus_text = _normalize_text(current_focus.get("text"))
         if focus_text and conf >= threshold:
-            hints.append(f"Current focus: {focus_text}")
+            hints.append(
+                {
+                    "text": f"Current focus: {focus_text}",
+                    "confidence": conf,
+                    "updated_at": _normalize_text(current_focus.get("updated_at")) or None,
+                    "source": _normalize_text(current_focus.get("source")) or "user_model",
+                }
+            )
 
     work_context = model.get("work_context")
     if isinstance(work_context, dict):
         conf = _normalize_confidence(work_context.get("confidence"), default=0.0)
         text = _normalize_text(work_context.get("text"))
         if text and conf >= threshold:
-            hints.append(f"Work context: {text}")
+            hints.append(
+                {
+                    "text": f"Work context: {text}",
+                    "confidence": conf,
+                    "updated_at": _normalize_text(work_context.get("updated_at")) or None,
+                    "source": _normalize_text(work_context.get("source")) or "user_model",
+                }
+            )
 
     north_star = model.get("north_star")
     if isinstance(north_star, dict):
@@ -5243,9 +7483,23 @@ def _extract_high_confidence_user_model_hints(model: Dict[str, Any], threshold: 
             v_conf = _normalize_confidence(entry.get("vision_confidence"), default=0.0)
             g_conf = _normalize_confidence(entry.get("goal_confidence"), default=0.0)
             if vision and v_conf >= threshold:
-                hints.append(f"{domain} vision: {vision}")
+                hints.append(
+                    {
+                        "text": f"{domain} vision: {vision}",
+                        "confidence": v_conf,
+                        "updated_at": _normalize_text(entry.get("updated_at")) or None,
+                        "source": "user_model",
+                    }
+                )
             if goal and g_conf >= threshold:
-                hints.append(f"{domain} goal: {goal}")
+                hints.append(
+                    {
+                        "text": f"{domain} goal: {goal}",
+                        "confidence": g_conf,
+                        "updated_at": _normalize_text(entry.get("updated_at")) or None,
+                        "source": "user_model",
+                    }
+                )
 
     relationships = model.get("key_relationships")
     if isinstance(relationships, list):
@@ -5259,10 +7513,21 @@ def _extract_high_confidence_user_model_hints(model: Dict[str, Any], threshold: 
             who = _normalize_text(rel.get("who"))
             status = _normalize_text(rel.get("status"))
             if name and who and status:
-                hints.append(f"Relationship: {name} ({who}), currently {status}")
+                hint = f"Relationship: {name} ({who}), currently {status}"
             elif name and who:
-                hints.append(f"Relationship: {name} ({who})")
-            if len(hints) >= 8:
+                hint = f"Relationship: {name} ({who})"
+            else:
+                hint = ""
+            if hint:
+                hints.append(
+                    {
+                        "text": hint,
+                        "confidence": conf,
+                        "updated_at": _normalize_text(rel.get("updated_at")) or None,
+                        "source": _normalize_text(rel.get("source")) or "user_model",
+                    }
+                )
+            if len(hints) >= max_items:
                 break
 
     patterns = model.get("patterns")
@@ -5273,11 +7538,46 @@ def _extract_high_confidence_user_model_hints(model: Dict[str, Any], threshold: 
             conf = _normalize_confidence(row.get("confidence"), default=0.0)
             text = _normalize_text(row.get("text"))
             if text and conf >= threshold:
-                hints.append(f"Pattern: {text}")
-            if len(hints) >= 8:
+                hints.append(
+                    {
+                        "text": f"Pattern: {text}",
+                        "confidence": conf,
+                        "updated_at": _normalize_text(row.get("updated_at")) or None,
+                        "source": _normalize_text(row.get("source")) or "user_model",
+                    }
+                )
+            if len(hints) >= max_items:
                 break
 
-    return _dedupe_keep_order(hints, limit=8)
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for row in hints:
+        text = _normalize_text(row.get("text"))
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(
+            {
+                "text": text,
+                "confidence": _normalize_confidence(row.get("confidence"), default=0.0),
+                "updated_at": _normalize_text(row.get("updated_at")) or None,
+                "source": _normalize_text(row.get("source")) or "user_model",
+            }
+        )
+        if len(deduped) >= max_items:
+            break
+    return deduped
+
+
+def _extract_high_confidence_user_model_hints(model: Dict[str, Any], threshold: float) -> List[str]:
+    return [
+        _normalize_text(row.get("text"))
+        for row in _build_user_model_hint_rows(model, threshold=threshold, max_items=8)
+        if _normalize_text(row.get("text"))
+    ]
 
 
 def _clean_startbrief_bridge_output(raw: Optional[str]) -> Optional[str]:
@@ -5533,6 +7833,16 @@ _STARTBRIEF_BUREAUCRATIC_PHRASES = (
     "big events",
 )
 
+_STARTBRIEF_LOW_VALUE_SENTENCE_PATTERNS = (
+    r"\bsession began with\b",
+    r"\bbrief exchange of presence\b",
+    r"\bpresence and readiness\b",
+    r"\bconfirmed availability\b",
+    r"\balways available\b",
+    r"\binsisted .* prior memory\b",
+    r"\bchecked if .* present\b",
+)
+
 _LOW_VALUE_LOOP_PATTERNS = (
     r"\bcoffee\b",
     r"\bweather\b",
@@ -5585,6 +7895,8 @@ def _validate_handover_text(
         reasons.append("ops_context_leak")
     if len(re.findall(r"\b(gap|since last spoke|hours since|minutes since)\b", clean.lower())) > 1:
         reasons.append("repeated_time_gap")
+    if _has_near_duplicate_sentences(clean):
+        reasons.append("duplicated_content")
     return reasons
 
 
@@ -5638,6 +7950,65 @@ def _ensure_sentence_spacing(value: str) -> str:
     if not clean:
         return ""
     return re.sub(r"([.!?])([A-Za-z])", r"\1 \2", clean)
+
+
+def _sentence_tokens(text: str) -> set[str]:
+    return {t for t in re.findall(r"[a-z0-9]+", _normalize_text(text).lower()) if t}
+
+
+def _has_near_duplicate_sentences(text: str, threshold: float = 0.84) -> bool:
+    sentences = [_normalize_text(s) for s in re.split(r"(?<=[.!?])\s+", _normalize_text(text)) if _normalize_text(s)]
+    tokenized = [_sentence_tokens(s) for s in sentences]
+    for i in range(len(tokenized)):
+        a = tokenized[i]
+        if not a:
+            continue
+        for j in range(i + 1, len(tokenized)):
+            b = tokenized[j]
+            if not b:
+                continue
+            overlap = len(a & b) / max(1, len(a | b))
+            if overlap >= threshold:
+                return True
+    return False
+
+
+def _compress_handover_text(text: Optional[str], depth_label: str) -> Optional[str]:
+    clean = _normalize_text(text)
+    if not clean:
+        return None
+    sentence_caps = {
+        "continuation": 3,
+        "today": 4,
+        "yesterday": 5,
+        "multi_day": 6,
+    }
+    cap = sentence_caps.get(_normalize_text(depth_label).lower(), 4)
+    raw_sentences = [_normalize_text(s) for s in re.split(r"(?<=[.!?])\s+", clean) if _normalize_text(s)]
+    kept: List[str] = []
+    seen_keys: List[set[str]] = []
+    for sentence in raw_sentences:
+        lower = sentence.lower()
+        if any(re.search(pattern, lower) for pattern in _STARTBRIEF_LOW_VALUE_SENTENCE_PATTERNS):
+            continue
+        tokens = _sentence_tokens(sentence)
+        if not tokens:
+            continue
+        duplicate = False
+        for prev in seen_keys:
+            overlap = len(tokens & prev) / max(1, len(tokens | prev))
+            if overlap >= 0.84:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        seen_keys.append(tokens)
+        kept.append(sentence)
+        if len(kept) >= cap:
+            break
+    if not kept:
+        kept = raw_sentences[:cap]
+    return _ensure_sentence_spacing(" ".join(kept)).strip()
 
 
 def _join_sentence_parts(parts: List[str]) -> str:
@@ -6361,6 +8732,7 @@ def select_startbrief_ingredients(
     yesterday_daily_analysis: Dict[str, Any],
     top_active_loops: List[Dict[str, Any]],
     user_model_hints: List[str],
+    user_model_hint_rows: Optional[List[Dict[str, Any]]] = None,
     user_model: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     gap_minutes: Optional[int] = None
@@ -6526,6 +8898,26 @@ def select_startbrief_ingredients(
     gap_human = _format_gap_human(gap_minutes)
     session_frequency = _session_frequency_phrase(sessions_today_count)
     now_local = _format_now_local(reference_now, time_of_day_label)
+    hint_rows_filtered: List[Dict[str, Any]] = []
+    for row in (user_model_hint_rows or []):
+        text = _normalize_text((row or {}).get("text"))
+        if not text:
+            continue
+        updated_raw = _normalize_text((row or {}).get("updated_at"))
+        keep = True
+        if updated_raw:
+            updated_dt = _parse_optional_dt(updated_raw)
+            if updated_dt:
+                updated_utc = updated_dt.astimezone(dt_timezone.utc) if updated_dt.tzinfo else updated_dt.replace(tzinfo=dt_timezone.utc)
+                ref_utc = reference_now.astimezone(dt_timezone.utc) if reference_now.tzinfo else reference_now.replace(tzinfo=dt_timezone.utc)
+                age_days = max(0.0, (ref_utc - updated_utc).total_seconds() / 86400.0)
+                if age_days > 45:
+                    keep = False
+        if keep:
+            hint_rows_filtered.append(row)
+    if not hint_rows_filtered and user_model_hints:
+        hint_rows_filtered = [{"text": _normalize_text(x), "confidence": None, "updated_at": None, "source": "user_model"} for x in user_model_hints if _normalize_text(x)]
+    hints_from_rows = [_normalize_text((row or {}).get("text")) for row in hint_rows_filtered if _normalize_text((row or {}).get("text"))]
 
     return {
         "depth_label": depth_label,
@@ -6549,7 +8941,28 @@ def select_startbrief_ingredients(
         "session_frequency": session_frequency,
         "yesterday_themes": [_normalize_text(x) for x in (yesterday_daily_analysis.get("themes") or []) if _normalize_text(x)][:2],
         "steering_note": _normalize_text(yesterday_daily_analysis.get("steering_note")) or None,
-        "user_model_hints": [_normalize_text(x) for x in user_model_hints if _normalize_text(x)][:6],
+        "daily_analysis_date": _normalize_text(yesterday_daily_analysis.get("date")) or None,
+        "daily_analysis_confidence": (
+            _normalize_confidence(yesterday_daily_analysis.get("confidence"), default=0.0)
+            if yesterday_daily_analysis.get("confidence") is not None
+            else None
+        ),
+        "daily_analysis_updated_at": _normalize_text(yesterday_daily_analysis.get("updated_at")) or None,
+        "user_model_hints": hints_from_rows[:6],
+        "user_model_hint_rows": [
+            {
+                "text": _normalize_text((row or {}).get("text")),
+                "confidence": (
+                    _normalize_confidence((row or {}).get("confidence"), default=0.0)
+                    if (row or {}).get("confidence") is not None
+                    else None
+                ),
+                "updated_at": _normalize_text((row or {}).get("updated_at")) or None,
+                "source": _normalize_text((row or {}).get("source")) or None,
+            }
+            for row in hint_rows_filtered
+            if _normalize_text((row or {}).get("text"))
+        ][:6],
     }
 
 
@@ -6587,8 +9000,14 @@ def compose_ops_context(
         "top_loops_today": top_loops_today,
         "waiting_on": [],
         "user_model_hints": ingredients.get("user_model_hints", [])[:6],
+        "user_model_hint_rows": ingredients.get("user_model_hint_rows", [])[:6],
         "yesterday_themes": ingredients.get("yesterday_themes", [])[:2],
         "steering_note": ingredients.get("steering_note"),
+        "daily_analysis": {
+            "date": ingredients.get("daily_analysis_date"),
+            "confidence": ingredients.get("daily_analysis_confidence"),
+            "updated_at": ingredients.get("daily_analysis_updated_at"),
+        },
     }
 
 
@@ -8098,6 +10517,9 @@ async def memory_query(request: MemoryQueryRequest):
     """
     try:
         fact_limit = max(1, request.limit or 10)
+        memory_intent = _resolve_memory_intent(request.memoryIntent)
+        exact_enabled = memory_intent in {"exact", "hybrid"}
+        episodic_enabled = memory_intent in {"episodic", "hybrid"}
         canonical_tenant, tenant_scope = _resolve_tenant_scope(request.tenantId)
         reference_time = None
         if request.referenceTime:
@@ -8106,29 +10528,64 @@ async def memory_query(request: MemoryQueryRequest):
                 value = value.replace("Z", "+00:00")
             reference_time = datetime.fromisoformat(value)
         query_terms = _query_terms(request.query)
+        requested_node_types = infer_query_node_types(request.query)
+        identity_target = _extract_narrow_entity_identity_target(request.query) if exact_enabled else None
 
-        graphiti_fact_tasks = [
-            graphiti_client.search_facts(
-                tenant_id=tenant_id,
-                user_id=request.userId,
-                query=request.query,
-                limit=fact_limit,
-                reference_time=reference_time
+        user_model_rows = await _fetch_user_model_rows_for_scope(tenant_scope=tenant_scope, user_id=request.userId)
+        primary_user_model = {}
+        if user_model_rows:
+            primary_user_model = _hydrate_user_model_narratives(
+                user_model_rows[0].get("model"),
+                row=user_model_rows[0] if isinstance(user_model_rows[0], dict) else None,
             )
-            for tenant_id in tenant_scope
-        ]
+
+        scoped_entity = None
+        if identity_target:
+            try:
+                scoped_entity = await _resolve_canonical_entity_candidate(
+                    tenant_id=canonical_tenant,
+                    user_id=request.userId,
+                    reference_time=reference_time or datetime.utcnow().replace(tzinfo=dt_timezone.utc),
+                    entity_id=None,
+                    name=identity_target,
+                    user_model=primary_user_model,
+                )
+            except Exception as e:
+                logger.warning("memory_query entity resolution failed tenant=%s user=%s target=%s err=%s", canonical_tenant, request.userId, identity_target, e)
+                scoped_entity = None
+
+        # GRAPHITI_REPLACED: search_facts (exact semantic fact retrieval)
+        # TEMPORARY_DEGRADED_REPLACEMENT: strict factual path only admits canonical evidence-backed rows.
+        graphiti_fact_tasks = (
+            [
+                _pg_search_facts(
+                    tenant_id=tenant_id,
+                    user_id=request.userId,
+                    query=request.query,
+                    limit=fact_limit,
+                    reference_time=reference_time,
+                    include_derived=False,
+                )
+                for tenant_id in tenant_scope
+            ]
+            if exact_enabled and not scoped_entity
+            else []
+        )
+        # GRAPHITI_REPLACED: search_nodes (entity retrieval for memory query)
+        # TEMPORARY_DEGRADED_REPLACEMENT: node/entity payload is continuity-oriented and not canonical factual evidence.
         graphiti_node_tasks = [
-            graphiti_client.search_nodes(
+            _pg_search_nodes(
                 tenant_id=tenant_id,
                 user_id=request.userId,
                 query=request.query,
                 limit=min(request.limit or 10, 10),
-                reference_time=reference_time
+                reference_time=reference_time,
+                allowed_types=requested_node_types or ONTOLOGY_NODE_TYPES,
             )
             for tenant_id in tenant_scope
         ]
         graphiti_fact_results, graphiti_node_results = await asyncio.gather(
-            asyncio.gather(*graphiti_fact_tasks, return_exceptions=True),
+            asyncio.gather(*graphiti_fact_tasks, return_exceptions=True) if graphiti_fact_tasks else asyncio.sleep(0, result=[]),
             asyncio.gather(*graphiti_node_tasks, return_exceptions=True),
         )
 
@@ -8184,80 +10641,60 @@ async def memory_query(request: MemoryQueryRequest):
                 enriched["tenant_id"] = tenant_id
                 entities_raw.append(enriched)
 
-        allowed_labels = {"entity", "mentalstate"}
-        excluded_labels = {"episodic", "environment"}
-
         def _include_memory_query_node(node: Any) -> bool:
             if not isinstance(node, dict):
                 return False
-            if _is_session_summary_node(node):
-                return True
+            summary = canonicalize_entity_name(node.get("summary"))
             labels = node.get("labels")
-            normalized_labels = {
-                _normalize_text(label).lower()
-                for label in (labels or [])
-                if _normalize_text(label)
-            } if isinstance(labels, list) else set()
-            if normalized_labels:
-                if normalized_labels & excluded_labels:
-                    return False
-                return bool(normalized_labels & allowed_labels)
-            node_type = _normalize_text(node.get("type")).lower()
-            if node_type in excluded_labels:
-                return False
-            return node_type in allowed_labels
+            node_type = infer_ontology_type(
+                node.get("type"),
+                labels=labels if isinstance(labels, list) else None,
+                name=summary,
+            )
+            return is_allowed_runtime_node(
+                name=summary,
+                raw_type=node_type,
+                labels=labels if isinstance(labels, list) else None,
+                allowed_types=requested_node_types or ONTOLOGY_NODE_TYPES,
+                include_internal=False,
+            )
 
         entities = [node for node in (entities_raw or []) if _include_memory_query_node(node)]
 
         fact_candidates: List[Dict[str, Any]] = []
-        for row in ordered_fact_items:
-            text = _normalize_text(row.get("text"))
-            if not text:
-                continue
-            if not (_allow_claim(text) and _allow_fact_text(text) and not _is_explicit_user_state_claim(text)):
-                continue
-            fact_candidates.append({
-                "text": text,
-                "relevance": row.get("relevance"),
-                "source": _normalize_text(row.get("source")) or "graphiti",
-                "relevance_tier": tier_by_text.get(text.lower()),
-                "tenant_id": _normalize_text(row.get("tenant_id")) or canonical_tenant,
-            })
-
-        for node in entities:
-            if not _is_session_summary_node(node):
-                continue
-            for claim in _extract_session_summary_candidate_texts(node):
-                overlap = _query_overlap_score(claim, query_terms)
-                if query_terms and overlap <= 0:
+        if exact_enabled:
+            for row in ordered_fact_items:
+                text = _normalize_text(row.get("text"))
+                if not text:
+                    continue
+                if not _is_canonical_factual_row(row):
+                    continue
+                if not (_allow_claim(text) and _allow_fact_text(text) and not _is_explicit_user_state_claim(text)):
                     continue
                 fact_candidates.append({
-                    "text": claim,
-                    "relevance": overlap or 0.55,
-                    "source": "graphiti_session_summary",
-                    "relevance_tier": "recent",
-                    "tenant_id": _normalize_text(node.get("tenant_id")) or canonical_tenant,
-                })
-
-        user_model_rows = await _fetch_user_model_rows_for_scope(tenant_scope=tenant_scope, user_id=request.userId)
-        for row in user_model_rows:
-            hydrated_model = _hydrate_user_model_narratives(
-                row.get("model"),
-                row=row if isinstance(row, dict) else None,
-            )
-            for candidate_text in _extract_user_model_recall_candidates(hydrated_model):
-                overlap = _query_overlap_score(candidate_text, query_terms)
-                if query_terms and overlap <= 0:
-                    continue
-                if not (_allow_claim(candidate_text) and _allow_fact_text(candidate_text)):
-                    continue
-                fact_candidates.append({
-                    "text": candidate_text,
-                    "relevance": overlap or 0.5,
-                    "source": "user_model",
-                    "relevance_tier": "persistent",
+                    "text": text,
+                    "relevance": row.get("relevance"),
+                    "source": _normalize_text(row.get("source")) or "graphiti",
+                    "relevance_tier": tier_by_text.get(text.lower()),
                     "tenant_id": _normalize_text(row.get("tenant_id")) or canonical_tenant,
+                    "source_type": row.get("source_type"),
+                    "derived": row.get("derived"),
+                    "evidence_backed": row.get("evidence_backed"),
+                    "data_classification": row.get("data_classification"),
                 })
+
+        # T1 containment: do not inject derived/projection prose into factual candidates.
+        # Specifically blocked sources: session summary prose and user_model prose.
+
+        if exact_enabled and scoped_entity:
+            fact_candidates = await _build_narrow_identity_fact_candidates(
+                tenant_id=canonical_tenant,
+                user_id=request.userId,
+                selected_entity=scoped_entity,
+                user_model=primary_user_model,
+                limit=fact_limit,
+            )
+            entities = [scoped_entity.get("raw")] if isinstance(scoped_entity.get("raw"), dict) else []
 
         deduped_fact_rows: List[Dict[str, Any]] = []
         fact_index: Dict[str, int] = {}
@@ -8531,6 +10968,30 @@ async def memory_query(request: MemoryQueryRequest):
                 continue
             entity_models.append(Entity(summary=summary, type=e.get("type"), uuid=e.get("uuid")))
 
+        episodic_items: List[EpisodeRecallItem] = []
+        episodic_audit: Dict[str, Any] = {}
+        if episodic_enabled:
+            episodic_items, episodic_audit = await _build_episodic_recall_items(
+                tenant_scope=tenant_scope,
+                canonical_tenant=canonical_tenant,
+                user_id=request.userId,
+                query=request.query,
+                query_terms=query_terms,
+                reference_time=reference_time,
+                entity_hints=[entity.summary for entity in entity_models[:12] if _normalize_text(entity.summary)],
+                limit=fact_limit,
+            )
+            try:
+                coverage_stats = await get_user_episodic_embedding_stats(
+                    db=db,
+                    tenant_scope=tenant_scope,
+                    user_id=request.userId,
+                    reference_time=reference_time,
+                )
+            except Exception:
+                coverage_stats = {"rows": 0, "sessions": 0}
+            episodic_audit["embeddingCoverage"] = coverage_stats
+
         provenance_counts: Dict[str, int] = {}
         for item in fact_models:
             source = _normalize_text(item.source) or "unknown"
@@ -8570,11 +11031,15 @@ async def memory_query(request: MemoryQueryRequest):
             facts=fact_texts,
             factItems=fact_models,
             entities=entity_models,
+            episodes=episodic_items,
             metadata={
                 "query": request.query,
+                "memoryIntent": memory_intent,
                 "responseMode": "context" if request.includeContext else "recall",
                 "facts": len(fact_models),
                 "entities": len(entity_models),
+                "episodes": len(episodic_items),
+                "episodicWeakRecall": bool(episodic_audit.get("weakRecall")) if episodic_enabled else None,
                 "limit": fact_limit,
                 "tenantCanonical": canonical_tenant,
                 "tenantScope": tenant_scope,
@@ -8601,6 +11066,33 @@ async def memory_query(request: MemoryQueryRequest):
                     "queryIntent": query_intent,
                     "queryMemoryType": query_memory_type,
                     "queryDomainFocus": sorted([x for x in query_domain_focus if x]),
+                    "ontologyNodeTypes": requested_node_types or ONTOLOGY_NODE_TYPES,
+                    "exactEntityScoped": bool(scoped_entity),
+                    "exactEntityTarget": identity_target if scoped_entity else None,
+                },
+                "episodicRanking": {
+                    "enabled": episodic_enabled,
+                    "embeddingEnabled": bool(get_settings().episodic_embedding_enabled),
+                    "embeddingModel": _normalize_text(get_settings().episodic_embedding_model) or None,
+                    "queryProfile": _normalize_text(episodic_audit.get("queryProfile")) if episodic_enabled else None,
+                    "weights": (
+                        episodic_audit.get("effectiveWeights")
+                        if isinstance(episodic_audit.get("effectiveWeights"), dict)
+                        else {
+                            "embeddingSimilarity": 0.50,
+                            "lexicalOverlap": 0.20,
+                            "recency": 0.12,
+                            "linkedEntityOverlap": 0.18,
+                            "userTurnDensity": 0.04,
+                            "continuationIntentBonus": 0.05,
+                        }
+                    ),
+                    "audit": episodic_audit,
+                },
+                "memoryOntology": {
+                    "nodeTypes": ONTOLOGY_NODE_TYPES,
+                    "edgeTypes": ONTOLOGY_EDGE_TYPES,
+                    "domainFacets": ONTOLOGY_DOMAIN_FACETS,
                 },
             }
         )
@@ -8608,13 +11100,16 @@ async def memory_query(request: MemoryQueryRequest):
             return response
 
         focus_query = _normalize_text(request.focusQuery) or "current focus priority focused on right now today i need"
+        # GRAPHITI_REPLACED: search_nodes (focus node retrieval for includeContext)
+        # TEMPORARY_DEGRADED_REPLACEMENT: includeContext focus nodes are continuity/debug aids (derived).
         focus_tasks = [
-            graphiti_client.search_nodes(
+            _pg_search_nodes(
                 tenant_id=tenant_id,
                 user_id=request.userId,
                 query=focus_query,
                 limit=3,
-                reference_time=reference_time
+                reference_time=reference_time,
+                allowed_types=["goal", "loop", "project", "event"],
             )
             for tenant_id in tenant_scope
         ]
@@ -9061,7 +11556,9 @@ async def session_brief(
             invalid_at=[[DateFilter(date=None, comparison_operator=ComparisonOperator.is_null)]]
         )
 
-        tensions = await graphiti_client.search_nodes(
+        # GRAPHITI_REPLACED: search_nodes (unresolved tension/loop retrieval for session brief)
+        # TEMPORARY_DEGRADED_REPLACEMENT: session-brief loops/tensions are derived continuity projections.
+        tensions = await _pg_search_nodes(
             tenant_id=tenantId,
             user_id=userId,
             query="current problems tasks unresolved blockers open loops",
@@ -9090,7 +11587,9 @@ async def session_brief(
                 "status": status or "unresolved"
             })
 
-        key_entities = await graphiti_client.search_nodes(
+        # GRAPHITI_REPLACED: search_nodes (key entities retrieval for session brief)
+        # TEMPORARY_DEGRADED_REPLACEMENT: key entities here are continuity hints, not canonical facts.
+        key_entities = await _pg_search_nodes(
             tenant_id=tenantId,
             user_id=userId,
             query="named people places projects tools organizations priorities",
@@ -9098,7 +11597,9 @@ async def session_brief(
             reference_time=reference_now,
             search_filter=current_filter
         )
-        commitment_entities = await graphiti_client.search_nodes(
+        # GRAPHITI_REPLACED: search_nodes (commitment candidates retrieval for session brief)
+        # TEMPORARY_DEGRADED_REPLACEMENT: commitment candidates are inferred from continuity nodes.
+        commitment_entities = await _pg_search_nodes(
             tenant_id=tenantId,
             user_id=userId,
             query="commitment schedule deadline todo follow up plan",
@@ -9106,7 +11607,9 @@ async def session_brief(
             reference_time=reference_now,
             search_filter=current_filter
         )
-        focus_nodes = await graphiti_client.search_nodes(
+        # GRAPHITI_REPLACED: search_nodes (current focus retrieval for session brief)
+        # TEMPORARY_DEGRADED_REPLACEMENT: current focus extraction uses derived continuity nodes.
+        focus_nodes = await _pg_search_nodes(
             tenant_id=tenantId,
             user_id=userId,
             query="current focus priority focused on right now today i need",
@@ -9276,6 +11779,7 @@ async def session_startbrief(
         last_activity_time: Optional[datetime] = None
         recent_session_summaries: List[Dict[str, Any]] = []
         user_model_hints: List[str] = []
+        user_model_hint_rows: List[Dict[str, Any]] = []
         user_model_data: Dict[str, Any] = {}
         user_model_narrative: Optional[str] = None
         user_model_narrative_stable: Optional[str] = None
@@ -9502,32 +12006,6 @@ async def session_startbrief(
             except Exception:
                 pass
 
-        # Diagnostics: environment nodes (not used in output)
-        try:
-            logger.info("startbrief graphiti: search_nodes (environment diagnostics)")
-            env_nodes = await graphiti_client.search_nodes(
-                tenant_id=tenantId,
-                user_id=userId,
-                query="environment location place context",
-                limit=3,
-                reference_time=reference_now
-            )
-            env_info = []
-            for node in env_nodes or []:
-                node_type = (node.get("type") or "").lower() if isinstance(node, dict) else ""
-                if node_type != "environment":
-                    continue
-                env_info.append({
-                    "summary": node.get("summary"),
-                    "uuid": node.get("uuid"),
-                    "created_at": node.get("created_at"),
-                    "updated_at": node.get("updated_at"),
-                    "reference_time": node.get("reference_time")
-                })
-            logger.info("startbrief env_nodes=%s", env_info)
-        except Exception as e:
-            logger.info("startbrief env_nodes lookup failed: %s", e)
-
         if last_activity_time:
             if last_activity_time.tzinfo is None:
                 last_activity_time = last_activity_time.replace(tzinfo=tzinfo or dt_timezone.utc)
@@ -9574,57 +12052,7 @@ async def session_startbrief(
             if len(loop_items) >= 5:
                 break
 
-        if len(loop_items) < 5:
-            logger.info("startbrief graphiti: search_nodes (tensions)")
-            tensions = await graphiti_client.search_nodes(
-                tenant_id=tenantId,
-                user_id=userId,
-                query="current problems tasks unresolved blockers open loops",
-                limit=5,
-                reference_time=reference_now
-            )
-            for t in tensions or []:
-                attrs = t.get("attributes") if isinstance(t, dict) else None
-                t_type = (t.get("type") or "").lower() if isinstance(t, dict) else ""
-                is_tension = t_type == "tension"
-                if isinstance(attrs, dict) and ("description" in attrs or "status" in attrs):
-                    is_tension = True
-                if not is_tension:
-                    continue
-                status = (attrs.get("status") if isinstance(attrs, dict) else None) or "unresolved"
-                if isinstance(status, str) and status.lower() != "unresolved":
-                    continue
-                description = (attrs.get("description") if isinstance(attrs, dict) else None) or t.get("summary")
-                description = _normalize_text(description)
-                if not description:
-                    continue
-                if not _allow_claim(description) or _is_explicit_user_state_claim(description):
-                    continue
-                if _looks_like_environment(description):
-                    continue
-                if any(_normalize_text(i.get("text")).lower() == description.lower() for i in loop_items):
-                    continue
-                loop_items.append({
-                    "kind": "tension",
-                    "text": _shorten_line(description, 120),
-                    "type": None,
-                    "timeHorizon": None,
-                    "dueDate": None,
-                    "salience": None,
-                    "lastSeenAt": None,
-                })
-                if len(loop_items) >= 5:
-                    break
-
         yesterday_analysis = {"date": None, "themes": [], "steering_note": None}
-        try:
-            yesterday_analysis = await _get_yesterday_analysis_context(
-                tenant_id=tenantId,
-                user_id=userId,
-                reference_date=reference_now.date()
-            )
-        except Exception as e:
-            logger.error(f"startbrief yesterday analysis lookup failed: {e}")
 
         try:
             _, tenant_scope = _resolve_tenant_scope(tenantId)
@@ -9633,68 +12061,6 @@ async def session_startbrief(
             if user_model_row:
                 user_model = _normalize_user_model(user_model_row.get("model"))
                 user_model_data = user_model
-                user_model_narrative_stable = (
-                    _normalize_text(user_model.get("narrative_stable"))
-                    or _normalize_text(user_model_row.get("narrative_stable"))
-                    or None
-                )
-                user_model_narrative_current = (
-                    _normalize_text(user_model.get("narrative_current"))
-                    or _normalize_text(user_model_row.get("narrative_current"))
-                    or None
-                )
-                user_model_narrative = (
-                    _normalize_text(" ".join([x for x in [user_model_narrative_stable, user_model_narrative_current] if x]))
-                    or _normalize_text(user_model.get("narrative"))
-                    or None
-                )
-                user_model_hints = _extract_high_confidence_user_model_hints(
-                    user_model,
-                    threshold=float(settings.user_model_high_confidence)
-                )
-                relationship_entities = _extract_valid_relationship_entities(user_model)
-                if relationship_entities:
-                    fact_tasks = [
-                        graphiti_client.search_facts(
-                            tenant_id=tenantId,
-                            user_id=userId,
-                            query=entity.get("name"),
-                            limit=12,
-                            reference_time=reference_now,
-                        )
-                        for entity in relationship_entities
-                    ]
-                    fact_results = await asyncio.gather(*fact_tasks, return_exceptions=True)
-                    for entity, result in zip(relationship_entities, fact_results):
-                        entity_name = _normalize_text(entity.get("name"))
-                        relationship_type = _normalize_text(entity.get("who")).lower()
-                        if not entity_name:
-                            continue
-                        if isinstance(result, Exception):
-                            logger.warning("startbrief entity profile fact query failed name=%s error=%s", entity_name, result)
-                            continue
-                        rows = result if isinstance(result, list) else []
-                        raw_texts = [_normalize_text(r.get("text")) for r in rows if isinstance(r, dict) and r.get("text")]
-                        cleaned_facts = _dedupe_keep_order(
-                            [
-                                t for t in raw_texts
-                                if _allow_fact_text(t)
-                            ],
-                            limit=6
-                        )
-                        if not cleaned_facts:
-                            continue
-                        entity_profiles.append(
-                            SessionStartBriefEntityProfile(
-                                name=entity_name,
-                                profile_text=_build_entity_profile_text(
-                                    entity_name,
-                                    cleaned_facts,
-                                    relationship_type=relationship_type,
-                                ),
-                                facts=cleaned_facts,
-                            )
-                        )
         except Exception as e:
             logger.error(f"startbrief user model hint lookup failed: {e}")
 
@@ -9705,11 +12071,14 @@ async def session_startbrief(
                 reference_time=reference_now,
                 user_model=user_model_data,
                 context_texts=[
-                    _normalize_text(x.get("summary_facts"))
-                    for x in recent_session_summaries[:4]
-                    if isinstance(x, dict) and _normalize_text(x.get("summary_facts"))
+                    *[
+                        _normalize_text(x.get("text"))
+                        for x in loop_items[:4]
+                        if isinstance(x, dict) and _normalize_text(x.get("text"))
+                    ],
+                    _normalize_text(last_user_text),
                 ],
-                max_hints=8,
+                max_hints=5,
             )
             entity_hints = [
                 SessionStartBriefEntityHint(
@@ -9717,57 +12086,30 @@ async def session_startbrief(
                     name=_normalize_text(item.get("name")) or "unknown",
                     type=_normalize_text(item.get("type")) or "other",
                     role=_normalize_text(item.get("role")) or None,
-                    importance=float(item.get("importance")) if item.get("importance") is not None else None,
+                    importance=_importance_label(item.get("importance")),
                     salience=float(item.get("salience")) if item.get("salience") is not None else None,
                     lastSeenAt=_normalize_text(item.get("lastSeenAt")) or None,
+                    source=_normalize_text(item.get("source")) or None,
+                    confidence=(
+                        _normalize_confidence(item.get("confidence"), default=0.0)
+                        if item.get("confidence") is not None
+                        else None
+                    ),
+                    updatedAt=_normalize_text(item.get("updatedAt")) or _normalize_text(item.get("lastSeenAt")) or None,
                 )
                 for item in (raw_entity_hints or [])
                 if _normalize_text(item.get("name"))
-            ][:10]
-            if len(entity_hints) < 3:
-                relationship_roles = {
-                    _normalize_text(x.get("name")).lower(): _normalize_relationship_role(x.get("who"))
-                    for x in _extract_valid_relationship_entities(user_model_data, limit=20)
-                    if _normalize_text(x.get("name"))
-                }
-                summary_role_hints = _extract_relationship_roles_from_summaries(recent_session_summaries[:6])
-                for rel_name, rel_role in summary_role_hints.items():
-                    if rel_name and rel_role:
-                        relationship_roles.setdefault(rel_name, rel_role)
-                relationship_names = {
-                    _normalize_text(x.get("name")).lower()
-                    for x in _extract_valid_relationship_entities(user_model_data, limit=20)
-                    if _normalize_text(x.get("name"))
-                }
-                existing_names = {_normalize_text(x.name).lower() for x in entity_hints if _normalize_text(x.name)}
-                fallback_rows = _extract_hints_from_summary_texts(
-                    summaries=recent_session_summaries[:6],
-                    existing_names=existing_names,
-                    relationship_names=relationship_names,
-                    relationship_roles=relationship_roles,
-                    limit=6,
-                )
-                for item in fallback_rows:
-                    entity_hints.append(
-                        SessionStartBriefEntityHint(
-                            entityId=None,
-                            name=_normalize_text(item.get("name")) or "unknown",
-                            type=_normalize_text(item.get("type")) or "other",
-                            role=_normalize_text(item.get("role")) or None,
-                            importance=float(item.get("importance") or 0.0),
-                            salience=float(item.get("salience") or 0.0),
-                            lastSeenAt=_normalize_text(item.get("lastSeenAt")) or None,
-                        )
-                    )
-                entity_hints = sorted(
-                    entity_hints,
-                    key=lambda x: (
-                        float(x.salience or 0.0),
-                        float(x.importance or 0.0),
-                        _normalize_text(x.lastSeenAt),
-                    ),
-                    reverse=True,
-                )[:10]
+            ][:5]
+            entity_hints = sorted(
+                entity_hints,
+                key=lambda x: (
+                    {"high": 3, "medium": 2, "low": 1}.get(_normalize_text(x.importance).lower(), 0),
+                    float(x.salience or 0.0),
+                    _normalize_text(x.lastSeenAt),
+                    _normalize_text(x.name).lower(),
+                ),
+                reverse=True,
+            )[:5]
         except Exception as e:
             logger.error("startbrief entity hints build failed: %s", e)
             entity_hints = []
@@ -9804,161 +12146,64 @@ async def session_startbrief(
                 if created_local.date() == local_day:
                     sessions_today_count += 1
 
-        ingredients = select_startbrief_ingredients(
-            reference_now=reference_now,
-            last_session_end=last_activity_time,
-            sessions_today_count=sessions_today_count,
-            time_of_day_label=time_of_day_label,
-            recent_session_summaries=recent_session_summaries,
-            yesterday_daily_analysis=yesterday_analysis,
-            top_active_loops=loop_items,
-            user_model_hints=user_model_hints,
-            user_model=user_model_data,
-        )
-        startbrief_narrative = _build_startbrief_narrative(
-            narrative_stable=user_model_narrative_stable,
-            narrative_current=user_model_narrative_current,
-            selected_summaries=ingredients.get("selected_summaries") if isinstance(ingredients.get("selected_summaries"), list) else [],
-            top_active_loops=loop_items,
-            user_model=user_model_data,
-        )
+        gap_minutes: Optional[int] = None
+        if last_activity_time:
+            gap_minutes = int(max(0, (reference_now_utc - last_activity_time.astimezone(dt_timezone.utc)).total_seconds() // 60))
+        if gap_minutes is not None and gap_minutes <= 30:
+            depth_label = "continuation"
+        elif gap_minutes is not None and gap_minutes <= 360:
+            depth_label = "today"
+        elif gap_minutes is not None and gap_minutes <= 1440:
+            depth_label = "yesterday"
+        else:
+            depth_label = "multi_day"
 
-        # Optional bounded fallback: if nodes were fetched but produced no usable thread text,
-        # re-fetch by ids via properties(n) and normalize with the same parser.
-        if (
-            int(summary_norm_stats.get("nodes_seen") or 0) > 0
-            and not _normalize_text(ingredients.get("last_thread"))
-            and fetched_summary_ids
-            and not summary_norm_stats.get("fallback_used")
-        ):
-            summary_norm_stats["fallback_used"] = True
-            try:
-                fallback_nodes = await graphiti_client.get_session_summary_nodes_by_ids(
-                    tenant_id=tenantId,
-                    user_id=userId,
-                    ids=fetched_summary_ids[:5],
-                    limit=5
-                )
-                for node in fallback_nodes or []:
-                    normalized = _normalize_startbrief_session_summary_node(node, stats=summary_norm_stats)
-                    if not normalized:
-                        continue
-                    created_at = _normalize_text(normalized.get("created_at"))
-                    created_dt = _parse_optional_dt(created_at)
-                    if _is_unreasonably_future(created_dt, reference_now_utc):
-                        continue
-                    summary_facts = _normalize_text(normalized.get("latest_thread_text"))
-                    tone = _normalize_text(normalized.get("tone"))
-                    moment = _normalize_text(normalized.get("moment"))
-                    if not summary_facts and not moment:
-                        continue
-                    summary_norm_stats["nodes_normalized_nonempty"] = int(summary_norm_stats.get("nodes_normalized_nonempty") or 0) + 1
-                    recent_session_summaries.append({
-                        "session_id": _normalize_text(normalized.get("session_id")),
-                        "created_at": created_at,
-                        "summary_facts": summary_facts,
-                        "tone": tone,
-                        "moment": moment,
-                        "unresolved": normalized.get("unresolved") if isinstance(normalized.get("unresolved"), list) else [],
-                        "decisions": normalized.get("decisions") if isinstance(normalized.get("decisions"), list) else [],
-                        "salience": _normalize_text(normalized.get("salience")) or "low",
-                        "summary_text": _normalize_text(normalized.get("summary_text")),
-                        "bridge_text": _normalize_text(normalized.get("bridge_text")),
-                        "reference_time": _normalize_text(normalized.get("reference_time") or created_at),
-                    })
-                if recent_session_summaries:
-                    summary_norm_stats["fallback_success"] = True
-                    ingredients = select_startbrief_ingredients(
-                        reference_now=reference_now,
-                        last_session_end=last_activity_time,
-                        sessions_today_count=sessions_today_count,
-                        time_of_day_label=time_of_day_label,
-                        recent_session_summaries=recent_session_summaries,
-                        yesterday_daily_analysis=yesterday_analysis,
-                        top_active_loops=loop_items,
-                        user_model_hints=user_model_hints,
-                        user_model=user_model_data,
-                    )
-            except Exception as e:
-                logger.warning("startbrief properties fallback failed: %s", e)
-                summary_norm_stats["fallback_success"] = False
-
+        identity_basics = _trusted_identity_basics(user_model_data)
+        recent_changes = _build_recent_high_signal_changes(recent_session_summaries, loop_items, max_items=3)
         local_time = reference_now.strftime("%H:%M")
         first_session_today = sessions_today_count == 0
-        top_open_loops_for_prompt = sorted(
-            [
+        handover_text = _compose_structured_handover_text(
+            depth_label=depth_label,
+            time_of_day_label=time_of_day_label,
+            time_gap_human=time_gap_human,
+            identity_basics=identity_basics,
+            entity_hints=entity_hints,
+            top_loops=loop_items,
+            recent_changes=recent_changes,
+        )
+
+        ops_context = {
+            "identity": identity_basics,
+            "top_loops_today": [
                 {
-                    "text": _normalize_text(item.get("text")),
-                    "reason": _normalize_text(item.get("reason")) or None,
-                    "salience": int(item.get("salience") or 0),
+                    "text": _normalize_text(loop.get("text")),
+                    "type": _normalize_text(loop.get("type")) or None,
+                    "time_horizon": _normalize_text(loop.get("timeHorizon")) or None,
+                    "salience": int(loop.get("salience") or 0) if loop.get("salience") is not None else None,
                 }
-                for item in loop_items
-                if _normalize_text(item.get("text"))
+                for loop in loop_items[:3]
+                if _normalize_text(loop.get("text"))
             ],
-            key=lambda x: int(x.get("salience") or 0),
-            reverse=True,
-        )[:3]
-        narrative_ingredients = {
-            "now_local": ingredients.get("now_local"),
-            "gap_human": ingredients.get("gap_human"),
-            "session_frequency": ingredients.get("session_frequency"),
-            "last_thread": ingredients.get("last_thread"),
-            "user_tone": ingredients.get("user_tone"),
-            "open_threads": ingredients.get("open_threads", [])[:2],
-            "open_thread_reasons": ingredients.get("open_thread_reasons", [])[:2],
-            "open_loops": top_open_loops_for_prompt,
-            "yesterday_themes": ingredients.get("yesterday_themes", [])[:2],
-            "steering_note": ingredients.get("steering_note"),
-            "continuation_hint": resume_bridge_text if ingredients.get("depth_label") == "continuation" else None,
-            "user_narrative_stable": None,
-            "user_narrative_current": startbrief_narrative,
+            "recent_changes": recent_changes[:3],
+            "assistant_guidance": [],
+            "user_model_hints": [],
+            "user_model_hint_rows": [],
+            "yesterday_themes": [],
+            "steering_note": None,
+            "daily_analysis": {"date": None, "confidence": None, "updated_at": None},
         }
-        depth_label = ingredients.get("depth_label") or "yesterday"
-        handover_text = None
-        try:
-            handover_text = await _generate_startbrief_bridge_llm(
-                narrative_ingredients=narrative_ingredients,
-                depth_label=depth_label
-            )
-            handover_text = _ensure_sentence_spacing(handover_text or "")
-        except Exception as e:
-            logger.error(f"startbrief bridge llm generation failed: {e}")
-            handover_text = None
-
-        invalid_reasons = _validate_handover_text(handover_text or "", depth_label, narrative_ingredients)
-        if invalid_reasons:
-            try:
-                rewritten = await _generate_startbrief_bridge_llm(
-                    narrative_ingredients={**narrative_ingredients, "existing_text": handover_text or "", "invalid_reasons": invalid_reasons},
-                    depth_label=depth_label,
-                    rewrite_only=True,
-                )
-                rewritten = _ensure_sentence_spacing(rewritten or "")
-                if not _validate_handover_text(rewritten or "", depth_label, narrative_ingredients):
-                    handover_text = rewritten
-            except Exception:
-                pass
-
-        if _validate_handover_text(handover_text or "", depth_label, narrative_ingredients):
-            handover_text = _fallback_handover_text(ingredients, depth_label)
-
-        handover_text = _sanitize_handover_tone(handover_text or "")
-        if _validate_handover_text(handover_text or "", depth_label, narrative_ingredients):
-            handover_text = _sanitize_handover_tone(_fallback_handover_text(ingredients, depth_label))
-
-        ops_context = compose_ops_context(ingredients, loop_items)
         used_summary_ids = [
             _normalize_text(s.get("session_id"))
-            for s in ingredients.get("selected_summaries", [])
+            for s in recent_session_summaries[:2]
             if _normalize_text(s.get("session_id")) and not _is_placeholder_value(s.get("session_id"))
         ]
-        evidence_ids = used_summary_ids or fetched_summary_ids or []
-        summary_content_quality = "ok"
+        evidence_ids = used_summary_ids or fetched_summary_ids[:2]
+        summary_content_quality = "not_used_by_default"
         if int(summary_norm_stats.get("nodes_seen") or 0) <= 0:
             summary_content_quality = "none_fetched"
-        elif not _normalize_text(ingredients.get("last_thread")):
-            summary_content_quality = "empty_after_normalization"
-        summary_norm_stats["evidence_ids_used_count"] = len(used_summary_ids)
+        elif recent_changes:
+            summary_content_quality = "used_for_recent_changes"
+        summary_norm_stats["evidence_ids_used_count"] = len(evidence_ids)
         summary_norm_stats["evidence_ids_fetched_count"] = len(fetched_summary_ids)
         logger.info(
             "startbrief_summary_norm nodes_seen=%s nodes_normalized_nonempty=%s placeholders_blocked=%s evidence_ids_used_count=%s evidence_ids_fetched_count=%s fallback_used=%s fallback_success=%s",
@@ -9970,7 +12215,6 @@ async def session_startbrief(
             summary_norm_stats.get("fallback_used"),
             summary_norm_stats.get("fallback_success"),
         )
-        daily_analysis_date_used = _normalize_text(yesterday_analysis.get("date")) or None
         try:
             ingest_freshness = await _get_session_ingest_freshness(
                 tenant_id=tenantId,
@@ -9982,13 +12226,13 @@ async def session_startbrief(
             logger.warning("startbrief ingest freshness lookup failed: %s", e)
 
         response = SessionStartBriefResponse(
-            handover_text=_normalize_text(handover_text) or _sanitize_handover_tone(_fallback_handover_text(ingredients, depth_label)),
-            narrative=startbrief_narrative,
+            handover_text=_normalize_text(handover_text),
+            narrative=None,
             handover_depth=depth_label,
             time_context={
                 "local_time": local_time,
                 "time_of_day": time_of_day_label,
-                "gap_minutes": ingredients.get("gap_minutes"),
+                "gap_minutes": gap_minutes,
                 "sessions_today": sessions_today_count,
                 "first_session_today": first_session_today,
             },
@@ -10000,8 +12244,8 @@ async def session_startbrief(
             evidence={
                 "session_summary_ids_used": evidence_ids[:2],
                 "session_summary_ids_fetched": fetched_summary_ids[:5],
-                "claim_ranking": ingredients.get("selected_summary_scores", [])[:5],
-                "loop_ranking": ingredients.get("selected_loop_scores", [])[:5],
+                "claim_ranking": [],
+                "loop_ranking": [],
                 "claim_ranking_defs": {
                     "salience": "Immediate intensity/urgency of a session claim (short-horizon prominence).",
                     "importance": "Durable relevance inferred from recurrence across recent sessions and alignment with active loops.",
@@ -10017,11 +12261,11 @@ async def session_startbrief(
                 "summary_content_quality": summary_content_quality,
                 "fallback_used": bool(summary_norm_stats.get("fallback_used")),
                 "fallback_success": bool(summary_norm_stats.get("fallback_success")),
-                "daily_analysis_date_used": daily_analysis_date_used,
+                "daily_analysis_date_used": None,
                 "freshness": ingest_freshness,
             },
             entity_hints=entity_hints,
-            entity_profiles=entity_profiles,
+            entity_profiles=[],
         )
         try:
             await _log_startbrief_history(
@@ -10037,7 +12281,7 @@ async def session_startbrief(
                     "handover_depth": depth_label,
                     "evidence": response.evidence,
                     "ops_context": response.ops_context,
-                    "narrative_ingredients": narrative_ingredients,
+                    "recent_changes": recent_changes,
                 }
             )
         except Exception as e:
@@ -10074,33 +12318,25 @@ async def entities_profile(request: EntityProfileRequest):
                 user_model = _normalize_user_model(rows[0].get("model"))
         except Exception:
             user_model = {}
+        # GRAPHITI_REPLACED: get_entity_role_grounding (entity role lookup for profile)
+        # TEMPORARY_DEGRADED_REPLACEMENT: role is continuity-derived and not evidence-backed.
+        role_grounding = await _pg_get_entity_role_grounding(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            name=name or None,
+            entity_id=entity_id or None,
+        ) or {}
 
-        candidates = await _build_entity_candidates(
+        selected = await _resolve_canonical_entity_candidate(
             tenant_id=tenant_id,
             user_id=user_id,
             reference_time=reference_time,
+            entity_id=entity_id,
+            name=name,
             user_model=user_model,
-            context_texts=[name] if name else None,
-            max_hints=10,
         )
-        selected = _resolve_entity_candidate(candidates, entity_id=entity_id, name=name)
-        if not selected and entity_id:
-            raise HTTPException(status_code=404, detail="Entity not found")
         if not selected:
-            fallback_name = name or "unknown"
-            fallback_role = _entity_role_from_user_model(user_model, fallback_name)
-            fallback_type = "person" if fallback_role else "other"
-            selected = {
-                "entityId": None,
-                "name": fallback_name,
-                "type": fallback_type,
-                "role": fallback_role,
-                "importance": 0.5,
-                "salience": 0.5,
-                "lastSeenAt": None,
-                "score": 0.5,
-                "raw": {},
-            }
+            raise HTTPException(status_code=404, detail="Entity not found")
 
         canonical_name = _normalize_text(selected.get("name"))
         aliases: List[str] = []
@@ -10112,13 +12348,35 @@ async def entities_profile(request: EntityProfileRequest):
 
         facts_limit = max(1, min(int(request.factsLimit or 6), 10))
         loops_limit = max(0, min(int(request.loopsLimit or 3), 8))
-        facts_rows = await graphiti_client.search_facts(
+        # GRAPHITI_REPLACED: get_entity_facts_exact (exact profile facts)
+        # TEMPORARY_DEGRADED_REPLACEMENT: strict factual mode blocks derived continuity-only rows.
+        exact_facts_rows = await _pg_get_entity_facts_exact(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            name=canonical_name,
+            entity_id=_normalize_text(selected.get("entityId")) or None,
+            limit=max(facts_limit * 2, 8),
+            include_derived=False,
+        )
+        # GRAPHITI_REPLACED: search_facts (semantic profile fact expansion)
+        # TEMPORARY_DEGRADED_REPLACEMENT: semantic expansion constrained to canonical evidence-backed rows only.
+        semantic_facts_rows = await _pg_search_facts(
             tenant_id=tenant_id,
             user_id=user_id,
             query=canonical_name,
             limit=max(facts_limit * 2, 8),
             reference_time=reference_time,
+            include_derived=False,
         )
+        facts_rows = list(exact_facts_rows or [])
+        seen_fact_texts = {str(row.get("text") or "").strip().lower() for row in facts_rows if isinstance(row, dict)}
+        for row in semantic_facts_rows or []:
+            if not isinstance(row, dict):
+                continue
+            text = str(row.get("text") or "").strip().lower()
+            if text and text not in seen_fact_texts:
+                facts_rows.append(row)
+                seen_fact_texts.add(text)
         entity_terms = _query_terms(canonical_name)
         key_facts: List[Dict[str, Any]] = []
         seen_facts = set()
@@ -10127,6 +12385,11 @@ async def entities_profile(request: EntityProfileRequest):
                 continue
             text = _normalize_text(row.get("text"))
             if not text or not _allow_fact_text(text):
+                continue
+            if not _is_canonical_factual_row(row):
+                continue
+            invalid_at = row.get("invalid_at")
+            if invalid_at:
                 continue
             if entity_terms and _query_overlap_score(text, entity_terms) < 0.35 and canonical_name.lower() not in text.lower():
                 continue
@@ -10173,12 +12436,30 @@ async def entities_profile(request: EntityProfileRequest):
                 if len(open_loops) >= loops_limit:
                     break
 
+        raw_summary = None
+        raw_node = selected.get("raw") if isinstance(selected.get("raw"), dict) else {}
+        if isinstance(raw_node, dict):
+            raw_summary = _normalize_text(raw_node.get("summary"))
+            if not raw_summary:
+                raw_summary = _normalize_text(raw_node.get("name"))
+
         summary_parts: List[str] = []
         if key_facts:
             summary_parts.append(_shorten_line(key_facts[0].get("text") or "", 180))
         if len(key_facts) > 1:
             summary_parts.append(_shorten_line(key_facts[1].get("text") or "", 180))
-        summary = " ".join([p for p in summary_parts if p]) or f"{canonical_name} appears in memory context."
+        attrs = raw_node.get("attributes") if isinstance(raw_node, dict) and isinstance(raw_node.get("attributes"), dict) else {}
+        profile_summary = _normalize_text(attrs.get("profile_summary")) if isinstance(attrs, dict) else ""
+        if not key_facts and profile_summary:
+            key_facts.append(
+                {
+                    "text": _shorten_line(profile_summary, 220),
+                    "confidence": _normalize_confidence(attrs.get("confidence"), default=0.75),
+                    "validAt": None,
+                    "invalidAt": None,
+                }
+            )
+        summary = " ".join([p for p in summary_parts if p]) or profile_summary or raw_summary or f"{canonical_name} appears in memory context."
         last_seen = _normalize_text(selected.get("lastSeenAt")) or None
         response_payload = EntityProfileResponse(
             entity={
@@ -10187,22 +12468,28 @@ async def entities_profile(request: EntityProfileRequest):
                 "type": _normalize_text(selected.get("type")) or "other",
                 "aliases": aliases,
                 "summary": summary,
-                "role": _normalize_text(selected.get("role")) or None,
-                "relationship": _normalize_text(selected.get("role")) or None,
+                "role": _normalize_text(role_grounding.get("role")) or _normalize_text(selected.get("role")) or _entity_role_from_user_model(user_model, canonical_name) or None,
+                "relationship": _normalize_text(role_grounding.get("relationship")) or _normalize_text(selected.get("role")) or _entity_role_from_user_model(user_model, canonical_name) or None,
                 "importance": float(selected.get("importance") or 0.0),
                 "salience": float(selected.get("salience") or 0.0),
+                "confidence": _normalize_confidence((raw_attrs or {}).get("confidence"), default=float(selected.get("confidence") or 0.6)),
                 "recency": {
                     "lastSeenAt": last_seen,
                     "daysSinceSeen": _days_since_iso(last_seen, reference_time),
+                    "firstSeenAt": _normalize_text((raw_attrs or {}).get("first_seen_at")) or None,
                 },
             },
             keyFacts=key_facts,
             openLoops=open_loops,
             provenance={
-                "sources": ["graphiti_nodes", "graphiti_facts", "user_model", "loops"],
+                "sources": ["postgres_continuity_nodes", "postgres_continuity_facts", "loops"] + (["postgres_role_hint"] if role_grounding else []) + (["user_model"] if _entity_role_from_user_model(user_model, canonical_name) else []),
                 "resolvedBy": "entityId" if entity_id else "name",
                 "queryUsed": canonical_name,
                 "generatedAt": reference_time.isoformat(),
+                "nodeProvenance": {
+                    "firstSeenAt": _normalize_text((raw_attrs or {}).get("first_seen_at")) or None,
+                    "lastSeenAt": _normalize_text((raw_attrs or {}).get("last_seen_at")) or last_seen,
+                },
             },
         )
         return response_payload
@@ -10261,12 +12548,15 @@ async def debug_entities_profile(
         )
 
         facts_limit = max(1, min(int(request.factsLimit or 6), 10))
-        raw_fact_rows = await graphiti_client.search_facts(
+        # GRAPHITI_REPLACED: search_facts (debug fact retrieval)
+        # TEMPORARY_DEGRADED_REPLACEMENT: debug endpoint intentionally includes derived continuity rows.
+        raw_fact_rows = await _pg_search_facts(
             tenant_id=tenant_id,
             user_id=user_id,
             query=canonical_name,
             limit=max(facts_limit * 3, 12),
             reference_time=reference_time,
+            include_derived=True,
         )
         entity_terms = _query_terms(canonical_name)
         kept_facts: List[Dict[str, Any]] = []
@@ -10290,7 +12580,16 @@ async def debug_entities_profile(
                 dropped_facts.append({"text": text, "reason": "duplicate"})
                 continue
             seen.add(key)
-            kept_facts.append({"text": text, "relevance": row.get("relevance")})
+            kept_facts.append(
+                {
+                    "text": text,
+                    "relevance": row.get("relevance"),
+                    "source_type": row.get("source_type"),
+                    "derived": row.get("derived"),
+                    "evidence_backed": row.get("evidence_backed"),
+                    "data_classification": row.get("data_classification"),
+                }
+            )
             if len(kept_facts) >= facts_limit:
                 break
 
@@ -10362,6 +12661,7 @@ async def purge_user(
     tables = [
         "session_buffer",
         "session_transcript",
+        "episodic_memory_embeddings",
         "graphiti_outbox",
         "loops",
         "identity_cache",
@@ -10443,6 +12743,10 @@ async def ingest_session(request: SessionIngestRequest):
             ended_at = request.messages[-1].timestamp
 
         messages_payload = [m.model_dump() for m in request.messages]
+        valid_messages = [
+            m for m in messages_payload
+            if _normalize_text(m.get("text")) and _normalize_text(m.get("role"))
+        ]
         await session.enqueue_session_ingest(
             tenant_id=request.tenantId,
             session_id=request.sessionId,
@@ -10453,7 +12757,7 @@ async def ingest_session(request: SessionIngestRequest):
         )
 
         return SessionIngestResponse(
-            status="ingested",
+            status="ingested" if valid_messages else "skipped_empty_transcript",
             sessionId=request.sessionId,
             graphitiAdded=False
         )
@@ -10549,9 +12853,11 @@ async def debug_user(
             last_interaction = await session.get_last_interaction_time(tenantId, session_id)
         entities = []
         try:
-            entities = await graphiti_client.search_nodes(
-                tenantId,
-                userId,
+            # GRAPHITI_REPLACED: search_nodes (debug top entities)
+            # TEMPORARY_DEGRADED_REPLACEMENT: debug top entities are continuity-node projections.
+            entities = await _pg_search_nodes(
+                tenant_id=tenantId,
+                user_id=userId,
                 query="top entities",
                 limit=5,
                 reference_time=datetime.utcnow()
@@ -10708,6 +13014,16 @@ async def debug_session_ingest_status(
             user_id,
             session_id
         )
+        transcript_message_count = int((transcript_row or {}).get("message_count") or 0)
+        graph_episode_status = "not_enqueued"
+        if transcript_message_count <= 0:
+            graph_episode_status = "skipped_empty_transcript"
+        elif any((row.get("job_type") or "").lower() == "session_raw_episode" for row in items):
+            graph_episode_status = "enqueued"
+            if any((row.get("job_type") or "").lower() == "session_raw_episode" and (row.get("status") or "") == "sent" for row in items):
+                graph_episode_status = "sent"
+            elif any((row.get("job_type") or "").lower() == "session_raw_episode" and (row.get("status") or "") == "failed" for row in items):
+                graph_episode_status = "failed"
         return {
             "tenant_id": tenant_id,
             "user_id": user_id,
@@ -10715,8 +13031,9 @@ async def debug_session_ingest_status(
             "transcript": {
                 "exists": bool(transcript_row),
                 "updated_at": transcript_row.get("updated_at") if transcript_row else None,
-                "message_count": int((transcript_row or {}).get("message_count") or 0),
+                "message_count": transcript_message_count,
             },
+            "graph_episode_status": graph_episode_status,
             "jobs": items,
             "last_success": [
                 {
@@ -10910,7 +13227,9 @@ async def debug_graphiti_episodes(
 ):
     _require_internal_token(x_internal_token)
     try:
-        episodes = await graphiti_client.get_recent_episodes(
+        # GRAPHITI_REPLACED: get_recent_episodes (debug episodic list)
+        # TEMPORARY_DEGRADED_REPLACEMENT: episodic debug output includes derived summaries plus transcript evidence.
+        episodes = await _pg_get_recent_episodes(
             tenant_id=tenantId,
             user_id=userId,
             since=None,
@@ -10924,7 +13243,11 @@ async def debug_graphiti_episodes(
                     "summary": episode.get("summary") or episode.get("episode_summary"),
                     "reference_time": episode.get("reference_time") or episode.get("created_at"),
                     "content": episode.get("episode_body") or episode.get("content") or episode.get("text"),
-                    "uuid": episode.get("uuid")
+                    "uuid": episode.get("uuid"),
+                    "source_type": episode.get("source_type"),
+                    "derived": episode.get("derived"),
+                    "evidence_backed": episode.get("evidence_backed"),
+                    "data_classification": episode.get("data_classification"),
                 })
             else:
                 results.append({
@@ -10932,7 +13255,11 @@ async def debug_graphiti_episodes(
                     "summary": getattr(episode, "summary", None) or getattr(episode, "episode_summary", None),
                     "reference_time": getattr(episode, "reference_time", None) or getattr(episode, "created_at", None),
                     "content": getattr(episode, "episode_body", None) or getattr(episode, "content", None),
-                    "uuid": str(getattr(episode, "uuid", None)) if getattr(episode, "uuid", None) else None
+                    "uuid": str(getattr(episode, "uuid", None)) if getattr(episode, "uuid", None) else None,
+                    "source_type": getattr(episode, "source_type", None),
+                    "derived": getattr(episode, "derived", None),
+                    "evidence_backed": getattr(episode, "evidence_backed", None),
+                    "data_classification": getattr(episode, "data_classification", None),
                 })
         return {"count": len(results), "episodes": results}
     except Exception as e:
@@ -11171,14 +13498,19 @@ async def debug_graphiti_query(
                 value = value.replace("Z", "+00:00")
             reference_time = datetime.fromisoformat(value)
 
-        facts = await graphiti_client.search_facts(
+        # GRAPHITI_REPLACED: search_facts (debug query facts)
+        # TEMPORARY_DEGRADED_REPLACEMENT: debug query path intentionally returns derived continuity rows.
+        facts = await _pg_search_facts(
             tenant_id=request.tenantId,
             user_id=request.userId,
             query=request.query,
             limit=request.limit or 10,
-            reference_time=reference_time
+            reference_time=reference_time,
+            include_derived=True,
         )
-        entities = await graphiti_client.search_nodes(
+        # GRAPHITI_REPLACED: search_nodes (debug query entities)
+        # TEMPORARY_DEGRADED_REPLACEMENT: debug entities are continuity nodes, not canonical factual entities.
+        entities = await _pg_search_nodes(
             tenant_id=request.tenantId,
             user_id=request.userId,
             query=request.query,
@@ -11795,6 +14127,30 @@ async def debug_graphiti_session_summaries_lookup(
     except Exception as e:
         logger.error(f"Debug graphiti session_summaries_lookup failed: {e}")
         raise HTTPException(status_code=500, detail="Debug graphiti session_summaries_lookup failed")
+
+
+@app.get("/session/handover")
+async def session_handover(
+    user_id: Optional[str] = Query(default=None),
+    userId: Optional[str] = Query(default=None),
+):
+    effective_user_id = _normalize_text(user_id) or _normalize_text(userId)
+    if not effective_user_id:
+        raise HTTPException(status_code=400, detail="user_id (or userId) is required")
+    try:
+        return await _build_handover_packet(effective_user_id)
+    except Exception as e:
+        logger.error(f"session handover failed user=%s err=%s", effective_user_id, e)
+        raise HTTPException(status_code=500, detail="session handover failed")
+
+
+@app.post("/memory/search")
+async def memory_search(payload: Dict[str, Any]):
+    # T1 containment: legacy mixed-authority retrieval contract disabled.
+    raise HTTPException(
+        status_code=410,
+        detail="Deprecated endpoint: /memory/search is disabled. Use /memory/query episodic mode.",
+    )
 
 
 if __name__ == "__main__":
