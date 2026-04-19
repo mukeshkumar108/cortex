@@ -85,6 +85,8 @@ class Settings(BaseSettings):
     daily_analysis_prompt_char_budget: int = 7000
     daily_analysis_low_confidence_threshold: float = 0.6
     session_bridge_ttl_minutes: int = 30
+    v2_dual_write_enabled: bool = False
+    v2_dual_write_fail_open: bool = True
 
     # Identity cache
     identity_cache_ttl_hours: int = 6

@@ -113,16 +113,17 @@ Evidence is canonical ground truth; must be established before extraction/resolu
 T2, T5.
 
 ### 4. Current status
-Partial (legacy transcript/buffer path exists, not v2 dual-write).
+Done (feature-flagged dual-write to v2 evidence surfaces).
 
 ### 5. Gaps
-- No explicit dual-write to v2 canonical surfaces.
-- Idempotency not standardized on v2 ingest key contract.
+- T3b contract hardening (strict UTC/role/state validation and structured reject codes) remains pending.
+- T4 extraction pipeline integration and parity telemetry thresholds remain pending.
 
 ### 6. Acceptance criteria
-- Dual-write enabled by flag; parity metrics by tenant/session exceed threshold.
-- Idempotency test: duplicate ingest does not create duplicate turns.
-- Evidence writes remain append-only.
+- Dual-write enabled by flag for ingest/session-ingest paths (`v2_dual_write_enabled`). ✅
+- Idempotency test: duplicate ingest does not create duplicate turns in `turns_v2`. ✅
+- Evidence writes remain append-only in v2 (`turns_v2` inserts only; idempotency via `turn_ingest_idempotency`). ✅
+- Legacy ingest behavior preserved while dual-write is active. ✅
 
 ### 7. Risks
 - Divergence between legacy and v2 evidence stores.
@@ -131,7 +132,8 @@ Partial (legacy transcript/buffer path exists, not v2 dual-write).
 ### 8. Files/functions likely affected
 - `src/ingestion.py`
 - `src/session.py`
-- `src/main.py` (`/ingest`, `/session/ingest`)
+- `src/config.py`
+- `tests/test_v2_dual_write_ingest.py`
 
 ---
 
@@ -146,18 +148,17 @@ Canonical evidence quality determines all downstream correctness. If evidence is
 T2, T0.
 
 ### 4. Current status
-Not implemented.
+Done (deterministic evidence contract enforced on v2 ingest writes).
 
 ### 5. Gaps
-- No explicit v2 ingest contract enforcement for UTC normalization, monotonic turn ordering, and session state consistency.
-- Legacy permissive ingest paths allow structurally inconsistent payloads.
+- T3b contract is enforced for v2 ingest/session-ingest runtime paths; broader legacy endpoint contract cleanup remains part of later deprecation scope (T15).
 
 ### 6. Acceptance criteria
-- All ingested timestamps normalized to UTC.
-- `turn_id` strictly monotonic per `(tenant_id, user_id, session_id)`.
-- Role enum strictly enforced at ingest boundary.
-- Session open/close states are internally consistent and validated.
-- Invalid ingest payloads are rejected with structured error codes.
+- All ingested v2 timestamps are normalized to UTC. ✅
+- Monotonic turn ordering is deterministic per `(tenant_id, user_id, session_id)` and out-of-order inserts are normalized deterministically. ✅
+- Role/text/timestamp malformed turns are rejected fail-closed. ✅
+- Session/user integrity mismatches are rejected to prevent cross-user/session contamination. ✅
+- Invalid ingest payloads are rejected with structured error codes (`EVIDENCE_*`). ✅
 
 ### 7. Risks
 - Existing traffic may trigger ingestion rejects due to latent data quality issues.
@@ -166,9 +167,8 @@ Not implemented.
 ### 8. Files/functions likely affected
 - `src/ingestion.py`
 - `src/session.py`
-- `src/models.py` (ingest request validation)
 - `src/main.py` (`/ingest`, `/session/ingest`)
-- new validation helpers in `src/`
+- `tests/test_v2_dual_write_ingest.py`
 
 ---
 
@@ -711,8 +711,8 @@ Can run independently once dependencies are met:
 - Documentation alignment portions of **T15** can start early, but destructive cleanup must wait.
 
 ## Immediate Next 3 Tickets
-1. **T3** — Dual-write evidence ingest to v2 surfaces.
-2. **T3b** — Evidence contract hardening.
-3. **T4** — Durable extraction-results pipeline.
+1. **T4** — Durable extraction-results pipeline.
+2. **T4b** — Quarantine pipeline for low-confidence/weakly grounded candidates.
+3. **T6** — Entity resolution v2.
 
-Rationale: T5 policy-version guardrails are now in place. Next blocking work is v2 evidence ingest and contract hardening (T3/T3b), then durable extraction outputs (T4).
+Rationale: T3/T3b evidence substrate and contract hardening are now in place. Next blocking work is durable extraction outputs and quarantine gating (T4/T4b), then entity/claim resolution contracts.

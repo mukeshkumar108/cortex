@@ -12,13 +12,14 @@ Rolling summary is a compressor, not a memory:
 - Graphiti receives raw turns for full-fidelity long-term storage
 """
 
-from typing import Dict, Any, List, Optional, Set, Callable, Awaitable
+from typing import Dict, Any, List, Optional, Set, Callable, Awaitable, Tuple
 from datetime import datetime, timedelta, date
 import inspect
 import json
 import logging
 import asyncio
 import re
+from datetime import timezone as dt_timezone
 from .db import Database
 from .models import Message
 from .config import get_settings
@@ -49,6 +50,13 @@ SESSION_INGEST_HOOK_MAX_MESSAGES = 200
 SESSION_INGEST_HOOK_MAX_CHARS = 60000
 
 
+class EvidenceContractError(ValueError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 class SessionManager:
     _SUMMARY_MAX_WORDS = 35
     _TONE_MAX_WORDS = 12
@@ -61,6 +69,245 @@ class SessionManager:
         self.db = db
         self.settings = get_settings()
         self.llm_client = get_llm_client()
+
+    @staticmethod
+    def _normalize_v2_timestamp(value: Any) -> datetime:
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            raw = str(value or "").strip()
+            if not raw:
+                parsed = datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+            else:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt_timezone.utc)
+        return parsed.astimezone(dt_timezone.utc)
+
+    @classmethod
+    def _validate_turn_contract(
+        cls,
+        *,
+        role: Any,
+        text: Any,
+        timestamp: Any,
+    ) -> Tuple[str, str, datetime]:
+        normalized_role = str(role or "").strip().lower()
+        if normalized_role not in {"system", "user", "assistant", "tool"}:
+            raise EvidenceContractError(
+                "EVIDENCE_INVALID_ROLE",
+                f"invalid role '{role}'",
+            )
+        normalized_text = str(text or "")
+        if not normalized_text.strip():
+            raise EvidenceContractError(
+                "EVIDENCE_EMPTY_TEXT",
+                "turn text must be non-empty",
+            )
+        try:
+            normalized_ts = cls._normalize_v2_timestamp(timestamp)
+        except Exception:
+            raise EvidenceContractError(
+                "EVIDENCE_INVALID_TIMESTAMP",
+                f"invalid timestamp '{timestamp}'",
+            )
+        return normalized_role, normalized_text, normalized_ts
+
+    @staticmethod
+    def _build_turn_idempotency_key(
+        *,
+        tenant_id: str,
+        user_id: str,
+        session_id: str,
+        role: str,
+        text: str,
+        timestamp: str,
+        source: str,
+        source_turn_id: Optional[str] = None,
+    ) -> str:
+        source_turn_normalized = str(source_turn_id or "").strip()
+        if source_turn_normalized:
+            return f"{source}:source_turn:{source_turn_normalized}"
+        digest = stable_short_hash(
+            {
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "session_id": session_id,
+                "role": role,
+                "text": text,
+                "timestamp": timestamp,
+                "source": source,
+            },
+            version="v2-turn-idempotency-v1",
+            length=40,
+        )
+        return f"{source}:payload:{digest}"
+
+    async def _dual_write_turn_v2(
+        self,
+        *,
+        conn: Any,
+        tenant_id: str,
+        user_id: str,
+        session_id: str,
+        role: str,
+        text: str,
+        timestamp: str,
+        source: str,
+        source_turn_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        started_at: Optional[Any] = None,
+        ended_at: Optional[Any] = None,
+    ) -> Optional[int]:
+        occurred_at = self._normalize_v2_timestamp(timestamp)
+        normalized_role, normalized_text, occurred_at = self._validate_turn_contract(
+            role=role,
+            text=text,
+            timestamp=occurred_at,
+        )
+        started_ts = self._normalize_v2_timestamp(started_at or occurred_at)
+        ended_ts = self._normalize_v2_timestamp(ended_at or occurred_at)
+        payload = dict(metadata) if isinstance(metadata, dict) else {}
+        idempotency_key = self._build_turn_idempotency_key(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            role=normalized_role,
+            text=normalized_text,
+            timestamp=occurred_at.isoformat(),
+            source=source,
+            source_turn_id=source_turn_id,
+        )
+
+        await conn.execute(
+            """
+            INSERT INTO sessions_v2 (
+                tenant_id, session_id, user_id, started_at, ended_at, status, source, metadata, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, 'open', $6, $7::jsonb, NOW())
+            ON CONFLICT (tenant_id, session_id)
+            DO UPDATE SET
+                started_at = CASE
+                    WHEN sessions_v2.started_at IS NULL THEN EXCLUDED.started_at
+                    WHEN EXCLUDED.started_at IS NULL THEN sessions_v2.started_at
+                    ELSE LEAST(sessions_v2.started_at, EXCLUDED.started_at)
+                END,
+                ended_at = CASE
+                    WHEN sessions_v2.ended_at IS NULL THEN EXCLUDED.ended_at
+                    WHEN EXCLUDED.ended_at IS NULL THEN sessions_v2.ended_at
+                    ELSE GREATEST(sessions_v2.ended_at, EXCLUDED.ended_at)
+                END,
+                status = CASE
+                    WHEN sessions_v2.status = 'archived' THEN sessions_v2.status
+                    ELSE 'open'
+                END,
+                source = COALESCE(sessions_v2.source, EXCLUDED.source),
+                metadata = COALESCE(sessions_v2.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+                updated_at = NOW()
+            WHERE sessions_v2.user_id = EXCLUDED.user_id
+            """,
+            tenant_id,
+            session_id,
+            user_id,
+            started_ts,
+            ended_ts,
+            source,
+            payload,
+        )
+
+        session_row = await conn.fetchrow(
+            """
+            SELECT user_id
+            FROM sessions_v2
+            WHERE tenant_id = $1 AND session_id = $2
+            FOR UPDATE
+            """,
+            tenant_id,
+            session_id,
+        )
+        if not session_row or str(session_row.get("user_id") or "") != user_id:
+            raise TypeError(
+                f"v2 dual-write session owner mismatch tenant={tenant_id} session={session_id} user={user_id}"
+            )
+
+        existing_turn_id = await conn.fetchval(
+            """
+            SELECT turn_id
+            FROM turn_ingest_idempotency
+            WHERE tenant_id = $1
+              AND user_id = $2
+              AND session_id = $3
+              AND idempotency_key = $4
+            LIMIT 1
+            """,
+            tenant_id,
+            user_id,
+            session_id,
+            idempotency_key,
+        )
+        if existing_turn_id is not None:
+            return int(existing_turn_id)
+
+        latest_turn = await conn.fetchrow(
+            """
+            SELECT turn_index, occurred_at
+            FROM turns_v2
+            WHERE tenant_id = $1
+              AND session_id = $2
+            ORDER BY turn_index DESC
+            LIMIT 1
+            """,
+            tenant_id,
+            session_id,
+        )
+        last_turn_index = (
+            int(latest_turn["turn_index"])
+            if latest_turn is not None and latest_turn["turn_index"] is not None
+            else -1
+        )
+        next_turn_index = last_turn_index + 1
+        last_occurred_at = latest_turn["occurred_at"] if latest_turn is not None else None
+        if isinstance(last_occurred_at, datetime):
+            if last_occurred_at.tzinfo is None:
+                last_occurred_at = last_occurred_at.replace(tzinfo=dt_timezone.utc)
+            if occurred_at <= last_occurred_at:
+                occurred_at = last_occurred_at + timedelta(microseconds=1)
+                payload["timestamp_normalized_from_out_of_order"] = True
+
+        inserted_turn_id = await conn.fetchval(
+            """
+            INSERT INTO turns_v2 (
+                tenant_id, session_id, user_id, turn_index, role, content, occurred_at, source_turn_id, metadata
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+            RETURNING turn_id
+            """,
+            tenant_id,
+            session_id,
+            user_id,
+            int(next_turn_index or 0),
+            normalized_role,
+            normalized_text,
+            occurred_at,
+            source_turn_id,
+            payload,
+        )
+        await conn.execute(
+            """
+            INSERT INTO turn_ingest_idempotency (
+                tenant_id, user_id, session_id, idempotency_key, turn_id, source, metadata
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+            """,
+            tenant_id,
+            user_id,
+            session_id,
+            idempotency_key,
+            inserted_turn_id,
+            source,
+            payload,
+        )
+        return int(inserted_turn_id)
 
     async def get_or_create_buffer(
         self,
@@ -121,7 +368,9 @@ class SessionManager:
         user_id: str,
         role: str,
         text: str,
-        timestamp: str
+        timestamp: str,
+        source_turn_id: Optional[str] = None,
+        v2_metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Add a turn to the buffer. Returns oldest_turn if buffer exceeds MAX_BUFFER_SIZE.
@@ -130,10 +379,15 @@ class SessionManager:
         """
         try:
             pool = await self.db.get_pool()
+            normalized_role, normalized_text, normalized_ts = self._validate_turn_contract(
+                role=role,
+                text=text,
+                timestamp=timestamp,
+            )
             new_turn = {
-                "role": role,
-                "text": text,
-                "timestamp": timestamp
+                "role": normalized_role,
+                "text": normalized_text,
+                "timestamp": normalized_ts.isoformat().replace("+00:00", "Z"),
             }
 
             async with pool.acquire() as conn:
@@ -174,6 +428,11 @@ class SessionManager:
                             tenant_id,
                             session_id
                         )
+                    elif str(row.get("user_id") or "") != user_id:
+                        raise EvidenceContractError(
+                            "EVIDENCE_SESSION_USER_MISMATCH",
+                            f"session user mismatch for session_id={session_id}",
+                        )
 
                     messages = row["messages"] or []
                     if isinstance(messages, str):
@@ -210,7 +469,11 @@ class SessionManager:
                             f"evicted oldest turn to outbox"
                         )
 
-                    last_user_ts = timestamp if role == "user" else None
+                    last_user_ts = (
+                        normalized_ts.isoformat().replace("+00:00", "Z")
+                        if normalized_role == "user"
+                        else None
+                    )
                     await conn.execute(
                         """
                         UPDATE session_buffer
@@ -235,6 +498,32 @@ class SessionManager:
                         session_id,
                         last_user_ts
                     )
+
+                    if bool(self.settings.v2_dual_write_enabled):
+                        try:
+                            await self._dual_write_turn_v2(
+                                conn=conn,
+                                tenant_id=tenant_id,
+                                user_id=user_id,
+                                session_id=session_id,
+                                role=normalized_role,
+                                text=normalized_text,
+                                timestamp=normalized_ts.isoformat(),
+                                source="ingest_v1",
+                                source_turn_id=source_turn_id,
+                                metadata=v2_metadata,
+                            )
+                        except Exception as e:
+                            if bool(self.settings.v2_dual_write_fail_open):
+                                logger.error(
+                                    "v2 dual-write failed open during add_turn tenant=%s user=%s session=%s err=%s",
+                                    tenant_id,
+                                    user_id,
+                                    session_id,
+                                    e,
+                                )
+                            else:
+                                raise
 
                     return oldest_turn
 
@@ -315,6 +604,27 @@ class SessionManager:
         ended_at: Optional[str],
     ) -> None:
         messages_payload = messages or []
+        normalized_messages: List[Dict[str, Any]] = []
+        for idx, msg in enumerate(messages_payload):
+            if not isinstance(msg, dict):
+                raise EvidenceContractError(
+                    "EVIDENCE_MALFORMED_TURN",
+                    f"message[{idx}] is not an object",
+                )
+            role, text, ts = self._validate_turn_contract(
+                role=msg.get("role"),
+                text=msg.get("text"),
+                timestamp=msg.get("timestamp"),
+            )
+            normalized_messages.append(
+                {
+                    **msg,
+                    "role": role,
+                    "text": text,
+                    "timestamp": ts.isoformat().replace("+00:00", "Z"),
+                }
+            )
+        messages_payload = normalized_messages
         valid_messages = [
             m for m in messages_payload
             if isinstance(m, dict)
@@ -340,18 +650,78 @@ class SessionManager:
         pool = await self.db.get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
+                existing_session = await conn.fetchrow(
+                    """
+                    SELECT user_id
+                    FROM session_transcript
+                    WHERE tenant_id = $1 AND session_id = $2
+                    FOR UPDATE
+                    """,
+                    tenant_id,
+                    session_id,
+                )
+                if existing_session and str(existing_session.get("user_id") or "") != user_id:
+                    raise EvidenceContractError(
+                        "EVIDENCE_SESSION_USER_MISMATCH",
+                        f"session transcript user mismatch for session_id={session_id}",
+                    )
                 await conn.execute(
                     """
                     INSERT INTO session_transcript (tenant_id, session_id, user_id, messages, updated_at)
                     VALUES ($1, $2, $3, $4::jsonb, NOW())
                     ON CONFLICT (tenant_id, session_id)
-                    DO UPDATE SET messages = $4::jsonb, updated_at = NOW(), user_id = EXCLUDED.user_id
+                    DO UPDATE SET messages = $4::jsonb, updated_at = NOW()
                     """,
                     tenant_id,
                     session_id,
                     user_id,
                     messages_payload
                 )
+                if bool(self.settings.v2_dual_write_enabled):
+                    started_ts = self._parse_ts(started_at)
+                    ended_ts = self._parse_ts(ended_at)
+                    for idx, msg in enumerate(messages_payload):
+                        if not isinstance(msg, dict):
+                            continue
+                        msg_role = str((msg.get("role") or "")).strip()
+                        msg_text = str((msg.get("text") or "")).strip()
+                        msg_ts_raw = msg.get("timestamp")
+                        msg_ts = (
+                            msg_ts_raw
+                            if str(msg_ts_raw or "").strip()
+                            else ((started_ts or ended_ts or reference_time).isoformat())
+                        )
+                        if not msg_role or not msg_text:
+                            continue
+                        msg_source_turn_id = str((msg.get("id") or msg.get("sourceTurnId") or "")).strip() or None
+                        dual_metadata = {"path": "session_ingest", "message_index": idx}
+                        try:
+                            await self._dual_write_turn_v2(
+                                conn=conn,
+                                tenant_id=tenant_id,
+                                user_id=user_id,
+                                session_id=session_id,
+                                role=msg_role,
+                                text=msg_text,
+                                timestamp=msg_ts,
+                                source="session_ingest_v1",
+                                source_turn_id=msg_source_turn_id,
+                                metadata=dual_metadata,
+                                started_at=started_ts,
+                                ended_at=ended_ts or reference_time,
+                            )
+                        except Exception as e:
+                            if bool(self.settings.v2_dual_write_fail_open):
+                                logger.error(
+                                    "v2 dual-write failed open during session_ingest tenant=%s user=%s session=%s idx=%s err=%s",
+                                    tenant_id,
+                                    user_id,
+                                    session_id,
+                                    idx,
+                                    e,
+                                )
+                            else:
+                                raise
                 if not valid_messages:
                     logger.warning(
                         "Skipping session_raw_episode enqueue for empty transcript tenant=%s user=%s session=%s",
@@ -2789,12 +3159,23 @@ async def add_turn(
     user_id: str,
     role: str,
     text: str,
-    timestamp: str
+    timestamp: str,
+    source_turn_id: Optional[str] = None,
+    v2_metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Add turn to buffer, returns oldest_turn if evicted"""
     if _manager is None:
         raise RuntimeError("SessionManager not initialized")
-    return await _manager.add_turn(tenant_id, session_id, user_id, role, text, timestamp)
+    return await _manager.add_turn(
+        tenant_id,
+        session_id,
+        user_id,
+        role,
+        text,
+        timestamp,
+        source_turn_id=source_turn_id,
+        v2_metadata=v2_metadata,
+    )
 
 
 async def enqueue_session_ingest(

@@ -29,6 +29,72 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-19 17:18 UTC — T3b
+- Summary of what changed:
+  - Hardened v2 evidence ingest contract with fail-closed validation for role, non-empty text, and parseable timestamps.
+  - Enforced deterministic per-session turn ordering in dual-write path by serializing writes on session row lock and assigning monotonic `turn_index`.
+  - Added deterministic normalization for out-of-order timestamps (later insert with earlier timestamp is normalized forward by microsecond, audit flag in turn metadata).
+  - Added UTC timestamp normalization for v2 evidence writes.
+  - Added session/user integrity guards to reject cross-user contamination on `session_buffer`/`session_transcript` and v2 session ownership mismatches.
+  - Added structured ingest rejection codes via `EVIDENCE_*` errors on `/ingest` and `/session/ingest`.
+- Files changed:
+  - `src/session.py`
+  - `src/ingestion.py`
+  - `src/main.py`
+  - `tests/test_v2_dual_write_ingest.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+- Tests added/updated:
+  - `tests/test_v2_dual_write_ingest.py`:
+    - out-of-order insert normalization and deterministic monotonic ordering
+    - malformed turn rejection with structured error code
+    - UTC timestamp normalization assertion
+    - duplicate ingest idempotency regression
+    - v2 row creation and legacy-path preservation regressions
+  - Regression runs:
+    - `tests/test_session_ingest.py::test_session_ingest_enqueues_raw_job_and_transcript`
+    - `tests/test_session_ingest.py::test_session_ingest_dedupe_key_idempotent`
+    - `tests/test_session_lifecycle.py::test_ingest_without_session_id_autocreates`
+- Acceptance criteria satisfied:
+  - Deterministic evidence contract for v2 ingest writes is enforced.
+  - Malformed evidence payloads are rejected fail-closed with structured error codes.
+  - Duplicate ingest does not produce duplicate v2 turns.
+  - Timestamp handling is normalized and consistent for v2 rows.
+- Known remaining gaps:
+  - T3b scope is confined to evidence ingest contract; extraction/claim/retrieval flows remain unchanged by design.
+- Status: done
+
+### 2026-04-19 16:54 UTC — T3
+- Summary of what changed:
+  - Implemented feature-flagged v2 evidence dual-write on `/ingest` and `/session/ingest` paths while preserving legacy writes.
+  - Added canonical evidence writer in session manager that upserts `sessions_v2` and append-only inserts `turns_v2`.
+  - Wired idempotency through `turn_ingest_idempotency` for both incremental ingest (`ingest_v1`) and session transcript ingest (`session_ingest_v1`).
+  - Preserved legacy behavior (`session_buffer`, `session_transcript`, outbox/session hooks) with no retrieval/synthesis path changes.
+  - Added dual-write flags in config: `v2_dual_write_enabled`, `v2_dual_write_fail_open`.
+- Files changed:
+  - `src/session.py`
+  - `src/ingestion.py`
+  - `src/config.py`
+  - `tests/test_v2_dual_write_ingest.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+- Tests added/updated:
+  - `tests/test_v2_dual_write_ingest.py`:
+    - duplicate `/ingest` payload does not duplicate `turns_v2`
+    - `/session/ingest` dual-write creates expected `sessions_v2` + `turns_v2` rows
+    - legacy `/ingest` path still writes expected `session_buffer` rows
+  - Regression runs:
+    - `tests/test_session_ingest.py::test_session_ingest_enqueues_raw_job_and_transcript`
+    - `tests/test_session_ingest.py::test_session_ingest_dedupe_key_idempotent`
+    - `tests/test_session_lifecycle.py::test_ingest_without_session_id_autocreates`
+    - `tests/test_schema_migration.py::test_t2_v2_constraints_and_indexes`
+- Acceptance criteria satisfied:
+  - Dual-write is implemented behind a feature flag for ingest/session evidence surfaces.
+  - Duplicate ingest idempotency is enforced for v2 turn writes.
+  - v2 evidence writes remain append-only for `turns_v2`; legacy ingest behavior remains intact.
+- Known remaining gaps:
+  - T3 parity metrics/threshold instrumentation is not yet implemented.
+  - T3b evidence contract hardening (strict UTC/ordering/state reject semantics) is not yet implemented.
+- Status: done
+
 ### 2026-04-19 16:48 UTC — T5_CHECKPOINT_VALIDATION
 - Summary of what changed:
   - Ran post-ticket checkpoint validation for T5 migration/service/test/runtime surfaces.

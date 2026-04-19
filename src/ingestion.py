@@ -18,6 +18,7 @@ from fastapi import BackgroundTasks
 from .models import IngestRequest, IngestResponse
 from .graphiti_client import GraphitiClient
 from . import session
+from .session import EvidenceContractError
 from .utils import is_noise
 
 logger = logging.getLogger(__name__)
@@ -67,7 +68,12 @@ async def ingest(
             user_id=request.userId,
             role=request.role,
             text=request.text,
-            timestamp=request.timestamp
+            timestamp=request.timestamp,
+            source_turn_id=(
+                str((request.metadata or {}).get("sourceTurnId") or (request.metadata or {}).get("turnId") or "").strip()
+                or None
+            ),
+            v2_metadata={"path": "ingest"},
         )
 
         # 3. IF BUFFER EXCEEDED, TRIGGER JANITOR (background, gated)
@@ -124,6 +130,8 @@ async def ingest(
             graphitiAdded=False
         )
 
+    except EvidenceContractError:
+        raise
     except Exception as e:
         logger.error(f"Ingestion failed: {e}")
         return IngestResponse(

@@ -51,6 +51,7 @@ from .graphiti_client import GraphitiClient
 from . import session
 from . import loops
 from .ingestion import ingest as process_ingest
+from .session import EvidenceContractError
 from .briefing import build_briefing
 from .migrate import run_migrations
 from .openrouter_client import get_llm_client
@@ -10472,6 +10473,11 @@ async def ingest(request: IngestRequest, background_tasks: BackgroundTasks):
         response = await process_ingest(request, graphiti_client, background_tasks)
         return response
 
+    except EvidenceContractError as e:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": e.code, "message": e.message},
+        )
     except Exception as e:
         logger.error(f"Ingest endpoint error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -12767,6 +12773,11 @@ async def ingest_session(request: SessionIngestRequest):
             status="ingested" if valid_messages else "skipped_empty_transcript",
             sessionId=request.sessionId,
             graphitiAdded=False
+        )
+    except EvidenceContractError as e:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": e.code, "message": e.message},
         )
     except Exception as e:
         logger.error(f"Session ingest failed: {e}")
