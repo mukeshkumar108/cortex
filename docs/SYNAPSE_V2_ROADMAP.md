@@ -249,25 +249,26 @@ Claim lifecycle correctness depends on explicit policy; replay requires version 
 T2, T0.
 
 ### 4. Current status
-Not implemented.
+Done (policy service + versioned lookup/fail-closed semantics).
 
 ### 5. Gaps
-- No explicit predicate policy table/service currently enforced.
-- No version pinning on extraction/resolution runs.
+- Extraction/resolver runtime integration is deferred to T4/T7 implementation work; T5 provides the enforceable lookup substrate and failure semantics.
 
 ### 6. Acceptance criteria
-- Predicate policy persisted and versioned.
-- Extraction and resolver reject runs without policy version.
-- Policy-change compatibility tests pass for replay.
+- Predicate policy persisted and versioned. ✅
+- Runtime service enforces fail-closed policy lookup for unknown predicate/version. ✅
+- Current version + explicit version request contract is implemented for downstream callers. ✅
+- Tests cover known predicate lookup, unknown predicate failure, unknown version failure, and versioned behavior lookup. ✅
 
 ### 7. Risks
 - Policy drift invalidates historical replay.
 - Incorrect cardinality config causes truth conflicts.
 
 ### 8. Files/functions likely affected
-- new policy module in `src/`
-- resolver/extraction job contracts
-- migrations for policy tables
+- `src/predicate_policy.py`
+- `migrations/037_predicate_policy_service_bootstrap.sql`
+- `schema.sql`
+- `tests/test_predicate_policy.py`
 
 ---
 
@@ -370,9 +371,9 @@ Not implemented in v2 canonical form.
 
 ---
 
-## T9 — Projection Builders v2
+## T9a — Re-anchor Existing Synthesis to Canonical Layer
 ### 1. Description
-Build derived projections from canonical state only, versioned and disposable.
+Re-anchor existing synthesis outputs onto canonical v2 inputs so derived projections are built from canonical state only, versioned, and disposable.
 
 ### 2. Why it exists
 Continuity data is necessary but must never become authority.
@@ -391,6 +392,9 @@ Legacy projection systems exist; v2 projection contract not implemented.
 - Projections include source watermarks and version.
 - Rebuild-from-canonical produces same projection for same watermark.
 - No projection table is queried for factual lane.
+- Existing identity/living/thread/handover synthesis behavior is preserved during re-anchoring.
+- No single-pass replacement of existing multi-pass synthesis is introduced.
+- Re-anchored outputs meet or exceed current baseline quality.
 
 ### 7. Risks
 - Stale projection serving continuity errors.
@@ -403,6 +407,40 @@ Legacy projection systems exist; v2 projection contract not implemented.
 
 ---
 
+## T9b — Optional Projection Rewrites (Only If Needed)
+### 1. Description
+Optional targeted projection/synthesis rewrites, only where re-anchoring cannot preserve quality or cannot operate correctly with canonical inputs.
+
+### 2. Why it exists
+Avoid unnecessary rewrites while allowing constrained intervention for proven quality or compatibility failures.
+
+### 3. Dependencies
+T9a, T12a.
+
+### 4. Current status
+Not started (deferred by default).
+
+### 5. Gaps
+- Rewrite scope, if any, is not yet justified by evidence.
+
+### 6. Acceptance criteria
+- Rewrite is explicitly justified by one of:
+  - measured quality degradation vs baseline, or
+  - demonstrated incompatibility with canonical inputs.
+- Before/after quality comparison is documented on the same golden set used in T12a.
+- Technical criteria from T9a remain satisfied (watermarks/versioning/factual-lane isolation).
+
+### 7. Risks
+- Unnecessary rewrites can degrade product continuity/tone quality.
+- Local improvements can regress broader synthesis behavior.
+
+### 8. Files/functions likely affected
+- constrained subsets of `src/main.py` synthesis/projection paths
+- selective synthesis modules only when justified
+- evaluation harness artifacts in `tests/fixtures/` and `scripts/`
+
+---
+
 ## T10 — `/v2/memory/query` Implementation
 ### 1. Description
 Implement single retrieval contract with strict lanes: factual, episodic, continuity, hybrid.
@@ -411,7 +449,7 @@ Implement single retrieval contract with strict lanes: factual, episodic, contin
 Current retrieval is monolithic and mixed-authority.
 
 ### 3. Dependencies
-T1, T7, T8, T9.
+T1, T7, T8, T9a.
 
 ### 4. Current status
 Not implemented.
@@ -486,6 +524,13 @@ Not implemented.
 ### 6. Acceptance criteria
 - Replay job can run from evidence snapshots and produce stable claim-state hash.
 - Diff reports include claim-level adds/removes/supersedes and evidence coverage deltas.
+- Golden test set exists and is versioned for offline quality evaluation.
+- Offline quality evaluation covers:
+  - identity quality
+  - living context quality
+  - thread quality
+  - handover usefulness
+- T12a reports include before/after quality comparison for these product-baseline dimensions.
 
 ### 7. Risks
 - Harness may diverge from production code path if not shared components.
@@ -516,6 +561,11 @@ Not implemented.
 - Shadow-read diff pipeline runs continuously for target tenants.
 - Dashboard tracks evidence coverage, divergence, latency, and contradiction rates.
 - Rollback thresholds wired to alerts.
+- Live quality monitoring tracks:
+  - continuity regressions
+  - tone/interaction regressions
+  - relationship-awareness degradation
+- Quality alerts are incorporated into rollout stop/rollback controls.
 
 ### 7. Risks
 - Diff noise if v1 and v2 contracts are not normalized before comparison.
@@ -535,7 +585,7 @@ Implement scheduled invariant checks and repair workflows for violations.
 Canonical memory correctness decays without continuous enforcement.
 
 ### 3. Dependencies
-T7, T8, T9.
+T7, T8, T9a.
 
 ### 4. Current status
 Partial legacy checks exist; v2 invariant framework not implemented.
@@ -575,11 +625,14 @@ Not implemented.
 
 ### 5. Gaps
 - No explicit cohort gating with lane-level SLO rollback automation.
+- No explicit hard quality-parity rollout gate is defined.
 
 ### 6. Acceptance criteria
 - Cohort progression plan enforced by feature flags.
 - Automatic rollback on predefined thresholds.
 - Post-rollback integrity checks run automatically.
+- Hard rollout gate: cohort progression cannot proceed unless synthesis quality parity is demonstrated against baseline dimensions (identity/living/thread/handover).
+- Rollback triggers include synthesis-quality regressions (not only technical/latency metrics).
 
 ### 7. Risks
 - Manual rollout decisions delay rollback and increase blast radius.
@@ -612,6 +665,7 @@ Not implemented.
 - Legacy mixed-authority retrieval logic removed from production path.
 - Deprecated endpoints disabled/removed with migration notice.
 - Docs (`schema.sql`, architecture/runbooks/contracts) aligned with v2.
+- Cleanup proceeds only after a 2–4 week soak period with no quality regressions.
 
 ### 7. Risks
 - Premature cleanup can remove fallback during unstable rollout.
@@ -639,7 +693,7 @@ Exact blocking sequence:
 10. **T7**
 11. **T8**
 12. **T12a**
-13. **T9**
+13. **T9a**
 14. **T10**
 15. **T11**
 16. **T12b**
@@ -652,12 +706,13 @@ Can run independently once dependencies are met:
 - **T2** and preparatory ops/dashboard scaffolding (non-serving).
 - **T5** in parallel with early schema work.
 - **T12a** can start once resolver contracts stabilize, before serve rollout.
-- Portions of **T13** (check framework scaffolding) can start during T9/T10.
+- Portions of **T13** (check framework scaffolding) can start during T9a/T10.
+- **T9b** is deferred by default and only activated if T12a evidence shows baseline-quality or compatibility failure.
 - Documentation alignment portions of **T15** can start early, but destructive cleanup must wait.
 
 ## Immediate Next 3 Tickets
-1. **T5** — Predicate policy service + versioning.
-2. **T3** — Dual-write evidence ingest to v2 surfaces.
-3. **T3b** — Evidence contract hardening.
+1. **T3** — Dual-write evidence ingest to v2 surfaces.
+2. **T3b** — Evidence contract hardening.
+3. **T4** — Durable extraction-results pipeline.
 
-Rationale: T2 schema substrate is now in place. Next blocking work is policy versioning guardrails (T5), then v2 evidence ingest and contract enforcement (T3/T3b).
+Rationale: T5 policy-version guardrails are now in place. Next blocking work is v2 evidence ingest and contract hardening (T3/T3b), then durable extraction outputs (T4).

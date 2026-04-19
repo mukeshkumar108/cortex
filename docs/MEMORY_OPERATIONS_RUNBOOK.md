@@ -9,6 +9,39 @@ Purpose: operator-facing runbook for running, validating, and recovering the mem
 - Env keys configured for OpenRouter/OpenAI
 - Migrations applied through SQL or startup runner
 
+## VPS DB Host Note
+
+- On this VPS shell, DNS name `postgres` may not resolve.
+- Use `localhost` for direct host-level migration/test commands.
+- Recommended `.env` setting:
+  - `DATABASE_URL=postgresql://synapse:<PASSWORD>@localhost:5432/synapse`
+
+## Migration and Schema Test Commands
+
+Run from repo root (`/opt/synapse`):
+
+```bash
+.venv/bin/python - <<'PY'
+import asyncio
+from src.db import Database
+from src.migrate import run_migrations
+
+async def main():
+    db = Database()
+    try:
+        await run_migrations(db)
+        print("migrations: success")
+    finally:
+        await db.close()
+
+asyncio.run(main())
+PY
+```
+
+```bash
+.venv/bin/python -m pytest -q tests/test_schema_migration.py
+```
+
 ## Standard Pipeline Sequence
 
 For a user:
@@ -86,4 +119,3 @@ SELECT * FROM pipeline_checkpoints WHERE user_id = '<USER_ID>' ORDER BY pipeline
 - Schema migrations are additive and idempotent.
 - Derived rows (`identity_profile`, `living_context`, open thread status changes) can be safely regenerated.
 - For severe corruption, snapshot + targeted delete of derived rows then re-run from pass outputs.
-

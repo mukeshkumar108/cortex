@@ -29,6 +29,55 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-19 16:48 UTC — T5_CHECKPOINT_VALIDATION
+- Summary of what changed:
+  - Ran post-ticket checkpoint validation for T5 migration/service/test/runtime surfaces.
+- Files changed:
+  - `docs/SYNAPSE_V2_CHANGELOG.md`
+- Tests added/updated:
+  - Executed `tests/test_predicate_policy.py` and `tests/test_schema_migration.py` (all passed in this environment).
+  - Executed app lifespan startup/shutdown smoke run; migration path completed.
+- Acceptance criteria satisfied:
+  - T5 lookup/fail-closed tests and migration presence are validated in local runtime context.
+- Known remaining gaps:
+  - No isolated disposable database was provisioned for from-scratch migration replay; validation used existing local DB context.
+  - No staging/production lock-impact validation for `ALTER TABLE ... SET NOT NULL`/constraint-add paths.
+  - Architecture-level requirement “extraction/resolution reject runs without policy version” remains deferred to T4/T7 integration.
+- Status: partially done
+
+### 2026-04-19 16:38 UTC — T5
+- Summary of what changed:
+  - Added T5 policy service module with deterministic predicate lookup by `(policy_version, predicate)`.
+  - Added fail-closed runtime behavior with explicit errors for unknown predicate and unknown policy version.
+  - Added current-version contract via active `predicate_policy_versions` lookup and explicit caller-supplied version handling in service lookup.
+  - Added additive migration `037_predicate_policy_service_bootstrap.sql` to:
+    - harden `predicate_policy` contract columns (`conflict_mode`, `expected_subject_kind`, `expected_object_kind`, `object_equivalence_rule`)
+    - enforce conflict-mode/value checks
+    - seed versioned policy records (`v2.p1`, `v2.p2`) with deterministic behavior differences
+  - Synchronized `schema.sql` policy contract columns with migration state.
+- Files changed:
+  - `src/predicate_policy.py`
+  - `migrations/037_predicate_policy_service_bootstrap.sql`
+  - `schema.sql`
+  - `tests/test_predicate_policy.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+- Tests added/updated:
+  - `tests/test_predicate_policy.py`:
+    - known predicate lookup
+    - unknown predicate failure
+    - unknown version failure
+    - versioned behavior lookup
+    - current active version contract lookup
+  - `tests/test_schema_migration.py` (re-run validation, unchanged assertions).
+- Acceptance criteria satisfied:
+  - Predicate policy is persisted and version-addressable with a runtime service in `src/`.
+  - Unknown predicate and unknown policy version are rejected fail-closed.
+  - Versioned policy behavior can coexist and be resolved deterministically by explicit version.
+- Known remaining gaps:
+  - Extraction and resolver wiring to require policy version at runtime is pending T4/T7 implementation.
+  - Replay policy-compatibility harness work remains under T12a scope.
+- Status: done
+
 ### 2026-04-19 15:33 UTC — T2
 - Summary of what changed:
   - Added T2 hardening migration `036_synapse_v2_schema_hardening.sql` to close post-audit structural gaps.
