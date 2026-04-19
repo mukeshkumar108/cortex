@@ -87,6 +87,10 @@ class Settings(BaseSettings):
     session_bridge_ttl_minutes: int = 30
     v2_dual_write_enabled: bool = False
     v2_dual_write_fail_open: bool = True
+    extract_results_enabled: bool = True
+    extract_results_model_version: str = "t4-extractor-v1"
+    extract_results_prompt_version: str = "t4-prompt-v1"
+    extract_results_policy_version: Optional[str] = None
 
     # Identity cache
     identity_cache_ttl_hours: int = 6

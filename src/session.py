@@ -42,6 +42,7 @@ JOB_TYPE_SESSION_RAW_EPISODE = "session_raw_episode"
 JOB_TYPE_POST_INGEST_HOOK = "post_ingest_hook"
 POST_INGEST_HOOK_SESSION_SUMMARY = "session_summary"
 POST_INGEST_HOOK_OPEN_LOOPS = "open_loops"
+POST_INGEST_HOOK_EXTRACT_RESULTS = "extract_results"
 POST_INGEST_HOOK_USER_MODEL_DELTA = "user_model_delta"
 POST_INGEST_HOOK_DAILY_ANALYSIS = "daily_analysis"
 SESSION_INGEST_GRAPHITI_MAX_MESSAGES = 400
@@ -1369,6 +1370,16 @@ class SessionManager:
             ts=reference_time,
             text=f"{JOB_TYPE_POST_INGEST_HOOK}:{POST_INGEST_HOOK_OPEN_LOOPS}",
             dedupe_key=f"session_hook_loops:{tenant_id}:{user_id}:{session_id}"
+        )
+        await self._enqueue_outbox_job(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            job_type=JOB_TYPE_POST_INGEST_HOOK,
+            payload={**base_payload, "hook": POST_INGEST_HOOK_EXTRACT_RESULTS},
+            ts=reference_time,
+            text=f"{JOB_TYPE_POST_INGEST_HOOK}:{POST_INGEST_HOOK_EXTRACT_RESULTS}",
+            dedupe_key=f"session_hook_extract_results:{tenant_id}:{user_id}:{session_id}"
         )
 
     async def _handle_session_raw_episode_job(self, row: Dict[str, Any], graphiti_client) -> None:

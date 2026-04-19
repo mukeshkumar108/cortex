@@ -29,6 +29,40 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-19 17:27 UTC — T4
+- Summary of what changed:
+  - Added durable extraction-results persistence module and contract (`src/extraction_results.py`) that writes versioned rows to `extract_results`.
+  - Wired extraction persistence into post-ingest hook orchestration via new hook `extract_results`.
+  - Enforced policy-version binding and fail-closed behavior for missing/unknown predicate policy version.
+  - Added deterministic retry/dedupe behavior via stable `extract_run_id` derivation and idempotent lookup.
+  - Added structured failure capture for malformed candidate payloads (`status='failed'`, `error_text`, structured `raw_output`).
+  - Kept extraction stage strictly non-mutating for claims/projections.
+- Files changed:
+  - `src/extraction_results.py`
+  - `src/session.py`
+  - `src/main.py`
+  - `src/config.py`
+  - `tests/test_extract_results_pipeline.py`
+  - `tests/test_session_ingest.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+- Tests added/updated:
+  - `tests/test_extract_results_pipeline.py`:
+    - durable extraction row write with required metadata
+    - missing policy version fails closed
+    - malformed candidate payload captured as structured failure
+    - no claim writes in extraction stage
+    - deterministic duplicate/retry behavior
+  - updated `tests/test_session_ingest.py::test_session_ingest_enqueues_only_summary_and_loops_hooks` for additive extraction hook.
+  - regression run: `tests/test_v2_dual_write_ingest.py`
+- Acceptance criteria satisfied:
+  - Durable, policy-bound, versioned extraction-results persistence is implemented and wired.
+  - Extraction stage remains contract-only and does not mutate claims/projections.
+  - Malformed payload behavior is structured and auditable.
+- Known remaining gaps:
+  - T4b quarantine routing/promotion workflow is not implemented.
+  - Resolver consumption of extraction results remains deferred to T7.
+- Status: done
+
 ### 2026-04-19 17:18 UTC — T3b
 - Summary of what changed:
   - Hardened v2 evidence ingest contract with fail-closed validation for role, non-empty text, and parseable timestamps.

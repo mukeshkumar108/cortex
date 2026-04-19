@@ -76,6 +76,7 @@ from .memory_ontology import (
     is_allowed_runtime_node,
 )
 from .canonicalization import normalize_text as canonicalize_text, stable_short_hash
+from .extraction_results import persist_extract_result, ExtractionContractError
 
 # Configure logging
 logging.basicConfig(
@@ -10191,6 +10192,33 @@ async def _execute_post_ingest_hook(hook_name: str, payload: Dict[str, Any]) -> 
         )
         return True
 
+    if hook_name == session.POST_INGEST_HOOK_EXTRACT_RESULTS:
+        settings = get_settings()
+        if not bool(settings.extract_results_enabled):
+            return True
+        await persist_extract_result(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            messages=messages_payload,
+            extractor_model_version=str(settings.extract_results_model_version or "").strip() or "t4-extractor-v1",
+            prompt_version=str(settings.extract_results_prompt_version or "").strip() or "t4-prompt-v1",
+            policy_version=_normalize_text(settings.extract_results_policy_version) or None,
+            reference_time=reference_time,
+            candidate_payload=payload.get("candidate_payload"),
+            raw_output=payload.get("raw_output"),
+            metadata={
+                "hook": session.POST_INGEST_HOOK_EXTRACT_RESULTS,
+                "episode_uuid": _normalize_text(payload.get("episode_uuid")) or None,
+                "turn_range": {
+                    "start_index": 0 if messages_payload else None,
+                    "end_index": (len(messages_payload) - 1) if messages_payload else None,
+                },
+            },
+        )
+        return True
+
     if hook_name in {
         session.POST_INGEST_HOOK_USER_MODEL_DELTA,
         session.POST_INGEST_HOOK_DAILY_ANALYSIS,
@@ -10473,7 +10501,7 @@ async def ingest(request: IngestRequest, background_tasks: BackgroundTasks):
         response = await process_ingest(request, graphiti_client, background_tasks)
         return response
 
-    except EvidenceContractError as e:
+    except (EvidenceContractError, ExtractionContractError) as e:
         raise HTTPException(
             status_code=400,
             detail={"code": e.code, "message": e.message},
@@ -12774,7 +12802,7 @@ async def ingest_session(request: SessionIngestRequest):
             sessionId=request.sessionId,
             graphitiAdded=False
         )
-    except EvidenceContractError as e:
+    except (EvidenceContractError, ExtractionContractError) as e:
         raise HTTPException(
             status_code=400,
             detail={"code": e.code, "message": e.message},

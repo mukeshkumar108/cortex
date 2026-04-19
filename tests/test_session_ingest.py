@@ -554,6 +554,7 @@ async def test_session_ingest_enqueues_only_summary_and_loops_hooks():
         )
         dedupe_keys = [r["dedupe_key"] for r in rows]
         assert dedupe_keys == sorted([
+            f"session_hook_extract_results:{tenant}:{user}:{session_id}",
             f"session_hook_loops:{tenant}:{user}:{session_id}",
             f"session_hook_summary:{tenant}:{user}:{session_id}",
         ])

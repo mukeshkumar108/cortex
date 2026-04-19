@@ -183,16 +183,18 @@ Extraction cannot be transient queue-only; must be auditable/replayable and vers
 T2, T3, T3b, T5.
 
 ### 4. Current status
-Not implemented as v2 durable extraction contract.
+Done (durable extraction-results contract wired into post-ingest hook path).
 
 ### 5. Gaps
-- Current pipeline has mixed hooks and model calls but no durable canonical extraction-results contract.
-- Policy version binding not enforced.
+- Extraction output quality calibration and quarantine routing are deferred to T4b.
+- Claim resolution consumption of extract results remains deferred to T7.
 
 ### 6. Acceptance criteria
-- `extract_results` table populated with structured candidates + errors.
-- Every extraction run records model version, prompt version, policy version.
-- No canonical claim mutation occurs in extraction stage.
+- `extract_results` table is populated with structured candidates and structured failure rows. ✅
+- Extraction persistence records model version, prompt version, and predicate policy version. ✅
+- Missing/unknown policy version fails closed before persistence. ✅
+- Extraction stage performs no claim or projection mutation. ✅
+- Duplicate/retry behavior is deterministic via stable `extract_run_id` contract. ✅
 
 ### 7. Risks
 - Queue replay without durable outputs causes silent data loss.
@@ -200,8 +202,10 @@ Not implemented as v2 durable extraction contract.
 
 ### 8. Files/functions likely affected
 - `src/session.py` (post-ingest hook orchestration)
-- `src/main.py` (job runners/background loops)
-- new extraction modules in `src/`
+- `src/main.py` (post-ingest hook executor wiring)
+- `src/extraction_results.py`
+- `src/config.py`
+- `tests/test_extract_results_pipeline.py`
 
 ---
 
@@ -711,8 +715,8 @@ Can run independently once dependencies are met:
 - Documentation alignment portions of **T15** can start early, but destructive cleanup must wait.
 
 ## Immediate Next 3 Tickets
-1. **T4** — Durable extraction-results pipeline.
-2. **T4b** — Quarantine pipeline for low-confidence/weakly grounded candidates.
-3. **T6** — Entity resolution v2.
+1. **T4b** — Quarantine pipeline for low-confidence/weakly grounded candidates.
+2. **T6** — Entity resolution v2.
+3. **T7** — Claim resolution v2.
 
-Rationale: T3/T3b evidence substrate and contract hardening are now in place. Next blocking work is durable extraction outputs and quarantine gating (T4/T4b), then entity/claim resolution contracts.
+Rationale: T4 durable extraction contract is now in place. Next blocking work is quarantine gating for weak candidates (T4b), then entity and claim resolution contracts (T6/T7).
