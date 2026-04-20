@@ -29,6 +29,39 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-20 10:44 UTC — T8
+- Summary of what changed:
+  - Added additive migration for canonical mutation ordering contract with explicit watermark semantics: **per-tenant monotonic sequence** (`tenant_sequence`) plus `canonical_tenant_watermarks`.
+  - Expanded canonical mutation schema to include committed-log fields (`user_id`, `object_type`, `object_id`, `source_run_id`, `resolver_version`, `tenant_sequence`, `commit_status`) and committed-only checks/indexes.
+  - Added shared mutation logger module that appends ordered committed mutation records and provides committed-only reader APIs.
+  - Wired canonical mutation writes in entity and claim resolvers to the shared logger, so canonical entity/claim mutations emit ordered committed mutation records.
+  - Kept scope to canonical infrastructure only: no retrieval/synthesis/projection behavior changes.
+- Files changed:
+  - `migrations/039_t8_canonical_mutation_watermarks.sql`
+  - `schema.sql`
+  - `src/canonical_mutation_log.py`
+  - `src/entity_resolution.py`
+  - `src/claim_resolution.py`
+  - `tests/test_canonical_mutation_log.py`
+  - `tests/test_schema_migration.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+  - `docs/SYNAPSE_V2_CHANGELOG.md`
+- Tests added/updated:
+  - `tests/test_canonical_mutation_log.py`:
+    - mutation records for canonical entity changes
+    - mutation records for canonical claim lifecycle changes
+    - deterministic ordering under repeated runs
+    - per-tenant watermark semantics and committed-read contract
+  - `tests/test_schema_migration.py::test_t8_canonical_mutation_watermark_contract`:
+    - validates watermark table, mutation columns, committed-status check, and sequence indexes
+- Acceptance criteria satisfied:
+  - Canonical entity/claim mutations emit ordered committed mutation records.
+  - Watermark semantics are explicit and implemented (`per-tenant monotonic`).
+  - Downstream committed-only read contract is implemented and tested.
+- Known remaining gaps:
+  - Projection rebuild and consumer catch-up orchestration remain deferred to later tickets (T12a/T9a), by design.
+- Status: done
+
 ### 2026-04-20 10:31 UTC — T7
 - Summary of what changed:
   - Added canonical claim resolver module that consumes `extract_results` candidates and resolves deterministic claim lifecycle outcomes using policy-bound slot/event semantics.

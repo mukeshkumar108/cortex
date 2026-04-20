@@ -339,14 +339,31 @@ CREATE TABLE IF NOT EXISTS claims_quarantine (
 CREATE TABLE IF NOT EXISTS canonical_mutations (
     mutation_id BIGSERIAL PRIMARY KEY,
     tenant_id TEXT NOT NULL,
+    user_id TEXT,
     mutation_type TEXT NOT NULL,
+    object_type TEXT NOT NULL,
+    object_id TEXT NOT NULL,
     claim_id BIGINT,
     entity_id UUID,
     source_extract_result_id BIGINT,
+    source_run_id TEXT,
+    resolver_version TEXT NOT NULL,
+    tenant_sequence BIGINT NOT NULL,
+    commit_status TEXT NOT NULL DEFAULT 'committed',
     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     committed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     committed_by TEXT,
-    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    CONSTRAINT canonical_mutations_object_type_nonempty_check CHECK (btrim(object_type) <> ''),
+    CONSTRAINT canonical_mutations_object_id_nonempty_check CHECK (btrim(object_id) <> ''),
+    CONSTRAINT canonical_mutations_commit_status_check CHECK (commit_status IN ('committed'))
+);
+
+CREATE TABLE IF NOT EXISTS canonical_tenant_watermarks (
+    tenant_id TEXT PRIMARY KEY,
+    last_sequence BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT canonical_tenant_watermarks_nonnegative_check CHECK (last_sequence >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS projection_snapshots (

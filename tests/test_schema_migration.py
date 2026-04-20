@@ -328,3 +328,64 @@ async def test_t4b_claims_quarantine_contract_columns_and_indexes():
         assert extract_run_idx == "idx_claims_quarantine_extract_run"
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_t8_canonical_mutation_watermark_contract():
+    async with app.router.lifespan_context(app):
+        pass
+
+    conn = await asyncpg.connect(_db_url())
+    try:
+        watermark_table = await conn.fetchval("SELECT to_regclass('public.canonical_tenant_watermarks')")
+        assert watermark_table == "canonical_tenant_watermarks"
+
+        columns = await conn.fetch(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'canonical_mutations'
+            """
+        )
+        col_names = {row["column_name"] for row in columns}
+        assert "user_id" in col_names
+        assert "object_type" in col_names
+        assert "object_id" in col_names
+        assert "source_run_id" in col_names
+        assert "resolver_version" in col_names
+        assert "tenant_sequence" in col_names
+        assert "commit_status" in col_names
+
+        seq_idx = await conn.fetchval(
+            """
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = 'canonical_mutations'
+              AND indexname = 'idx_canonical_mutations_tenant_sequence'
+            """
+        )
+        assert seq_idx == "idx_canonical_mutations_tenant_sequence"
+
+        commit_idx = await conn.fetchval(
+            """
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = 'canonical_mutations'
+              AND indexname = 'idx_canonical_mutations_committed_sequence'
+            """
+        )
+        assert commit_idx == "idx_canonical_mutations_committed_sequence"
+
+        commit_check = await conn.fetchval(
+            """
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid = 'canonical_mutations'::regclass
+              AND conname = 'canonical_mutations_commit_status_check'
+            """
+        )
+        assert commit_check == "canonical_mutations_commit_status_check"
+    finally:
+        await conn.close()

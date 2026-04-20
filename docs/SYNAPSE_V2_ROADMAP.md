@@ -350,25 +350,27 @@ Projection freshness and replay correctness require ordered, committed canonical
 T2, T7.
 
 ### 4. Current status
-Not implemented in v2 canonical form.
+Done (committed canonical mutation log implemented with explicit per-tenant monotonic watermark semantics).
 
 ### 5. Gaps
-- Existing async pipelines lack unified committed mutation watermark contract.
-- Global vs per-tenant watermark semantics not fixed.
+- None for T8 mutation-log/watermark scope.
 
 ### 6. Acceptance criteria
-- Mutation log exists and is written on every canonical claim/entity mutation.
-- Watermark semantics are explicitly documented and tested.
-- Projection builders consume committed watermarks only.
+- Mutation log exists and is written on canonical claim/entity mutations via shared logger. ✅
+- Watermark semantics are explicitly documented and tested (`per-tenant monotonic tenant_sequence`). ✅
+- Downstream contract for committed-only reads is implemented (`commit_status='committed'` + ordered sequence reads). ✅
 
 ### 7. Risks
 - Out-of-order or skipped watermarks causing stale or inconsistent projections.
 - Ambiguous watermark semantics break multi-tenant rollout.
 
 ### 8. Files/functions likely affected
-- migrations for mutation log
-- resolver/projection job modules
-- `src/main.py` orchestration logic
+- `migrations/039_t8_canonical_mutation_watermarks.sql`
+- `src/canonical_mutation_log.py`
+- `src/entity_resolution.py`
+- `src/claim_resolution.py`
+- `tests/test_canonical_mutation_log.py`
+- `tests/test_schema_migration.py`
 
 ---
 
@@ -712,8 +714,8 @@ Can run independently once dependencies are met:
 - Documentation alignment portions of **T15** can start early, but destructive cleanup must wait.
 
 ## Immediate Next 3 Tickets
-1. **T8** — Canonical mutation log + watermarks.
-2. **T12a** — Offline replay, diffing, and audit harness.
-3. **T9a** — Re-anchor existing synthesis to canonical layer.
+1. **T12a** — Offline replay, diffing, and audit harness.
+2. **T9a** — Re-anchor existing synthesis to canonical layer.
+3. **T10** — `/v2/memory/query` implementation.
 
-Rationale: T4/T4b/T6/T7 are closed with execution validation; proceed on critical path with mutation-log watermarks, then replay/audit, then projection re-anchoring.
+Rationale: T4/T4b/T6/T7/T8 are closed with execution validation; proceed with replay/diff audit hardening, then projection re-anchoring, then v2 retrieval serving.

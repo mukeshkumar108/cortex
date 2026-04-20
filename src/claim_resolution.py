@@ -11,6 +11,7 @@ from .canonicalization import (
     normalize_text,
     normalize_timestamp,
 )
+from .canonical_mutation_log import CanonicalMutationLogger
 from .db import Database
 from .predicate_policy import (
     MissingPolicyVersionError,
@@ -176,6 +177,7 @@ class ClaimResolver:
     def __init__(self, db: Database):
         self.db = db
         self.policy_service = PredicatePolicyService(db)
+        self.mutation_logger = CanonicalMutationLogger(db)
 
     async def resolve_extract_result_claims(
         self,
@@ -458,6 +460,7 @@ class ClaimResolver:
             )
             await self._record_mutation(
                 tenant_id=tenant_id,
+                user_id=user_id,
                 mutation_type="claim_reinforced",
                 claim_id=claim_id,
                 extract_result_id=extract_result_id,
@@ -551,6 +554,7 @@ class ClaimResolver:
         )
         await self._record_mutation(
             tenant_id=tenant_id,
+            user_id=user_id,
             mutation_type="claim_created",
             claim_id=claim_id,
             extract_result_id=extract_result_id,
@@ -587,6 +591,7 @@ class ClaimResolver:
                 for old_claim_id in superseded_ids:
                     await self._record_mutation(
                         tenant_id=tenant_id,
+                        user_id=user_id,
                         mutation_type="claim_superseded",
                         claim_id=old_claim_id,
                         extract_result_id=extract_result_id,
@@ -731,6 +736,7 @@ class ClaimResolver:
         for claim_id in retract_ids:
             await self._record_mutation(
                 tenant_id=tenant_id,
+                user_id=user_id,
                 mutation_type="claim_retracted",
                 claim_id=claim_id,
                 extract_result_id=extract_result_id,
@@ -746,34 +752,24 @@ class ClaimResolver:
         self,
         *,
         tenant_id: str,
+        user_id: str,
         mutation_type: str,
         claim_id: int,
         extract_result_id: int,
         resolver_version: str,
         payload: Dict[str, Any],
     ) -> None:
-        await self.db.execute(
-            """
-            INSERT INTO canonical_mutations (
-                tenant_id,
-                mutation_type,
-                claim_id,
-                source_extract_result_id,
-                payload,
-                committed_at,
-                committed_by,
-                metadata
-            )
-            VALUES (
-                $1, $2, $3, $4, $5::jsonb, $6, $7, $8::jsonb
-            )
-            """,
-            tenant_id,
-            mutation_type,
-            int(claim_id),
-            int(extract_result_id),
-            payload if isinstance(payload, dict) else {},
-            _utc_now(),
-            "t7.claim_resolver",
-            {"resolver_version": resolver_version},
+        await self.mutation_logger.append_mutation(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            mutation_type=mutation_type,
+            object_type="claim",
+            object_id=str(int(claim_id)),
+            resolver_version=resolver_version,
+            claim_id=int(claim_id),
+            source_extract_result_id=int(extract_result_id),
+            source_run_id=str(int(extract_result_id)),
+            committed_by="t7.claim_resolver",
+            payload=payload if isinstance(payload, dict) else {},
+            metadata={"resolver_version": resolver_version},
         )

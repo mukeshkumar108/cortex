@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 import uuid
 
 from .canonicalization import normalize_text
+from .canonical_mutation_log import CanonicalMutationLogger
 from .db import Database
 
 
@@ -57,6 +58,7 @@ def _normalize_name(value: Any) -> str:
 class EntityResolver:
     def __init__(self, db: Database):
         self.db = db
+        self.mutation_logger = CanonicalMutationLogger(db)
 
     async def resolve_entity_mention(
         self,
@@ -110,6 +112,7 @@ class EntityResolver:
         if len(alias_entity_ids) > 1:
             await self._record_ambiguity(
                 tenant_id=tenant,
+                user_id=user,
                 candidate_entity_ids=alias_entity_ids,
                 mention_text=canonical_name,
                 alias_normalized=alias_normalized,
@@ -235,6 +238,7 @@ class EntityResolver:
         )
         await self._write_mutation(
             tenant_id=tenant,
+            user_id=user,
             mutation_type="entity_create",
             entity_id=entity_id,
             payload={
@@ -399,31 +403,25 @@ class EntityResolver:
                     except Exception:
                         copied_count = 0
 
-                await conn.execute(
-                    """
-                    INSERT INTO canonical_mutations (
-                        tenant_id,
-                        mutation_type,
-                        entity_id,
-                        payload,
-                        committed_at,
-                        committed_by,
-                        metadata
-                    )
-                    VALUES ($1, 'entity_merge', $2::uuid, $3::jsonb, $4, $5, $6::jsonb)
-                    """,
-                    tenant,
-                    source_uuid,
-                    {
+                await self.mutation_logger.append_mutation(
+                    conn=conn,
+                    tenant_id=tenant,
+                    user_id=user,
+                    mutation_type="entity_merge",
+                    object_type="entity",
+                    object_id=source_id,
+                    resolver_version=ENTITY_RESOLVER_VERSION,
+                    entity_id=source_id,
+                    source_run_id=str(metadata.get("source_run_id")) if isinstance(metadata, dict) and metadata.get("source_run_id") else None,
+                    committed_by=actor,
+                    payload={
                         "source_entity_id": source_id,
                         "survivor_entity_id": survivor_id,
                         "reason": merge_reason,
                         "copied_aliases": copied_count,
                         "resolver_version": ENTITY_RESOLVER_VERSION,
                     },
-                    now,
-                    actor,
-                    metadata if isinstance(metadata, dict) else {},
+                    metadata=metadata if isinstance(metadata, dict) else {},
                 )
 
         return EntityMergeResult(
@@ -513,6 +511,7 @@ class EntityResolver:
         self,
         *,
         tenant_id: str,
+        user_id: str,
         mention_text: str,
         alias_normalized: str,
         entity_type: str,
@@ -521,6 +520,7 @@ class EntityResolver:
     ) -> None:
         await self._write_mutation(
             tenant_id=tenant_id,
+            user_id=user_id,
             mutation_type="entity_resolution_ambiguous",
             entity_id=None,
             payload={
@@ -538,33 +538,25 @@ class EntityResolver:
         self,
         *,
         tenant_id: str,
+        user_id: str,
         mutation_type: str,
         entity_id: Optional[str],
         payload: Dict[str, Any],
         committed_by: str,
         metadata: Optional[Dict[str, Any]],
     ) -> None:
-        entity_uuid = None
-        if entity_id:
-            entity_uuid = str(entity_id)
-        await self.db.execute(
-            """
-            INSERT INTO canonical_mutations (
-                tenant_id,
-                mutation_type,
-                entity_id,
-                payload,
-                committed_at,
-                committed_by,
-                metadata
-            )
-            VALUES ($1, $2, $3::uuid, $4::jsonb, $5, $6, $7::jsonb)
-            """,
-            tenant_id,
-            mutation_type,
-            entity_uuid,
-            payload if isinstance(payload, dict) else {},
-            _utc_now(),
-            committed_by,
-            metadata if isinstance(metadata, dict) else {},
+        object_type = "entity" if entity_id else "entity_resolution"
+        object_id = str(entity_id) if entity_id else str(payload.get("alias_normalized") or mutation_type)
+        await self.mutation_logger.append_mutation(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            mutation_type=mutation_type,
+            object_type=object_type,
+            object_id=object_id,
+            resolver_version=ENTITY_RESOLVER_VERSION,
+            entity_id=str(entity_id) if entity_id else None,
+            source_run_id=str(metadata.get("source_run_id")) if isinstance(metadata, dict) and metadata.get("source_run_id") else None,
+            committed_by=committed_by,
+            payload=payload if isinstance(payload, dict) else {},
+            metadata=metadata if isinstance(metadata, dict) else {},
         )
