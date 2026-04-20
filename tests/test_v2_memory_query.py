@@ -8,6 +8,14 @@ from src.main import memory_query_v2
 from src.models import MemoryQueryV2Item, MemoryQueryV2Request
 
 
+@pytest.fixture(autouse=True)
+def _force_v2_route(monkeypatch):
+    async def _route_v2(self, *, tenant_id: str, user_id: str):
+        return "v2_served"
+
+    monkeypatch.setattr("src.main.RolloutController.decide_route", _route_v2, raising=True)
+
+
 @pytest.mark.asyncio
 async def test_v2_memory_query_factual_returns_evidence_backed_claims_only(monkeypatch):
     now = datetime.now(dt_timezone.utc)

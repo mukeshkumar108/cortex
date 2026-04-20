@@ -98,6 +98,9 @@ class Settings(BaseSettings):
     v2_invariant_checker_enabled: bool = True
     v2_invariant_checker_interval_seconds: int = 900
     v2_invariant_checker_auto_repair_enabled: bool = True
+    v2_rollout_control_enabled: bool = True
+    v2_rollout_eval_enabled: bool = True
+    v2_rollout_eval_interval_seconds: int = 300
 
     # Identity cache
     identity_cache_ttl_hours: int = 6

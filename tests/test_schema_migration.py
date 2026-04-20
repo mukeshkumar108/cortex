@@ -135,6 +135,8 @@ async def test_t2_v2_additive_schema_objects_exist():
             "retrieval_shadow_diffs",
             "invariant_violations",
             "invariant_repair_actions",
+            "retrieval_rollout_control",
+            "retrieval_rollout_events",
         ]
         for table in required_tables:
             exists = await conn.fetchval("SELECT to_regclass($1)", f"public.{table}")
@@ -499,5 +501,51 @@ async def test_t13_invariant_tables_contract():
             """
         )
         assert r_idx == "idx_invariant_repair_actions_tenant_created"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_t14_rollout_tables_contract():
+    async with app.router.lifespan_context(app):
+        pass
+
+    conn = await asyncpg.connect(_db_url())
+    try:
+        control_table = await conn.fetchval("SELECT to_regclass('public.retrieval_rollout_control')")
+        events_table = await conn.fetchval("SELECT to_regclass('public.retrieval_rollout_events')")
+        assert control_table == "retrieval_rollout_control"
+        assert events_table == "retrieval_rollout_events"
+
+        control_check = await conn.fetchval(
+            """
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid = 'retrieval_rollout_control'::regclass
+              AND conname = 'retrieval_rollout_control_mode_check'
+            """
+        )
+        assert control_check == "retrieval_rollout_control_mode_check"
+
+        events_check = await conn.fetchval(
+            """
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid = 'retrieval_rollout_events'::regclass
+              AND conname = 'retrieval_rollout_events_type_check'
+            """
+        )
+        assert events_check == "retrieval_rollout_events_type_check"
+
+        events_idx = await conn.fetchval(
+            """
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = 'retrieval_rollout_events'
+              AND indexname = 'idx_retrieval_rollout_events_created'
+            """
+        )
+        assert events_idx == "idx_retrieval_rollout_events_created"
     finally:
         await conn.close()

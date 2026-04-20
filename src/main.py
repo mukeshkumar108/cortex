@@ -83,6 +83,7 @@ from .canonicalization import normalize_text as canonicalize_text, stable_short_
 from .extraction_results import persist_extract_result, ExtractionContractError
 from .retrieval_shadow import build_shadow_diff, persist_shadow_diff, persist_shadow_error
 from .invariants import InvariantManager
+from .rollout import RolloutController, ROUTE_LEGACY, ROUTE_SHADOW, ROUTE_V2
 
 # Configure logging
 logging.basicConfig(
@@ -7085,6 +7086,26 @@ async def v2_invariant_checker_loop(
         await asyncio.sleep(max(60, int(interval_seconds or 900)))
 
 
+async def v2_rollout_evaluator_loop(
+    *,
+    interval_seconds: int,
+) -> None:
+    controller = RolloutController(db)
+    while True:
+        try:
+            result = await controller.evaluate_and_apply_rollback()
+            logger.info(
+                "v2 rollout evaluator samples=%s triggered=%s reason=%s metrics=%s",
+                result.samples,
+                result.triggered,
+                result.rollback_reason,
+                result.metrics,
+            )
+        except Exception as e:
+            logger.error(f"v2 rollout evaluator loop error: {e}")
+        await asyncio.sleep(max(60, int(interval_seconds or 300)))
+
+
 def _safe_parse_json_object(raw: Any) -> Optional[Dict[str, Any]]:
     if raw is None:
         return None
@@ -11214,6 +11235,13 @@ async def lifespan(app: FastAPI):
                 )
             )
             logger.info("V2 invariant checker loop started")
+        if settings.v2_rollout_control_enabled and settings.v2_rollout_eval_enabled:
+            app.state.v2_rollout_evaluator_task = asyncio.create_task(
+                v2_rollout_evaluator_loop(
+                    interval_seconds=settings.v2_rollout_eval_interval_seconds,
+                )
+            )
+            logger.info("V2 rollout evaluator loop started")
 
     except Exception as e:
         logger.error(f"Failed to initialize services: {e}")
@@ -11284,6 +11312,14 @@ async def lifespan(app: FastAPI):
         app.state.v2_invariant_checker_task.cancel()
         try:
             await app.state.v2_invariant_checker_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+    if getattr(app.state, "v2_rollout_evaluator_task", None):
+        app.state.v2_rollout_evaluator_task.cancel()
+        try:
+            await app.state.v2_rollout_evaluator_task
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -11723,12 +11759,7 @@ async def _v2_collect_continuity_items(
     ]
 
 
-@app.post(
-    "/v2/memory/query",
-    response_model=MemoryQueryV2Response,
-    response_model_exclude_none=True,
-)
-async def memory_query_v2(request: MemoryQueryV2Request):
+async def _memory_query_v2_service(request: MemoryQueryV2Request) -> MemoryQueryV2Response:
     """
     Authoritative Synapse v2 retrieval contract with strict lane separation.
     """
@@ -11810,6 +11841,26 @@ async def memory_query_v2(request: MemoryQueryV2Request):
         raise HTTPException(status_code=500, detail="v2 memory query failed")
 
 
+@app.post(
+    "/v2/memory/query",
+    response_model=MemoryQueryV2Response,
+    response_model_exclude_none=True,
+)
+async def memory_query_v2(request: MemoryQueryV2Request):
+    controller = RolloutController(db)
+    route = await controller.decide_route(tenant_id=request.tenantId, user_id=request.userId)
+    if route != ROUTE_V2:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "V2_ROLLOUT_NOT_ENABLED_FOR_SCOPE",
+                "message": "v2 served path is not enabled for this tenant/user cohort",
+                "route": route,
+            },
+        )
+    return await _memory_query_v2_service(request)
+
+
 def _legacy_intent_to_v2_lane(memory_intent: str) -> str:
     intent = _resolve_memory_intent(memory_intent)
     if intent == "exact":
@@ -11861,7 +11912,7 @@ async def _memory_query_legacy_adapter(request: MemoryQueryRequest) -> MemoryQue
     """
     memory_intent = _resolve_memory_intent(request.memoryIntent)
     lane = _legacy_intent_to_v2_lane(memory_intent)
-    v2_response = await memory_query_v2(
+    v2_response = await _memory_query_v2_service(
         MemoryQueryV2Request(
             tenantId=request.tenantId,
             userId=request.userId,
@@ -11962,7 +12013,7 @@ async def _run_retrieval_shadow_diff(
 ) -> None:
     shadow_lane = _shadow_lane_for_legacy_request(request)
     shadow_started = perf_counter()
-    shadow_response = await memory_query_v2(
+    shadow_response = await _memory_query_v2_service(
         MemoryQueryV2Request(
             tenantId=request.tenantId,
             userId=request.userId,
@@ -12036,18 +12087,22 @@ async def memory_query(request: MemoryQueryRequest):
     Legacy compatibility endpoint.
     """
     # T11 transitional rule: route exclusively through v2 adapter; no mixed-authority legacy fallback.
+    controller = RolloutController(db)
+    rollout_route = await controller.decide_route(tenant_id=request.tenantId, user_id=request.userId)
     started = perf_counter()
     response = await _memory_query_legacy_adapter(request)
     served_latency_ms = (perf_counter() - started) * 1000.0
 
     settings = get_settings()
-    shadow_enabled = bool(settings.retrieval_shadow_read_enabled) and bool(settings.retrieval_shadow_read_endpoint_enabled)
+    shadow_enabled = (
+        bool(settings.retrieval_shadow_read_enabled) and bool(settings.retrieval_shadow_read_endpoint_enabled)
+    ) or rollout_route == ROUTE_SHADOW
     sampled = _shadow_sampling_selected(
         tenant_id=request.tenantId,
         user_id=request.userId,
         query=request.query,
         intent=_resolve_memory_intent(request.memoryIntent),
-        sample_rate=float(settings.retrieval_shadow_read_sample_rate or 0.0),
+        sample_rate=(1.0 if rollout_route == ROUTE_SHADOW else float(settings.retrieval_shadow_read_sample_rate or 0.0)),
     )
     if shadow_enabled and sampled:
         if bool(settings.retrieval_shadow_read_blocking):
@@ -12064,6 +12119,13 @@ async def memory_query(request: MemoryQueryRequest):
                     served_latency_ms=served_latency_ms,
                 )
             )
+    metadata = response.metadata if isinstance(response.metadata, dict) else {}
+    metadata["rollout"] = {
+        "controller_version": "t14.rollout.v1",
+        "route": rollout_route,
+        "shadow_executed": bool(shadow_enabled and sampled),
+    }
+    response.metadata = metadata
     return response
 
     # Legacy implementation retained below for temporary reference during migration;
@@ -15854,6 +15916,77 @@ async def retrieval_shadow_audit(
             "min_delta_ms": round(float(min(latency_deltas)), 3) if latency_deltas else 0.0,
         },
         "items": rows,
+    }
+
+
+@app.get("/internal/v2/rollout/state")
+async def get_v2_rollout_state(
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    state = await RolloutController(db).get_state()
+    return {
+        "controller_version": "t14.rollout.v1",
+        "state": state,
+    }
+
+
+@app.post("/internal/v2/rollout/state")
+async def set_v2_rollout_state(
+    payload: Dict[str, Any],
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    updated = await RolloutController(db).update_state(
+        patch=payload or {},
+        updated_by="internal_api",
+    )
+    return {
+        "controller_version": "t14.rollout.v1",
+        "state": updated,
+    }
+
+
+@app.post("/internal/v2/rollout/evaluate")
+async def evaluate_v2_rollout_health(
+    lookback_minutes: int = Query(default=60, ge=5, le=1440),
+    min_samples: int = Query(default=20, ge=1, le=10000),
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    result = await RolloutController(db).evaluate_and_apply_rollback(
+        lookback_minutes=int(lookback_minutes),
+        min_samples=int(min_samples),
+        updated_by="internal_api_eval",
+    )
+    return {
+        "controller_version": "t14.rollout.v1",
+        "samples": result.samples,
+        "triggered": result.triggered,
+        "rollback_reason": result.rollback_reason,
+        "metrics": result.metrics,
+    }
+
+
+@app.get("/internal/v2/rollout/events")
+async def list_v2_rollout_events(
+    limit: int = Query(default=200, ge=1, le=1000),
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    rows = await db.fetch(
+        """
+        SELECT event_id, event_type, details, updated_by, created_at
+        FROM retrieval_rollout_events
+        ORDER BY created_at DESC, event_id DESC
+        LIMIT $1
+        """,
+        int(limit),
+    )
+    return {
+        "controller_version": "t14.rollout.v1",
+        "rows": len(rows or []),
+        "items": rows or [],
     }
 
 

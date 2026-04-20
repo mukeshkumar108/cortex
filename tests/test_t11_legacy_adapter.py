@@ -6,6 +6,14 @@ from src.main import memory_query
 from src.models import MemoryQueryRequest, MemoryQueryV2Response, MemoryQueryV2Item
 
 
+@pytest.fixture(autouse=True)
+def _force_rollout_legacy_route(monkeypatch):
+    async def _route_legacy(self, *, tenant_id: str, user_id: str):
+        return "legacy_served"
+
+    monkeypatch.setattr("src.main.RolloutController.decide_route", _route_legacy, raising=True)
+
+
 @pytest.mark.asyncio
 async def test_t11_legacy_query_routes_to_v2_only_and_blocks_old_path(monkeypatch):
     async def _should_not_call(**_kwargs):
@@ -31,7 +39,7 @@ async def test_t11_legacy_query_routes_to_v2_only_and_blocks_old_path(monkeypatc
     monkeypatch.setattr("src.main._pg_search_facts", _should_not_call, raising=True)
     monkeypatch.setattr("src.main._pg_search_nodes", _should_not_call, raising=True)
     monkeypatch.setattr("src.main._build_episodic_recall_items", _should_not_call, raising=True)
-    monkeypatch.setattr("src.main.memory_query_v2", _stub_memory_query_v2, raising=True)
+    monkeypatch.setattr("src.main._memory_query_v2_service", _stub_memory_query_v2, raising=True)
 
     resp = await memory_query(
         MemoryQueryRequest(
@@ -93,7 +101,7 @@ async def test_t11_legacy_hybrid_maps_v2_lanes_conservatively(monkeypatch):
             metadata={"counts": {"factual": 1, "episodic": 1, "continuity": 1, "total": 3}},
         )
 
-    monkeypatch.setattr("src.main.memory_query_v2", _stub_memory_query_v2, raising=True)
+    monkeypatch.setattr("src.main._memory_query_v2_service", _stub_memory_query_v2, raising=True)
 
     resp = await memory_query(
         MemoryQueryRequest(
@@ -126,7 +134,7 @@ async def test_t11_legacy_default_intent_routes_to_factual_lane(monkeypatch):
         captured["lane"] = request.lane
         return MemoryQueryV2Response(lane=request.lane, items=[], metadata={})
 
-    monkeypatch.setattr("src.main.memory_query_v2", _stub_memory_query_v2, raising=True)
+    monkeypatch.setattr("src.main._memory_query_v2_service", _stub_memory_query_v2, raising=True)
 
     resp = await memory_query(
         MemoryQueryRequest(

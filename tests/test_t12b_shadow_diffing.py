@@ -18,6 +18,14 @@ from src.models import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _force_rollout_legacy_route(monkeypatch):
+    async def _route_legacy(self, *, tenant_id: str, user_id: str):
+        return "legacy_served"
+
+    monkeypatch.setattr("src.main.RolloutController.decide_route", _route_legacy, raising=True)
+
+
 @pytest.mark.asyncio
 async def test_t12b_shadow_path_runs_without_changing_served_output(monkeypatch):
     expected = MemoryQueryResponse(
@@ -105,7 +113,7 @@ async def test_t12b_diff_record_written(monkeypatch):
     async def _stub_persist(_db, payload):
         persisted["payload"] = payload
 
-    monkeypatch.setattr("src.main.memory_query_v2", _stub_v2, raising=True)
+    monkeypatch.setattr("src.main._memory_query_v2_service", _stub_v2, raising=True)
     monkeypatch.setattr("src.main.persist_shadow_diff", _stub_persist, raising=True)
 
     served = MemoryQueryResponse(

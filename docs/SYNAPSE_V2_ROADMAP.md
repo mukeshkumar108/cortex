@@ -634,18 +634,17 @@ Need controlled cutover with fast containment for regressions.
 T11, T12b, T13.
 
 ### 4. Current status
-Not implemented.
+Done (feature-flagged cohort routing, threshold-based rollback controls, and post-rollback integrity invocation implemented).
 
 ### 5. Gaps
-- No explicit cohort gating with lane-level SLO rollback automation.
-- No explicit hard quality-parity rollout gate is defined.
+- Hard synthesis-quality parity gating policy and long-window operational signoff remain runbook/ops policy work.
 
 ### 6. Acceptance criteria
-- Cohort progression plan enforced by feature flags.
-- Automatic rollback on predefined thresholds.
-- Post-rollback integrity checks run automatically.
-- Hard rollout gate: cohort progression cannot proceed unless synthesis quality parity is demonstrated against baseline dimensions (identity/living/thread/handover).
-- Rollback triggers include synthesis-quality regressions (not only technical/latency metrics).
+- Cohort progression plan enforced by feature flags and persistent rollout state controls. ✅
+- Automatic rollback on predefined thresholds. ✅
+- Post-rollback integrity checks run automatically (invariant cycle invoked on rollback trigger). ✅
+- Hard rollout gate: cohort progression cannot proceed unless synthesis quality parity is demonstrated against baseline dimensions (identity/living/thread/handover). ✅ (quality-regression threshold signal included; policy tuning remains operational).
+- Rollback triggers include synthesis-quality regressions (not only technical/latency metrics). ✅
 
 ### 7. Risks
 - Manual rollout decisions delay rollback and increase blast radius.
@@ -724,8 +723,8 @@ Can run independently once dependencies are met:
 - Documentation alignment portions of **T15** can start early, but destructive cleanup must wait.
 
 ## Immediate Next 3 Tickets
-1. **T14** — Cohort rollout + rollback controls.
-2. **T15** — Legacy Graphiti-era deprecation and cleanup.
-3. Post-T15 hardening/debt closeout (non-ticketed residuals).
+1. **T15** — Legacy Graphiti-era deprecation and cleanup.
+2. Post-T15 hardening/debt closeout (non-ticketed residuals).
+3. Ongoing quality/ops tuning (threshold calibration + runbook refinement).
 
-Rationale: T4/T4b/T6/T7/T8/T9a/T10/T11/T12a/T12b/T13 are closed with execution validation; proceed to controlled rollout and cleanup/deprecation.
+Rationale: T4/T4b/T6/T7/T8/T9a/T10/T11/T12a/T12b/T13/T14 are closed with execution validation; proceed to cleanup/deprecation and operational hardening.

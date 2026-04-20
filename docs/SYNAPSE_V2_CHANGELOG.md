@@ -29,6 +29,54 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-20 14:23 UTC — T14
+- Summary of what changed:
+  - Added persistent rollout controller with explicit serving modes (`legacy_only`, `shadow_only`, `cohort_v2`, `v2_all`) and cohort selectors (tenant/user/percentage).
+  - Added objective rollback threshold controls in persisted rollout state for:
+    - evidence coverage regression
+    - active-slot conflict counts
+    - replay divergence counts
+    - latency regression rate
+    - quality-regression drift rate
+  - Added threshold evaluator that can auto-trigger rollback to `legacy_only` without code changes and logs rollout events.
+  - Added post-rollback integrity invocation by running T13 invariant checks automatically when rollback is triggered.
+  - Added internal observability/control endpoints for rollout state, evaluation, and event history.
+  - Added v2 cohort gate on `/v2/memory/query` (non-cohort requests fail safely with explicit rollout code); legacy `/memory/query` remains served and annotated with rollout route metadata.
+- Files changed:
+  - `src/rollout.py`
+  - `src/main.py`
+  - `src/config.py`
+  - `migrations/042_t14_rollout_controls.sql`
+  - `schema.sql`
+  - `tests/test_t14_rollout_controls.py`
+  - `tests/test_v2_memory_query.py`
+  - `tests/test_t11_legacy_adapter.py`
+  - `tests/test_t12b_shadow_diffing.py`
+  - `tests/test_schema_migration.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+  - `docs/SYNAPSE_V2_CHANGELOG.md`
+- Tests added/updated:
+  - `tests/test_t14_rollout_controls.py`:
+    - cohort routing behavior
+    - rollback trigger behavior
+    - non-trigger path behavior
+    - v2 endpoint cohort gate behavior
+  - Updated regression tests for T10/T11/T12b around v2-service routing and rollout gating:
+    - `tests/test_v2_memory_query.py`
+    - `tests/test_t11_legacy_adapter.py`
+    - `tests/test_t12b_shadow_diffing.py`
+  - Schema migration contract extension:
+    - `tests/test_schema_migration.py::test_t14_rollout_tables_contract`
+- Acceptance criteria satisfied:
+  - Cohort routing controls exist and are configurable.
+  - Rollback triggers are objective and enforceable.
+  - Rollback is explicit/fast via state update and does not require code changes.
+  - Post-rollback integrity path is automatically invoked.
+  - Runbook/observability signals for current state, rollback reason, and failing health metrics are queryable.
+- Known remaining gaps:
+  - T15 cleanup/deprecation remains pending.
+- Status: done
+
 ### 2026-04-20 14:00 UTC — T13
 - Summary of what changed:
   - Added v2 continuous invariant framework covering canonical safety checks for:
