@@ -29,6 +29,27 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-20 09:59 UTC — T4b
+- Summary of what changed:
+  - Executed T4b runtime validation tests in this environment and confirmed quarantine behavior and schema contract enforcement.
+  - Closed T4b ticket status from partial to done based on passing execution evidence.
+  - Removed stale roadmap gate language that required external execution before closure.
+- Files changed:
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+  - `docs/SYNAPSE_V2_CHANGELOG.md`
+- Tests added/updated:
+  - Executed `tests/test_extract_results_pipeline.py`:
+    - `test_t4b_low_confidence_candidate_is_quarantined`
+    - `test_t4b_malformed_claim_candidate_is_quarantined`
+    - `test_t4b_valid_candidate_persists_without_quarantine`
+  - Executed `tests/test_schema_migration.py::test_t4b_claims_quarantine_contract_columns_and_indexes`
+- Acceptance criteria satisfied:
+  - Quarantine routing, persistence, and no-claim-write guarantees are validated in runtime tests.
+  - `claims_quarantine` schema/index contract is validated.
+- Known remaining gaps:
+  - None for T4b pipeline scope.
+- Status: done
+
 ### 2026-04-20 09:44 UTC — T4
 - Summary of what changed:
   - Closed T4 validation gaps by hardening extraction-results tests around actual outbox-drain contract (single-pass or multi-pass) instead of fixed second-pass assumptions.

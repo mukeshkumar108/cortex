@@ -219,11 +219,10 @@ Backfill and live extraction noise must not pollute canonical claims.
 T4, T5.
 
 ### 4. Current status
-Partial (deterministic quarantine routing and persistence are implemented; review/promotion and ops tooling remain deferred).
+Done (quarantine routing/persistence contract implemented and validated by runtime execution tests).
 
 ### 5. Gaps
-- Manual review/promotion tooling is intentionally deferred.
-- Quarantine metrics dashboarding is deferred to later ops tickets.
+- None for T4b pipeline scope.
 
 ### 6. Acceptance criteria
 - Quarantine persistence captures tenant/user/session/extract-run linkage, candidate payload, reason, confidence, status, and timestamps. ✅
@@ -717,8 +716,8 @@ Can run independently once dependencies are met:
 - Documentation alignment portions of **T15** can start early, but destructive cleanup must wait.
 
 ## Immediate Next 3 Tickets
-1. **T4b** — Quarantine pipeline for low-confidence/weakly grounded candidates (external test execution gate).
-2. **T6** — Entity resolution v2.
-3. **T7** — Claim resolution v2.
+1. **T6** — Entity resolution v2.
+2. **T7** — Claim resolution v2.
+3. **T8** — Canonical mutation log + watermarks.
 
-Rationale: T4b implementation is complete but must pass execution tests in a full runtime environment before closure. Then proceed on critical path to T6/T7.
+Rationale: T4 and T4b are now closed with execution validation; continue on the critical path with T6/T7, then T8.
