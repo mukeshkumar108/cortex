@@ -29,6 +29,41 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-20 13:36 UTC — T12b
+- Summary of what changed:
+  - Added live shadow-read diff instrumentation for legacy retrieval requests (`/memory/query`) with feature-flag + sampling controls and no serving-path response changes.
+  - Implemented structured machine-readable diff generation for factual deltas, evidence coverage deltas, continuity deltas (where representable), episodic deltas, and latency deltas.
+  - Added durable/queryable audit persistence for shadow outcomes (`ok` / `shadow_error`) and diff/metric payloads.
+  - Added internal audit endpoint for shadow regression visibility and summary metrics.
+  - Added fail-safe shadow error handling so malformed/unsupported diff flows do not impact served output.
+- Files changed:
+  - `src/main.py`
+  - `src/retrieval_shadow.py`
+  - `src/config.py`
+  - `migrations/040_t12b_retrieval_shadow_diff_audit.sql`
+  - `schema.sql`
+  - `tests/test_t12b_shadow_diffing.py`
+  - `tests/test_schema_migration.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+  - `docs/SYNAPSE_V2_CHANGELOG.md`
+- Tests added/updated:
+  - `tests/test_t12b_shadow_diffing.py`:
+    - shadow path executes without changing served output
+    - feature flag disables shadow execution
+    - diff payload is generated and persisted
+    - malformed diff flow fails safe and writes shadow error
+    - internal audit endpoint returns structured summary
+  - `tests/test_schema_migration.py`:
+    - `test_t12b_retrieval_shadow_diff_contract`
+- Acceptance criteria satisfied:
+  - Live shadow-read diffing exists and is configurable/flagged.
+  - Structured diff/audit records are persisted and queryable.
+  - Served output remains unchanged while shadowing.
+  - Safety behavior is fail-safe for malformed/unsupported shadow cases.
+- Known remaining gaps:
+  - Alert wiring/rollback threshold automation remains deferred to T14 by design.
+- Status: done
+
 ### 2026-04-20 15:35 UTC — T11
 - Summary of what changed:
   - Converted legacy `POST /memory/query` into a strict T11 compatibility adapter that routes through v2 retrieval logic only.

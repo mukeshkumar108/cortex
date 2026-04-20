@@ -91,6 +91,10 @@ class Settings(BaseSettings):
     extract_results_model_version: str = "t4-extractor-v1"
     extract_results_prompt_version: str = "t4-prompt-v1"
     extract_results_policy_version: Optional[str] = None
+    retrieval_shadow_read_enabled: bool = False
+    retrieval_shadow_read_sample_rate: float = 0.0
+    retrieval_shadow_read_blocking: bool = False
+    retrieval_shadow_read_endpoint_enabled: bool = True
 
     # Identity cache
     identity_cache_ttl_hours: int = 6

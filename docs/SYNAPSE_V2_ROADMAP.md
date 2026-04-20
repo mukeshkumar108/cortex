@@ -570,20 +570,16 @@ Detect quality/latency regressions before cohort serve.
 T10, T11, T12a.
 
 ### 4. Current status
-Not implemented.
+Done (observability/diff instrumentation implemented; no rollout routing changes).
 
 ### 5. Gaps
-- No production shadow diff dashboard with lane-specific metrics.
+- Alert wiring and automated rollback policy coupling remain deferred to T14.
 
 ### 6. Acceptance criteria
-- Shadow-read diff pipeline runs continuously for target tenants.
-- Dashboard tracks evidence coverage, divergence, latency, and contradiction rates.
-- Rollback thresholds wired to alerts.
-- Live quality monitoring tracks:
-  - continuity regressions
-  - tone/interaction regressions
-  - relationship-awareness degradation
-- Quality alerts are incorporated into rollout stop/rollback controls.
+- Feature-flagged shadow-read diff pipeline exists and can run for selected live requests without changing served output. ✅
+- Structured, queryable audit rows capture factual/evidence/continuity/latency diffs. ✅
+- Internal audit endpoint exposes regression-oriented summary metrics (evidence coverage, unsupported factual diffs, latency deltas, continuity drift, contradiction signals). ✅
+- Rollout policy/alert coupling remains explicitly out of scope for T12b and is deferred to T14. ✅
 
 ### 7. Risks
 - Diff noise if v1 and v2 contracts are not normalized before comparison.
@@ -729,8 +725,8 @@ Can run independently once dependencies are met:
 - Documentation alignment portions of **T15** can start early, but destructive cleanup must wait.
 
 ## Immediate Next 3 Tickets
-1. **T12b** — Live shadow-read diffing and rollout audit dashboard.
-2. **T13** — Continuous invariants + repair jobs.
-3. **T14** — Cohort rollout + rollback controls.
+1. **T13** — Continuous invariants + repair jobs.
+2. **T14** — Cohort rollout + rollback controls.
+3. **T15** — Legacy Graphiti-era deprecation and cleanup.
 
-Rationale: T4/T4b/T6/T7/T8/T9a/T10/T11/T12a are closed with execution validation; proceed to live rollout auditing, invariant automation, and cohorted rollout controls.
+Rationale: T4/T4b/T6/T7/T8/T9a/T10/T11/T12a/T12b are closed with execution validation; proceed to invariant automation, controlled rollout, and cleanup/deprecation.

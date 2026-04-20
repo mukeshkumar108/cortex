@@ -132,6 +132,7 @@ async def test_t2_v2_additive_schema_objects_exist():
             "v2_pipeline_checkpoints",
             "predicate_policy_versions",
             "turn_ingest_idempotency",
+            "retrieval_shadow_diffs",
         ]
         for table in required_tables:
             exists = await conn.fetchval("SELECT to_regclass($1)", f"public.{table}")
@@ -387,5 +388,57 @@ async def test_t8_canonical_mutation_watermark_contract():
             """
         )
         assert commit_check == "canonical_mutations_commit_status_check"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_t12b_retrieval_shadow_diff_contract():
+    async with app.router.lifespan_context(app):
+        pass
+
+    conn = await asyncpg.connect(_db_url())
+    try:
+        table = await conn.fetchval("SELECT to_regclass('public.retrieval_shadow_diffs')")
+        assert table == "retrieval_shadow_diffs"
+
+        columns = await conn.fetch(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'retrieval_shadow_diffs'
+            """
+        )
+        col_names = {row["column_name"] for row in columns}
+        assert "endpoint" in col_names
+        assert "served_intent" in col_names
+        assert "request_fingerprint" in col_names
+        assert "status" in col_names
+        assert "served_latency_ms" in col_names
+        assert "shadow_latency_ms" in col_names
+        assert "latency_delta_ms" in col_names
+        assert "diff_payload" in col_names
+        assert "metrics_payload" in col_names
+
+        status_check = await conn.fetchval(
+            """
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid = 'retrieval_shadow_diffs'::regclass
+              AND conname = 'retrieval_shadow_diffs_status_check'
+            """
+        )
+        assert status_check == "retrieval_shadow_diffs_status_check"
+
+        created_idx = await conn.fetchval(
+            """
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = 'retrieval_shadow_diffs'
+              AND indexname = 'idx_retrieval_shadow_diffs_created'
+            """
+        )
+        assert created_idx == "idx_retrieval_shadow_diffs_created"
     finally:
         await conn.close()

@@ -7,6 +7,7 @@ import logging
 import re
 import json
 import uuid
+from time import perf_counter
 from copy import deepcopy
 from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import parse_qsl, urlencode
@@ -80,6 +81,7 @@ from .memory_ontology import (
 )
 from .canonicalization import normalize_text as canonicalize_text, stable_short_hash
 from .extraction_results import persist_extract_result, ExtractionContractError
+from .retrieval_shadow import build_shadow_diff, persist_shadow_diff, persist_shadow_error
 
 # Configure logging
 logging.basicConfig(
@@ -11885,6 +11887,106 @@ async def _memory_query_legacy_adapter(request: MemoryQueryRequest) -> MemoryQue
     )
 
 
+def _shadow_sampling_selected(*, tenant_id: str, user_id: str, query: str, intent: str, sample_rate: float) -> bool:
+    rate = max(0.0, min(1.0, float(sample_rate or 0.0)))
+    if rate <= 0.0:
+        return False
+    if rate >= 1.0:
+        return True
+    sample_key = stable_short_hash(
+        json.dumps(
+            {
+                "tenant": _normalize_text(tenant_id),
+                "user": _normalize_text(user_id),
+                "query": _normalize_text(query),
+                "intent": _normalize_text(intent),
+            },
+            sort_keys=True,
+            ensure_ascii=True,
+        )
+    )
+    raw = sample_key.encode("utf-8")
+    bucket_seed = int.from_bytes((raw[:4] if len(raw) >= 4 else raw.ljust(4, b"0")), byteorder="big")
+    bucket = bucket_seed % 10000
+    return bucket < int(rate * 10000.0)
+
+
+def _shadow_lane_for_legacy_request(request: MemoryQueryRequest) -> str:
+    return _legacy_intent_to_v2_lane(_resolve_memory_intent(request.memoryIntent))
+
+
+async def _run_retrieval_shadow_diff(
+    *,
+    request: MemoryQueryRequest,
+    served_response: MemoryQueryResponse,
+    served_latency_ms: float,
+) -> None:
+    shadow_lane = _shadow_lane_for_legacy_request(request)
+    shadow_started = perf_counter()
+    shadow_response = await memory_query_v2(
+        MemoryQueryV2Request(
+            tenantId=request.tenantId,
+            userId=request.userId,
+            query=request.query,
+            lane=shadow_lane,
+            limit=request.limit,
+            referenceTime=request.referenceTime,
+        )
+    )
+    shadow_latency_ms = (perf_counter() - shadow_started) * 1000.0
+    payload = build_shadow_diff(
+        tenant_id=request.tenantId,
+        user_id=request.userId,
+        endpoint="/memory/query",
+        request_query=request.query,
+        served_intent=_resolve_memory_intent(request.memoryIntent),
+        served_response=served_response,
+        shadow_response=shadow_response,
+        served_latency_ms=served_latency_ms,
+        shadow_latency_ms=shadow_latency_ms,
+    )
+    await persist_shadow_diff(db, payload)
+
+
+async def _safe_run_retrieval_shadow_diff(
+    *,
+    request: MemoryQueryRequest,
+    served_response: MemoryQueryResponse,
+    served_latency_ms: float,
+) -> None:
+    try:
+        await _run_retrieval_shadow_diff(
+            request=request,
+            served_response=served_response,
+            served_latency_ms=served_latency_ms,
+        )
+    except Exception as e:
+        logger.warning(
+            "retrieval shadow diff failed tenant=%s user=%s intent=%s err=%s",
+            request.tenantId,
+            request.userId,
+            _resolve_memory_intent(request.memoryIntent),
+            e,
+        )
+        try:
+            await persist_shadow_error(
+                db,
+                tenant_id=request.tenantId,
+                user_id=request.userId,
+                endpoint="/memory/query",
+                served_intent=_resolve_memory_intent(request.memoryIntent),
+                request_query=request.query,
+                error=str(e),
+            )
+        except Exception as persist_err:
+            logger.warning(
+                "retrieval shadow error persistence failed tenant=%s user=%s err=%s",
+                request.tenantId,
+                request.userId,
+                persist_err,
+            )
+
+
 @app.post(
     "/memory/query",
     response_model=MemoryQueryResponse,
@@ -11895,7 +11997,35 @@ async def memory_query(request: MemoryQueryRequest):
     Legacy compatibility endpoint.
     """
     # T11 transitional rule: route exclusively through v2 adapter; no mixed-authority legacy fallback.
-    return await _memory_query_legacy_adapter(request)
+    started = perf_counter()
+    response = await _memory_query_legacy_adapter(request)
+    served_latency_ms = (perf_counter() - started) * 1000.0
+
+    settings = get_settings()
+    shadow_enabled = bool(settings.retrieval_shadow_read_enabled) and bool(settings.retrieval_shadow_read_endpoint_enabled)
+    sampled = _shadow_sampling_selected(
+        tenant_id=request.tenantId,
+        user_id=request.userId,
+        query=request.query,
+        intent=_resolve_memory_intent(request.memoryIntent),
+        sample_rate=float(settings.retrieval_shadow_read_sample_rate or 0.0),
+    )
+    if shadow_enabled and sampled:
+        if bool(settings.retrieval_shadow_read_blocking):
+            await _safe_run_retrieval_shadow_diff(
+                request=request,
+                served_response=response,
+                served_latency_ms=served_latency_ms,
+            )
+        else:
+            asyncio.create_task(
+                _safe_run_retrieval_shadow_diff(
+                    request=request,
+                    served_response=response,
+                    served_latency_ms=served_latency_ms,
+                )
+            )
+    return response
 
     # Legacy implementation retained below for temporary reference during migration;
     # unreachable by design in T11 and scheduled for removal in T15.
@@ -15606,6 +15736,86 @@ async def session_handover(
     except Exception as e:
         logger.error(f"session handover failed user=%s err=%s", effective_user_id, e)
         raise HTTPException(status_code=500, detail="session handover failed")
+
+
+@app.get("/internal/v2/retrieval-shadow/audit")
+async def retrieval_shadow_audit(
+    hours: int = Query(default=24, ge=1, le=720),
+    limit: int = Query(default=200, ge=1, le=1000),
+    tenant_id: Optional[str] = Query(default=None),
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    since = datetime.utcnow().replace(tzinfo=dt_timezone.utc) - timedelta(hours=int(hours or 24))
+    tenant = _normalize_text(tenant_id)
+    rows = await db.fetch(
+        """
+        SELECT
+          shadow_id,
+          tenant_id,
+          user_id,
+          endpoint,
+          served_intent,
+          request_fingerprint,
+          status,
+          served_latency_ms,
+          shadow_latency_ms,
+          latency_delta_ms,
+          diff_payload,
+          metrics_payload,
+          created_at
+        FROM retrieval_shadow_diffs
+        WHERE created_at >= $1
+          AND ($2::text IS NULL OR tenant_id = $2::text)
+        ORDER BY created_at DESC, shadow_id DESC
+        LIMIT $3
+        """,
+        since,
+        tenant or None,
+        int(limit or 200),
+    )
+
+    row_count = len(rows or [])
+    regressions = {"evidence": 0, "unsupported_factual": 0, "latency": 0, "continuity_drift": 0, "contradictions": 0}
+    latency_deltas: List[float] = []
+    statuses: Dict[str, int] = {}
+    for row in (rows or []):
+        status = _normalize_text(row.get("status")) or "unknown"
+        statuses[status] = int(statuses.get(status) or 0) + 1
+        delta = row.get("latency_delta_ms")
+        if delta is not None:
+            latency_deltas.append(float(delta))
+        diff_payload = row.get("diff_payload") if isinstance(row.get("diff_payload"), dict) else {}
+        signals = diff_payload.get("regression_signals") if isinstance(diff_payload, dict) else {}
+        if isinstance(signals, dict):
+            if bool(signals.get("evidence_coverage_regression")):
+                regressions["evidence"] += 1
+            if bool(signals.get("unsupported_factual_difference")):
+                regressions["unsupported_factual"] += 1
+            if bool(signals.get("latency_regression")):
+                regressions["latency"] += 1
+            if bool(signals.get("continuity_drift")):
+                regressions["continuity_drift"] += 1
+            contradictions = signals.get("possible_contradictions")
+            if isinstance(contradictions, list) and contradictions:
+                regressions["contradictions"] += 1
+
+    avg_delta = (sum(latency_deltas) / float(len(latency_deltas))) if latency_deltas else 0.0
+    return {
+        "window_hours": int(hours or 24),
+        "since": since.isoformat(),
+        "tenant_filter": tenant or None,
+        "rows": row_count,
+        "status_breakdown": statuses,
+        "regression_counts": regressions,
+        "latency": {
+            "samples": len(latency_deltas),
+            "avg_delta_ms": round(float(avg_delta), 3),
+            "max_delta_ms": round(float(max(latency_deltas)), 3) if latency_deltas else 0.0,
+            "min_delta_ms": round(float(min(latency_deltas)), 3) if latency_deltas else 0.0,
+        },
+        "items": rows,
+    }
 
 
 @app.post("/memory/search")
