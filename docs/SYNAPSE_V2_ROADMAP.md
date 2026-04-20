@@ -499,15 +499,15 @@ Support clients during migration without preserving mixed-authority engine.
 T10.
 
 ### 4. Current status
-Not implemented.
+Done.
 
 ### 5. Gaps
-- Legacy endpoints still execute legacy logic directly.
+- Legacy compatibility surface is intentionally transitional and scheduled for removal at T15.
 
 ### 6. Acceptance criteria
-- Legacy retrieval endpoints call v2 service internally.
-- No adapter path can invoke old mixed-authority logic.
-- Contract tests pass for legacy response compatibility.
+- Legacy retrieval endpoints call v2 service internally. ✅
+- No adapter path can invoke old mixed-authority logic. ✅
+- Contract tests pass for legacy response compatibility. ✅
 
 ### 7. Risks
 - Silent fallback to old logic during incidents.
@@ -729,8 +729,8 @@ Can run independently once dependencies are met:
 - Documentation alignment portions of **T15** can start early, but destructive cleanup must wait.
 
 ## Immediate Next 3 Tickets
-1. **T11** — Legacy client compatibility adapter routed to v2 only.
-2. **T12b** — Live shadow-read diffing and rollout audit dashboard.
-3. **T13** — Continuous invariants + repair jobs.
+1. **T12b** — Live shadow-read diffing and rollout audit dashboard.
+2. **T13** — Continuous invariants + repair jobs.
+3. **T14** — Cohort rollout + rollback controls.
 
-Rationale: T4/T4b/T6/T7/T8/T9a/T10/T12a are closed with execution validation; proceed to adapter cutover, live rollout auditing, and invariant automation.
+Rationale: T4/T4b/T6/T7/T8/T9a/T10/T11/T12a are closed with execution validation; proceed to live rollout auditing, invariant automation, and cohorted rollout controls.

@@ -29,6 +29,31 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-20 15:35 UTC — T11
+- Summary of what changed:
+  - Converted legacy `POST /memory/query` into a strict T11 compatibility adapter that routes through v2 retrieval logic only.
+  - Added legacy-to-v2 intent/lane mapping (`exact -> factual`, `episodic -> episodic`, `hybrid -> hybrid`) and conservative lane-to-legacy response mapping.
+  - Removed runtime dependence on legacy mixed-authority retrieval path for legacy endpoint handling (no silent fallback).
+  - Marked adapter behavior as transitional with explicit T15 removal TODO/comments.
+  - Fixed v2 factual evidence-link query to use actual `claim_evidence` schema columns (`turn_id`, `evidence_start_char`, `evidence_end_char`).
+- Files changed:
+  - `src/main.py`
+  - `tests/test_t11_legacy_adapter.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+  - `docs/SYNAPSE_V2_CHANGELOG.md`
+- Tests added/updated:
+  - `tests/test_t11_legacy_adapter.py`:
+    - legacy endpoint routes to v2-only logic and does not invoke old retrieval helpers
+    - hybrid mapping preserves legacy shape with conservative derived continuity mapping
+    - default legacy intent routes safely to factual lane
+- Acceptance criteria satisfied:
+  - Legacy compatibility endpoint is routed to v2-backed logic only.
+  - No adapter path invokes old mixed-authority retrieval code.
+  - Legacy response shape compatibility is preserved for core fields (`facts`, `factItems`, `episodes`, `metadata`).
+- Known remaining gaps:
+  - Broader historical `tests/test_graphiti_native.py` assertions for pre-T11 legacy internals are not the T11 acceptance suite and remain to be migrated to v2/adapter-era expectations.
+- Status: done
+
 ### 2026-04-20 15:20 UTC — T10
 - Summary of what changed:
   - Implemented authoritative `POST /v2/memory/query` retrieval contract with explicit lanes: `factual`, `episodic`, `continuity`, `hybrid`.

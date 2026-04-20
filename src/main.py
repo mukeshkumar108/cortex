@@ -11445,12 +11445,12 @@ async def _v2_collect_factual_items(
               jsonb_build_object(
                 'claimEvidenceId', ce.claim_evidence_id,
                 'sessionId', ce.session_id,
-                'turnIndex', ce.turn_index,
-                'charStart', ce.char_start,
-                'charEnd', ce.char_end,
-                'evidenceText', t.content
+                'turnIndex', t.turn_index,
+                'charStart', ce.evidence_start_char,
+                'charEnd', ce.evidence_end_char,
+                'evidenceText', COALESCE(ce.evidence_text, t.content)
               )
-              ORDER BY ce.turn_index ASC, ce.claim_evidence_id ASC
+              ORDER BY t.turn_index ASC NULLS LAST, ce.claim_evidence_id ASC
             ) FILTER (WHERE ce.claim_evidence_id IS NOT NULL),
             '[]'::jsonb
           ) AS evidence_links
@@ -11464,7 +11464,7 @@ async def _v2_collect_factual_items(
         LEFT JOIN turns_v2 t
           ON t.tenant_id = ce.tenant_id
          AND t.session_id = ce.session_id
-         AND t.turn_index = ce.turn_index
+         AND t.turn_id = ce.turn_id
         WHERE c.tenant_id = ANY($1::text[])
           AND c.user_id = $2
           AND c.lifecycle_status = 'active'
@@ -11769,6 +11769,122 @@ async def memory_query_v2(request: MemoryQueryV2Request):
         raise HTTPException(status_code=500, detail="v2 memory query failed")
 
 
+def _legacy_intent_to_v2_lane(memory_intent: str) -> str:
+    intent = _resolve_memory_intent(memory_intent)
+    if intent == "exact":
+        return "factual"
+    if intent == "episodic":
+        return "episodic"
+    return "hybrid"
+
+
+def _map_v2_item_to_legacy_fact(item: MemoryQueryV2Item) -> Optional[Fact]:
+    text = _normalize_text(item.text)
+    if not text:
+        return None
+    return Fact(
+        text=text,
+        relevance=item.relevance,
+        source=item.source,
+        sourceTenant=item.sourceTenant,
+    )
+
+
+def _map_v2_item_to_legacy_episode(item: MemoryQueryV2Item) -> Optional[EpisodeRecallItem]:
+    if item.itemType != "episode":
+        return None
+    evidence_lines = []
+    for row in (item.evidence or []):
+        if not isinstance(row, dict):
+            continue
+        line = _normalize_text(row.get("evidenceText"))
+        if line:
+            evidence_lines.append(line)
+    return EpisodeRecallItem(
+        episodeId=item.episodeId,
+        sessionId=item.sessionId,
+        referenceTime=item.referenceTime,
+        score=item.relevance,
+        summary=item.text,
+        evidence=evidence_lines,
+        linkedEntities=item.linkedEntities or [],
+        sourceTenant=item.sourceTenant,
+    )
+
+
+async def _memory_query_legacy_adapter(request: MemoryQueryRequest) -> MemoryQueryResponse:
+    """
+    T11 transitional compatibility adapter.
+    Legacy /memory/query maps to v2 lanes and response contracts without invoking legacy mixed-authority retrieval.
+    TODO(T15): remove once legacy clients are fully migrated to /v2/memory/query.
+    """
+    memory_intent = _resolve_memory_intent(request.memoryIntent)
+    lane = _legacy_intent_to_v2_lane(memory_intent)
+    v2_response = await memory_query_v2(
+        MemoryQueryV2Request(
+            tenantId=request.tenantId,
+            userId=request.userId,
+            query=request.query,
+            lane=lane,
+            limit=request.limit,
+            referenceTime=request.referenceTime,
+        )
+    )
+
+    fact_items: List[Fact] = []
+    episodes: List[EpisodeRecallItem] = []
+    continuity_items: List[Fact] = []
+    for item in (v2_response.items or []):
+        if item.lane == "factual":
+            mapped = _map_v2_item_to_legacy_fact(item)
+            if mapped is not None:
+                fact_items.append(mapped)
+            continue
+        if item.lane == "episodic":
+            mapped_episode = _map_v2_item_to_legacy_episode(item)
+            if mapped_episode is not None:
+                episodes.append(mapped_episode)
+            continue
+        if item.lane == "continuity":
+            # Conservative adapter degradation: continuity remains explicitly derived.
+            mapped_continuity = _map_v2_item_to_legacy_fact(item)
+            if mapped_continuity is not None:
+                continuity_items.append(mapped_continuity)
+
+    # Keep legacy shape stable while making adapter origin explicit for clients/operators.
+    facts = [item.text for item in fact_items if _normalize_text(item.text)]
+    if memory_intent == "hybrid":
+        facts.extend([item.text for item in continuity_items if _normalize_text(item.text)])
+
+    metadata = {
+        "query": request.query,
+        "memoryIntent": memory_intent,
+        "responseMode": "context" if request.includeContext else "recall",
+        "adapter": {
+            "mode": "t11_legacy_to_v2_only",
+            "v2Lane": lane,
+            "legacyMixedAuthorityFallback": False,
+            "continuityMappedAsDerivedFacts": bool(memory_intent == "hybrid" and continuity_items),
+            "includeContextSupported": False,
+        },
+        "v2Metadata": v2_response.metadata,
+        "facts": len(fact_items),
+        "entities": 0,
+        "episodes": len(episodes),
+        "continuityFacts": len(continuity_items),
+    }
+    if request.includeContext:
+        metadata["contextCompatibilityNotice"] = "Legacy includeContext is not available in T11 adapter mode."
+
+    return MemoryQueryResponse(
+        facts=facts,
+        factItems=(fact_items + continuity_items) if memory_intent == "hybrid" else fact_items,
+        entities=[],
+        episodes=episodes,
+        metadata=metadata,
+    )
+
+
 @app.post(
     "/memory/query",
     response_model=MemoryQueryResponse,
@@ -11776,8 +11892,13 @@ async def memory_query_v2(request: MemoryQueryV2Request):
 )
 async def memory_query(request: MemoryQueryRequest):
     """
-    Query Graphiti for semantic memory snippets on-demand.
+    Legacy compatibility endpoint.
     """
+    # T11 transitional rule: route exclusively through v2 adapter; no mixed-authority legacy fallback.
+    return await _memory_query_legacy_adapter(request)
+
+    # Legacy implementation retained below for temporary reference during migration;
+    # unreachable by design in T11 and scheduled for removal in T15.
     try:
         fact_limit = max(1, request.limit or 10)
         memory_intent = _resolve_memory_intent(request.memoryIntent)
