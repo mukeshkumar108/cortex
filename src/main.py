@@ -82,6 +82,7 @@ from .memory_ontology import (
 from .canonicalization import normalize_text as canonicalize_text, stable_short_hash
 from .extraction_results import persist_extract_result, ExtractionContractError
 from .retrieval_shadow import build_shadow_diff, persist_shadow_diff, persist_shadow_error
+from .invariants import InvariantManager
 
 # Configure logging
 logging.basicConfig(
@@ -7062,6 +7063,28 @@ async def loop_staleness_janitor_loop(
         await asyncio.sleep(max(300, interval_seconds))
 
 
+async def v2_invariant_checker_loop(
+    *,
+    interval_seconds: int,
+    auto_repair_enabled: bool,
+) -> None:
+    manager = InvariantManager(db)
+    while True:
+        try:
+            summary = await manager.run_cycle(auto_repair_enabled=bool(auto_repair_enabled))
+            logger.info(
+                "v2 invariant checker detected=%s persisted=%s auto_repaired=%s review_required=%s failed_repairs=%s",
+                summary.detected,
+                summary.persisted,
+                summary.auto_repaired,
+                summary.review_required,
+                summary.failed_repairs,
+            )
+        except Exception as e:
+            logger.error(f"v2 invariant checker loop error: {e}")
+        await asyncio.sleep(max(60, int(interval_seconds or 900)))
+
+
 def _safe_parse_json_object(raw: Any) -> Optional[Dict[str, Any]]:
     if raw is None:
         return None
@@ -11183,6 +11206,14 @@ async def lifespan(app: FastAPI):
                 )
             )
             logger.info("Daily habit dedupe loop started")
+        if settings.v2_invariant_checker_enabled:
+            app.state.v2_invariant_checker_task = asyncio.create_task(
+                v2_invariant_checker_loop(
+                    interval_seconds=settings.v2_invariant_checker_interval_seconds,
+                    auto_repair_enabled=settings.v2_invariant_checker_auto_repair_enabled,
+                )
+            )
+            logger.info("V2 invariant checker loop started")
 
     except Exception as e:
         logger.error(f"Failed to initialize services: {e}")
@@ -11245,6 +11276,14 @@ async def lifespan(app: FastAPI):
         app.state.daily_habit_dedupe_task.cancel()
         try:
             await app.state.daily_habit_dedupe_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+    if getattr(app.state, "v2_invariant_checker_task", None):
+        app.state.v2_invariant_checker_task.cancel()
+        try:
+            await app.state.v2_invariant_checker_task
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -15815,6 +15854,133 @@ async def retrieval_shadow_audit(
             "min_delta_ms": round(float(min(latency_deltas)), 3) if latency_deltas else 0.0,
         },
         "items": rows,
+    }
+
+
+@app.post("/internal/v2/invariants/run")
+async def run_v2_invariants(
+    auto_repair: Optional[bool] = Query(default=None),
+    max_rows_per_invariant: int = Query(default=200, ge=1, le=2000),
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    settings = get_settings()
+    manager = InvariantManager(db)
+    summary = await manager.run_cycle(
+        auto_repair_enabled=bool(
+            settings.v2_invariant_checker_auto_repair_enabled if auto_repair is None else auto_repair
+        ),
+        max_rows_per_invariant=int(max_rows_per_invariant),
+    )
+    return {
+        "runner_version": "t13.invariants.v1",
+        "detected": summary.detected,
+        "persisted": summary.persisted,
+        "auto_repaired": summary.auto_repaired,
+        "review_required": summary.review_required,
+        "failed_repairs": summary.failed_repairs,
+    }
+
+
+@app.get("/internal/v2/invariants/violations")
+async def list_v2_invariant_violations(
+    status: Optional[str] = Query(default=None),
+    tenant_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    status_filter = _normalize_text(status).lower()
+    if status_filter not in {"", "open", "review_required", "auto_repaired", "ignored", "failed"}:
+        raise HTTPException(status_code=400, detail="invalid status filter")
+    tenant = _normalize_text(tenant_id)
+    rows = await db.fetch(
+        """
+        SELECT
+          violation_id,
+          invariant_code,
+          severity,
+          tenant_id,
+          user_id,
+          object_type,
+          object_id,
+          details,
+          status,
+          requires_human_review,
+          first_detected_at,
+          last_detected_at,
+          repaired_at,
+          occurrence_count,
+          detected_by,
+          updated_at
+        FROM invariant_violations
+        WHERE ($1::text IS NULL OR status = $1::text)
+          AND ($2::text IS NULL OR tenant_id = $2::text)
+        ORDER BY last_detected_at DESC, violation_id DESC
+        LIMIT $3
+        """,
+        (status_filter or None),
+        (tenant or None),
+        int(limit),
+    )
+    open_counts = await db.fetch(
+        """
+        SELECT status, COUNT(*)::int AS n
+        FROM invariant_violations
+        WHERE ($1::text IS NULL OR tenant_id = $1::text)
+        GROUP BY status
+        ORDER BY status ASC
+        """,
+        (tenant or None),
+    )
+    return {
+        "tenant_filter": tenant or None,
+        "status_filter": status_filter or None,
+        "rows": len(rows or []),
+        "status_counts": {(_normalize_text(r.get("status")) or "unknown"): int(r.get("n") or 0) for r in (open_counts or [])},
+        "items": rows or [],
+    }
+
+
+@app.get("/internal/v2/invariants/repairs")
+async def list_v2_invariant_repairs(
+    status: Optional[str] = Query(default=None),
+    tenant_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    status_filter = _normalize_text(status).lower()
+    if status_filter not in {"", "applied", "blocked", "failed", "skipped"}:
+        raise HTTPException(status_code=400, detail="invalid status filter")
+    tenant = _normalize_text(tenant_id)
+    rows = await db.fetch(
+        """
+        SELECT
+          repair_action_id,
+          violation_id,
+          tenant_id,
+          action_code,
+          action_mode,
+          status,
+          details,
+          created_at,
+          applied_at
+        FROM invariant_repair_actions
+        WHERE ($1::text IS NULL OR status = $1::text)
+          AND ($2::text IS NULL OR tenant_id = $2::text)
+        ORDER BY created_at DESC, repair_action_id DESC
+        LIMIT $3
+        """,
+        (status_filter or None),
+        (tenant or None),
+        int(limit),
+    )
+    return {
+        "tenant_filter": tenant or None,
+        "status_filter": status_filter or None,
+        "rows": len(rows or []),
+        "items": rows or [],
     }
 
 

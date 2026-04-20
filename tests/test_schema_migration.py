@@ -133,6 +133,8 @@ async def test_t2_v2_additive_schema_objects_exist():
             "predicate_policy_versions",
             "turn_ingest_idempotency",
             "retrieval_shadow_diffs",
+            "invariant_violations",
+            "invariant_repair_actions",
         ]
         for table in required_tables:
             exists = await conn.fetchval("SELECT to_regclass($1)", f"public.{table}")
@@ -440,5 +442,62 @@ async def test_t12b_retrieval_shadow_diff_contract():
             """
         )
         assert created_idx == "idx_retrieval_shadow_diffs_created"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_t13_invariant_tables_contract():
+    async with app.router.lifespan_context(app):
+        pass
+
+    conn = await asyncpg.connect(_db_url())
+    try:
+        v_table = await conn.fetchval("SELECT to_regclass('public.invariant_violations')")
+        r_table = await conn.fetchval("SELECT to_regclass('public.invariant_repair_actions')")
+        assert v_table == "invariant_violations"
+        assert r_table == "invariant_repair_actions"
+
+        v_status_check = await conn.fetchval(
+            """
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid = 'invariant_violations'::regclass
+              AND conname = 'invariant_violations_status_check'
+            """
+        )
+        assert v_status_check == "invariant_violations_status_check"
+
+        repair_fk = await conn.fetchval(
+            """
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid = 'invariant_repair_actions'::regclass
+              AND conname = 'invariant_repair_actions_violation_fk'
+            """
+        )
+        assert repair_fk == "invariant_repair_actions_violation_fk"
+
+        v_idx = await conn.fetchval(
+            """
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = 'invariant_violations'
+              AND indexname = 'idx_invariant_violations_tenant_status_detected'
+            """
+        )
+        assert v_idx == "idx_invariant_violations_tenant_status_detected"
+
+        r_idx = await conn.fetchval(
+            """
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = 'invariant_repair_actions'
+              AND indexname = 'idx_invariant_repair_actions_tenant_created'
+            """
+        )
+        assert r_idx == "idx_invariant_repair_actions_tenant_created"
     finally:
         await conn.close()

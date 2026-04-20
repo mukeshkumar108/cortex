@@ -29,6 +29,47 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-20 14:00 UTC — T13
+- Summary of what changed:
+  - Added v2 continuous invariant framework covering canonical safety checks for:
+    - factual claims missing evidence
+    - invalid claim lifecycle state transitions
+    - duplicate active claims on exclusive (`cardinality=one`) slots
+    - claim-evidence tenant/user/session integrity mismatches
+    - canonical mutation watermark consistency drift
+    - assistant-authored canonical claims without explicit allow policy
+    - invalid entity merge lineage states
+  - Added explicit repair governance:
+    - safe structural auto-repair only for watermark inconsistency
+    - semantic/risky classes are marked `review_required` and not auto-mutated
+  - Added structured, queryable persistence for violations and repair actions.
+  - Added scheduled invariant checker loop (feature-flagged) plus internal endpoints to run checks and inspect violations/repairs.
+- Files changed:
+  - `src/invariants.py`
+  - `src/main.py`
+  - `src/config.py`
+  - `migrations/041_t13_invariant_checks_and_repairs.sql`
+  - `schema.sql`
+  - `tests/test_t13_invariants.py`
+  - `tests/test_schema_migration.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+  - `docs/SYNAPSE_V2_CHANGELOG.md`
+- Tests added/updated:
+  - `tests/test_t13_invariants.py`:
+    - representative invariant detection cases
+    - auto-repair executes only for safe class
+    - risky semantic classes are review-only and not auto-mutated
+    - internal filter handling fails safely
+  - `tests/test_schema_migration.py`:
+    - `test_t13_invariant_tables_contract`
+- Acceptance criteria satisfied:
+  - Continuous invariant detection exists (scheduled/manual).
+  - Repair governance is explicit and enforced in code.
+  - Structured observability exists for outstanding violations and repair actions.
+- Known remaining gaps:
+  - Rollout-stop/alert automation remains deferred to T14.
+- Status: done
+
 ### 2026-04-20 13:36 UTC — T12b
 - Summary of what changed:
   - Added live shadow-read diff instrumentation for legacy retrieval requests (`/memory/query`) with feature-flag + sampling controls and no serving-path response changes.

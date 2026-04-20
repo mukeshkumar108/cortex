@@ -95,6 +95,9 @@ class Settings(BaseSettings):
     retrieval_shadow_read_sample_rate: float = 0.0
     retrieval_shadow_read_blocking: bool = False
     retrieval_shadow_read_endpoint_enabled: bool = True
+    v2_invariant_checker_enabled: bool = True
+    v2_invariant_checker_interval_seconds: int = 900
+    v2_invariant_checker_auto_repair_enabled: bool = True
 
     # Identity cache
     identity_cache_ttl_hours: int = 6

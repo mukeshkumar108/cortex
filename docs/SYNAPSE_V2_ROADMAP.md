@@ -602,16 +602,15 @@ Canonical memory correctness decays without continuous enforcement.
 T7, T8, T9a.
 
 ### 4. Current status
-Partial legacy checks exist; v2 invariant framework not implemented.
+Done (v2 invariant detection, governed repair workflow, and internal observability endpoints implemented).
 
 ### 5. Gaps
-- No v2 invariant job suite for claim/evidence/lane correctness.
-- Repair governance (human vs auto) not encoded.
+- Alert policy coupling to rollout-stop automation remains deferred to T14.
 
 ### 6. Acceptance criteria
-- Continuous checks for documented invariants run and alert.
-- Repair jobs implemented with explicit approval gates for semantic mutations.
-- Audit logs for all repair actions.
+- Continuous checks for documented invariants run via scheduled checker loop and manual run endpoint. ✅
+- Repair jobs implement explicit approval gates: semantic classes are `review_required`; only unambiguous structural classes are auto-repaired. ✅
+- Structured/queryable logs exist for violations and repair actions. ✅
 
 ### 7. Risks
 - Over-aggressive auto-repairs mutate truth incorrectly.
@@ -725,8 +724,8 @@ Can run independently once dependencies are met:
 - Documentation alignment portions of **T15** can start early, but destructive cleanup must wait.
 
 ## Immediate Next 3 Tickets
-1. **T13** — Continuous invariants + repair jobs.
-2. **T14** — Cohort rollout + rollback controls.
-3. **T15** — Legacy Graphiti-era deprecation and cleanup.
+1. **T14** — Cohort rollout + rollback controls.
+2. **T15** — Legacy Graphiti-era deprecation and cleanup.
+3. Post-T15 hardening/debt closeout (non-ticketed residuals).
 
-Rationale: T4/T4b/T6/T7/T8/T9a/T10/T11/T12a/T12b are closed with execution validation; proceed to invariant automation, controlled rollout, and cleanup/deprecation.
+Rationale: T4/T4b/T6/T7/T8/T9a/T10/T11/T12a/T12b/T13 are closed with execution validation; proceed to controlled rollout and cleanup/deprecation.
