@@ -29,6 +29,33 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-20 10:05 UTC — T6
+- Summary of what changed:
+  - Added a canonical entity resolver module with deterministic mention resolution and explicit result contract fields: `resolved_entity_id`, `resolution_status`, `resolution_confidence`, `resolver_version`.
+  - Implemented alias normalization/linking via canonicalization SDK and fail-closed ambiguity behavior when one alias maps to multiple active entities.
+  - Implemented auditable manual entity merge operation with lineage updates (`entities.merged_into_entity_id`, `status='merged'`) and mutation logging in `canonical_mutations`.
+  - Kept scope identity-only: no synthesis rewrites, no profile enrichment, no retrieval-path changes, no claim resolver behavior.
+- Files changed:
+  - `src/entity_resolution.py`
+  - `tests/test_entity_resolution.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+  - `docs/SYNAPSE_V2_CHANGELOG.md`
+- Tests added/updated:
+  - `tests/test_entity_resolution.py`:
+    - deterministic known-entity resolution
+    - new canonical entity creation + alias linkage
+    - ambiguous alias fail-closed + ambiguity mutation logging
+    - merge lineage preservation + alias copy to survivor
+    - tenant isolation
+- Acceptance criteria satisfied:
+  - Canonical entity IDs resolve deterministically with explicit ambiguity state and confidence.
+  - Ambiguous aliases do not auto-resolve.
+  - Merge lineage is auditable with no hard deletes.
+  - Tenant-scoped resolution isolation is enforced.
+- Known remaining gaps:
+  - T6 does not integrate claim lifecycle resolution; that remains T7 scope by design.
+- Status: done
+
 ### 2026-04-20 09:59 UTC — T4b
 - Summary of what changed:
   - Executed T4b runtime validation tests in this environment and confirmed quarantine behavior and schema contract enforcement.

@@ -288,11 +288,10 @@ Claims depend on stable entity IDs; ambiguous alias auto-linking corrupts memory
 T0, T2, T4, T5.
 
 ### 4. Current status
-Partial legacy behavior only.
+Done (canonical entity resolver module implemented with deterministic alias normalization, fail-closed ambiguity, and auditable merge lineage operations).
 
 ### 5. Gaps
-- Existing entity/profile paths are derived and mixed with retrieval.
-- No canonical merge ledger and strict ambiguity handling in v2 contract.
+- None for T6 identity-resolution scope.
 
 ### 6. Acceptance criteria
 - Resolver outputs canonical entity IDs with confidence and ambiguity state.
@@ -304,9 +303,8 @@ Partial legacy behavior only.
 - Over-merging creates irreversible semantic corruption.
 
 ### 8. Files/functions likely affected
-- `src/main.py` (entity helpers)
-- `src/graphiti_client.py` (legacy mapping boundaries)
-- new entity resolver module + migrations
+- `src/entity_resolution.py`
+- `tests/test_entity_resolution.py`
 
 ---
 
@@ -716,8 +714,8 @@ Can run independently once dependencies are met:
 - Documentation alignment portions of **T15** can start early, but destructive cleanup must wait.
 
 ## Immediate Next 3 Tickets
-1. **T6** — Entity resolution v2.
-2. **T7** — Claim resolution v2.
-3. **T8** — Canonical mutation log + watermarks.
+1. **T7** — Claim resolution v2.
+2. **T8** — Canonical mutation log + watermarks.
+3. **T12a** — Offline replay, diffing, and audit harness.
 
-Rationale: T4 and T4b are now closed with execution validation; continue on the critical path with T6/T7, then T8.
+Rationale: T4/T4b/T6 are closed with execution validation; proceed on critical path with T7 and T8, then replay/audit hardening.
