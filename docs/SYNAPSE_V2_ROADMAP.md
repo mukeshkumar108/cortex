@@ -385,19 +385,19 @@ Continuity data is necessary but must never become authority.
 T2, T7, T8.
 
 ### 4. Current status
-Legacy projection systems exist; v2 projection contract not implemented.
+Done.
 
 ### 5. Gaps
-- Existing projections (`user_model`, `living_context`, etc.) are mixed with retrieval authority.
-- No strict v2 projection rebuild/watermark contract.
+- No remaining T9a re-anchoring gaps for currently active synthesis surfaces.
+- Full projection rebuild/snapshot orchestration remains part of later projection-operational tickets, not T9a input re-anchoring scope.
 
 ### 6. Acceptance criteria
-- Projections include source watermarks and version.
-- Rebuild-from-canonical produces same projection for same watermark.
-- No projection table is queried for factual lane.
-- Existing identity/living/thread/handover synthesis behavior is preserved during re-anchoring.
-- No single-pass replacement of existing multi-pass synthesis is introduced.
-- Re-anchored outputs meet or exceed current baseline quality.
+- Projections include source watermarks and version. ✅
+- Rebuild-from-canonical produces same projection for same watermark. ✅ for implemented re-anchored surfaces under deterministic canonical inputs.
+- No projection table is queried for factual lane. ✅ (retained from T1 containment).
+- Existing identity/living/thread/handover synthesis behavior is preserved during re-anchoring. ✅
+- No single-pass replacement of existing multi-pass synthesis is introduced. ✅
+- Re-anchored outputs meet or exceed current baseline quality. ✅ with parity/contract checks on re-anchored handover + startbrief + continuity wrapper surfaces.
 
 ### 7. Risks
 - Stale projection serving continuity errors.
@@ -407,6 +407,18 @@ Legacy projection systems exist; v2 projection contract not implemented.
 - `src/main.py` projection builders
 - user model/living context modules
 - migrations for snapshot/latest projection tables
+  - Progress completed:
+    - `src/main.py::_build_handover_packet` (canonical claims/entities/watermark fallback + provenance)
+    - `src/main.py::session_startbrief` (canonical claim/entity fallback + canonical provenance metadata)
+    - continuity wrappers in `src/main.py`:
+      - `_pg_get_entity_role_hint`
+      - `_pg_get_entity_continuity_facts`
+      - `_pg_search_nodes`
+      - `_pg_search_continuity_facts`
+    - tests:
+      - `tests/test_t9a_handover_reanchor.py`
+      - `tests/test_t9a_remaining_reanchor.py`
+      - `tests/fixtures/t9a_handover_quality_golden.json`
 
 ---
 
@@ -718,8 +730,8 @@ Can run independently once dependencies are met:
 - Documentation alignment portions of **T15** can start early, but destructive cleanup must wait.
 
 ## Immediate Next 3 Tickets
-1. **T9a** — Re-anchor existing synthesis to canonical layer.
-2. **T10** — `/v2/memory/query` implementation.
-3. **T11** — Legacy client compatibility adapter routed to v2 only.
+1. **T10** — `/v2/memory/query` implementation.
+2. **T11** — Legacy client compatibility adapter routed to v2 only.
+3. **T12b** — Live shadow-read diffing and rollout audit dashboard.
 
-Rationale: T4/T4b/T6/T7/T8/T12a are closed with execution validation; proceed with projection re-anchoring, then v2 retrieval serving, then adapter cutover.
+Rationale: T4/T4b/T6/T7/T8/T9a/T12a are closed with execution validation; proceed to v2 retrieval serving, adapter cutover, and live rollout auditing.

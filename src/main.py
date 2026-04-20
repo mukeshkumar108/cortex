@@ -227,6 +227,283 @@ async def _episodic_search(
 
 
 async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
+    def _payload_value(payload: Any) -> str:
+        if isinstance(payload, dict):
+            for key in ("value", "text", "status", "summary", "name", "title"):
+                value = _normalize_text(payload.get(key))
+                if value:
+                    return value
+            compact = _normalize_text(json.dumps(payload, sort_keys=True, ensure_ascii=True))
+            return compact
+        if isinstance(payload, list):
+            parts = [_normalize_text(x) for x in payload if _normalize_text(x)]
+            return ", ".join(parts[:3])
+        return _normalize_text(payload)
+
+    def _claim_sentence(row: Dict[str, Any]) -> str:
+        predicate = _normalize_text(row.get("predicate")).lower()
+        subject = _normalize_text(row.get("subject_name")) or _normalize_text(row.get("subject_text")) or "The user"
+        value = _payload_value(row.get("object_payload"))
+        tail = predicate.replace("_", ".").split(".")[-1] if predicate else "update"
+        tail = tail.replace("_", " ").strip() or "update"
+        if value:
+            return f"{subject} {tail}: {value}"
+        return f"{subject} {tail}."
+
+    def _claim_matches(predicate: str, terms: List[str]) -> bool:
+        clean = _normalize_text(predicate).lower()
+        return bool(clean) and any(term in clean for term in terms)
+
+    async def _load_canonical_inputs(target_user_id: str) -> Dict[str, Any]:
+        claim_rows = await db.fetch(
+            """
+            SELECT
+              c.tenant_id,
+              c.claim_event_key,
+              c.predicate,
+              c.subject_entity_id::text AS subject_entity_id,
+              c.subject_text,
+              c.object_payload,
+              c.truth_confidence,
+              c.updated_at,
+              c.created_at,
+              e.canonical_name AS subject_name,
+              e.entity_type,
+              COUNT(ce.claim_evidence_id)::int AS evidence_count
+            FROM claims c
+            LEFT JOIN entities e
+              ON e.tenant_id = c.tenant_id
+             AND e.entity_id = c.subject_entity_id
+            LEFT JOIN claim_evidence ce
+              ON ce.tenant_id = c.tenant_id
+             AND ce.claim_id = c.claim_id
+            WHERE c.user_id = $1
+              AND c.lifecycle_status = 'active'
+            GROUP BY
+              c.tenant_id,
+              c.claim_event_key,
+              c.predicate,
+              c.subject_entity_id,
+              c.subject_text,
+              c.object_payload,
+              c.truth_confidence,
+              c.updated_at,
+              c.created_at,
+              e.canonical_name,
+              e.entity_type
+            ORDER BY c.updated_at DESC NULLS LAST, c.claim_event_key ASC
+            LIMIT 300
+            """,
+            target_user_id,
+        )
+        entity_rows = await db.fetch(
+            """
+            SELECT
+              tenant_id,
+              entity_id::text AS entity_id,
+              canonical_name,
+              entity_type,
+              status,
+              created_at,
+              updated_at
+            FROM entities
+            WHERE user_id = $1
+              AND status = 'active'
+            ORDER BY updated_at DESC NULLS LAST, canonical_name_normalized ASC
+            LIMIT 200
+            """,
+            target_user_id,
+        )
+        watermark_rows = await db.fetch(
+            """
+            SELECT
+              w.tenant_id,
+              w.last_sequence,
+              w.updated_at
+            FROM canonical_tenant_watermarks w
+            WHERE EXISTS (
+                SELECT 1
+                FROM claims c
+                WHERE c.tenant_id = w.tenant_id
+                  AND c.user_id = $1
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM entities e
+                WHERE e.tenant_id = w.tenant_id
+                  AND e.user_id = $1
+            )
+            ORDER BY w.tenant_id ASC
+            """,
+            target_user_id,
+        )
+        return {
+            "claims": claim_rows or [],
+            "entities": entity_rows or [],
+            "watermarks": watermark_rows or [],
+        }
+
+    def _canonical_living_fallback(claims_rows: List[Dict[str, Any]]) -> Dict[str, Optional[str]]:
+        rows = [r for r in (claims_rows or []) if int(r.get("evidence_count") or 0) > 0]
+        if not rows:
+            return {
+                "current_focus": None,
+                "primary_tension": None,
+                "unspoken_goal": None,
+                "emotional_texture": None,
+                "relationship_pulse": None,
+            }
+
+        def _pick(terms: List[str]) -> Optional[str]:
+            for row in rows:
+                if not _claim_matches(str(row.get("predicate") or ""), terms):
+                    continue
+                text = _claim_sentence(row)
+                if text:
+                    return _shorten_line(text, 220)
+            return None
+
+        focus = _pick(["focus", "goal", "plan", "priority", "project", "work"])
+        tension = _pick(["tension", "conflict", "stress", "worry", "problem", "blocker"])
+        unspoken_goal = _pick(["want", "intent", "desire", "goal"])
+        emotional = _pick(["emotion", "mood", "feeling", "affect", "state"])
+        relationship = _pick(["relationship", "partner", "family", "friend"])
+        return {
+            "current_focus": focus,
+            "primary_tension": tension,
+            "unspoken_goal": unspoken_goal,
+            "emotional_texture": emotional,
+            "relationship_pulse": relationship,
+        }
+
+    def _canonical_identity_fallback(claims_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        rows = [r for r in (claims_rows or []) if int(r.get("evidence_count") or 0) > 0]
+        if not rows:
+            return {
+                "current_chapter": None,
+                "core_values": [],
+                "persistent_goals": [],
+                "what_they_want": None,
+            }
+        chapter = None
+        core_values: List[str] = []
+        goals: List[str] = []
+        what_they_want = None
+        seen_values = set()
+        seen_goals = set()
+        for row in rows:
+            predicate = _normalize_text(row.get("predicate")).lower()
+            sentence = _shorten_line(_claim_sentence(row), 220)
+            if not sentence:
+                continue
+            if chapter is None and _claim_matches(predicate, ["chapter", "season", "phase", "identity"]):
+                chapter = sentence
+            if _claim_matches(predicate, ["value", "belief", "principle"]):
+                key = sentence.lower()
+                if key not in seen_values and len(core_values) < 3:
+                    seen_values.add(key)
+                    core_values.append(sentence)
+            if _claim_matches(predicate, ["goal", "objective", "commitment"]):
+                key = sentence.lower()
+                if key not in seen_goals and len(goals) < 6:
+                    seen_goals.add(key)
+                    goals.append(sentence)
+            if what_they_want is None and _claim_matches(predicate, ["want", "intent", "desire"]):
+                what_they_want = sentence
+        if chapter is None and goals:
+            chapter = goals[0]
+        return {
+            "current_chapter": chapter,
+            "core_values": core_values,
+            "persistent_goals": goals,
+            "what_they_want": what_they_want,
+        }
+
+    def _canonical_threads_fallback(claims_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        rows = [r for r in (claims_rows or []) if int(r.get("evidence_count") or 0) > 0]
+        out: List[Dict[str, Any]] = []
+        seen = set()
+        for row in rows:
+            predicate = _normalize_text(row.get("predicate")).lower()
+            if not _claim_matches(predicate, ["goal", "task", "deadline", "commit", "habit", "plan", "project", "relationship"]):
+                continue
+            title = _shorten_line(_claim_sentence(row), 180)
+            if not title:
+                continue
+            key = title.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            conf = _normalize_confidence(row.get("truth_confidence"), default=0.62)
+            out.append(
+                {
+                    "title": title,
+                    "detail": _normalize_text(_payload_value(row.get("object_payload"))) or None,
+                    "category": predicate.split(".")[0] if "." in predicate else "other",
+                    "priority": "high" if conf >= 0.85 else ("medium" if conf >= 0.6 else "low"),
+                    "thread_type": "persistent_goal" if "goal" in predicate else "situational",
+                    "follow_up_after": row.get("updated_at").isoformat() if isinstance(row.get("updated_at"), datetime) else None,
+                    "salience": float(conf),
+                }
+            )
+            if len(out) >= 5:
+                break
+        return out
+
+    def _canonical_people_projects_fallback(
+        entities_rows: List[Dict[str, Any]],
+        claims_rows: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        claims_by_subject: Dict[str, List[Dict[str, Any]]] = {}
+        for row in claims_rows or []:
+            subject_id = _normalize_text(row.get("subject_entity_id"))
+            if not subject_id:
+                continue
+            claims_by_subject.setdefault(subject_id, []).append(row)
+        people: List[Dict[str, Any]] = []
+        projects: List[Dict[str, Any]] = []
+        for entity in entities_rows or []:
+            entity_type = _normalize_text(entity.get("entity_type")).lower()
+            name = _normalize_text(entity.get("canonical_name"))
+            entity_id = _normalize_text(entity.get("entity_id"))
+            if not name or entity_type not in {"person", "project"}:
+                continue
+            snippets = [
+                _shorten_line(_claim_sentence(row), 180)
+                for row in (claims_by_subject.get(entity_id) or [])[:3]
+                if _shorten_line(_claim_sentence(row), 180)
+            ]
+            profile_text = ". ".join(snippets[:2]) if snippets else f"{name} remains in active canonical context."
+            status = snippets[0] if snippets else None
+            salience = max(
+                [_normalize_confidence(r.get("truth_confidence"), default=0.6) for r in (claims_by_subject.get(entity_id) or [])] or [0.6]
+            )
+            row_payload = {
+                "canonical_name": name,
+                "relationship_to_user": None,
+                "profile_text": profile_text,
+                "last_known_status": status,
+                "key_facts": snippets[:3],
+                "open_questions": [],
+                "salience_score": float(salience),
+                "aliases": [],
+            }
+            if entity_type == "person":
+                people.append(row_payload)
+            else:
+                projects.append(row_payload)
+        people = sorted(
+            people,
+            key=lambda row: (float(row.get("salience_score") or 0.0), _normalize_text(row.get("canonical_name")).lower()),
+            reverse=True,
+        )[:6]
+        projects = sorted(
+            projects,
+            key=lambda row: (float(row.get("salience_score") or 0.0), _normalize_text(row.get("canonical_name")).lower()),
+            reverse=True,
+        )
+        return people, projects
+
     living = await db.fetchone(
         """
         SELECT current_focus, recent_narrative,
@@ -299,53 +576,96 @@ async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
 
     living = living or {}
     identity = identity or {}
+    canonical_inputs = await _load_canonical_inputs(user_id)
+    canonical_living = _canonical_living_fallback(canonical_inputs.get("claims") or [])
+    canonical_identity = _canonical_identity_fallback(canonical_inputs.get("claims") or [])
+    canonical_threads = _canonical_threads_fallback(canonical_inputs.get("claims") or [])
+    canonical_people, canonical_projects = _canonical_people_projects_fallback(
+        canonical_inputs.get("entities") or [],
+        canonical_inputs.get("claims") or [],
+    )
 
-    living_focus = _normalize_text(living.get("primary_tension")) or _normalize_text(living.get("current_focus"))
+    living_focus = (
+        _normalize_text(living.get("primary_tension"))
+        or _normalize_text(living.get("current_focus"))
+        or _normalize_text(canonical_living.get("primary_tension"))
+        or _normalize_text(canonical_living.get("current_focus"))
+    )
     episodic_recall = await _episodic_search(user_id=user_id, query=living_focus, limit=3) if living_focus else []
+    derived_threads = [
+        {
+            "title": _normalize_text(t.get("title")),
+            "detail": _normalize_text(t.get("detail")),
+            "category": _normalize_text(t.get("category")),
+            "priority": _normalize_text(t.get("priority")),
+            "thread_type": _normalize_text(t.get("thread_type")),
+            "follow_up_after": t.get("follow_up_after").isoformat() if isinstance(t.get("follow_up_after"), datetime) else _normalize_text(t.get("follow_up_after")),
+            "salience": float(t.get("salience_score") or 0.0),
+        }
+        for t in threads
+    ]
+    effective_threads = derived_threads if derived_threads else canonical_threads
+    effective_people = [
+        {
+            "name": _normalize_text(p.get("canonical_name")),
+            "relationship": _normalize_text(p.get("relationship_to_user")),
+            "profile": _normalize_text(p.get("profile_text")),
+            "current_status": _normalize_text(p.get("last_known_status")),
+            "key_facts": p.get("key_facts") if isinstance(p.get("key_facts"), list) else [],
+            "open_questions": p.get("open_questions") if isinstance(p.get("open_questions"), list) else [],
+            "salience": float(p.get("salience_score") or 0.0),
+        }
+        for p in (people or canonical_people)
+    ]
+    effective_projects = _cluster_projects(projects if projects else canonical_projects)
+    source_provenance = {
+        "projection_version": "t9a.handover_reanchor.v1",
+        "canonical_claims_considered": len(canonical_inputs.get("claims") or []),
+        "canonical_entities_considered": len(canonical_inputs.get("entities") or []),
+        "canonical_watermarks": [
+            {
+                "tenant_id": _normalize_text(r.get("tenant_id")),
+                "last_sequence": int(r.get("last_sequence") or 0),
+                "updated_at": r.get("updated_at").isoformat() if isinstance(r.get("updated_at"), datetime) else _normalize_text(r.get("updated_at")) or None,
+            }
+            for r in (canonical_inputs.get("watermarks") or [])
+        ],
+        "derived_inputs_present": {
+            "living_context": bool(living),
+            "open_threads": bool(derived_threads),
+            "people_profiles": bool(people),
+            "project_profiles": bool(projects),
+            "identity_profile": bool(identity),
+        },
+    }
 
     return {
         "generated_at": datetime.now(dt_timezone.utc).isoformat(),
         "living_context": {
-            "current_focus": _normalize_text(living.get("current_focus")) or None,
-            "primary_tension": _normalize_text(living.get("primary_tension")) or None,
-            "unspoken_goal": _normalize_text(living.get("unspoken_goal")) or None,
-            "emotional_texture": _normalize_text(living.get("emotional_texture")) or None,
-            "relationship_pulse": _normalize_text(living.get("relationship_pulse")) or None,
+            "current_focus": _normalize_text(living.get("current_focus")) or _normalize_text(canonical_living.get("current_focus")) or None,
+            "primary_tension": _normalize_text(living.get("primary_tension")) or _normalize_text(canonical_living.get("primary_tension")) or None,
+            "unspoken_goal": _normalize_text(living.get("unspoken_goal")) or _normalize_text(canonical_living.get("unspoken_goal")) or None,
+            "emotional_texture": _normalize_text(living.get("emotional_texture")) or _normalize_text(canonical_living.get("emotional_texture")) or None,
+            "relationship_pulse": _normalize_text(living.get("relationship_pulse")) or _normalize_text(canonical_living.get("relationship_pulse")) or None,
         },
         "sophie_directives": living.get("sophie_directives") if isinstance(living.get("sophie_directives"), list) else [],
         "active_contradictions": living.get("active_contradictions") if isinstance(living.get("active_contradictions"), list) else [],
-        "open_threads": [
-            {
-                "title": _normalize_text(t.get("title")),
-                "detail": _normalize_text(t.get("detail")),
-                "category": _normalize_text(t.get("category")),
-                "priority": _normalize_text(t.get("priority")),
-                "thread_type": _normalize_text(t.get("thread_type")),
-                "follow_up_after": t.get("follow_up_after").isoformat() if isinstance(t.get("follow_up_after"), datetime) else _normalize_text(t.get("follow_up_after")),
-                "salience": float(t.get("salience_score") or 0.0),
-            }
-            for t in threads
-        ],
-        "people": [
-            {
-                "name": _normalize_text(p.get("canonical_name")),
-                "relationship": _normalize_text(p.get("relationship_to_user")),
-                "profile": _normalize_text(p.get("profile_text")),
-                "current_status": _normalize_text(p.get("last_known_status")),
-                "key_facts": p.get("key_facts") if isinstance(p.get("key_facts"), list) else [],
-                "open_questions": p.get("open_questions") if isinstance(p.get("open_questions"), list) else [],
-                "salience": float(p.get("salience_score") or 0.0),
-            }
-            for p in people
-        ],
-        "projects": _cluster_projects(projects),
+        "open_threads": effective_threads,
+        "people": effective_people,
+        "projects": effective_projects,
         "episodic_recall": episodic_recall,
         "identity": {
-            "current_chapter": _normalize_text(identity.get("current_chapter")) or None,
-            "core_values": (identity.get("core_values") if isinstance(identity.get("core_values"), list) else [])[:3],
-            "persistent_goals": identity.get("persistent_goals") if isinstance(identity.get("persistent_goals"), list) else [],
-            "what_they_want": _normalize_text(identity.get("what_they_want")) or None,
+            "current_chapter": _normalize_text(identity.get("current_chapter")) or _normalize_text(canonical_identity.get("current_chapter")) or None,
+            "core_values": (
+                (identity.get("core_values") if isinstance(identity.get("core_values"), list) else [])
+                or (canonical_identity.get("core_values") if isinstance(canonical_identity.get("core_values"), list) else [])
+            )[:3],
+            "persistent_goals": (
+                identity.get("persistent_goals") if isinstance(identity.get("persistent_goals"), list) else []
+            ) or (canonical_identity.get("persistent_goals") if isinstance(canonical_identity.get("persistent_goals"), list) else []),
+            "what_they_want": _normalize_text(identity.get("what_they_want")) or _normalize_text(canonical_identity.get("what_they_want")) or None,
         },
+        "provenance": source_provenance,
     }
 
 
@@ -1638,6 +1958,147 @@ def _is_canonical_factual_row(row: Any) -> bool:
     )
 
 
+def _payload_text(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ("value", "text", "status", "summary", "title", "name"):
+            candidate = _normalize_text(value.get(key))
+            if candidate:
+                return candidate
+        compact = _normalize_text(json.dumps(value, sort_keys=True, ensure_ascii=True))
+        return compact
+    if isinstance(value, list):
+        items = [_normalize_text(x) for x in value if _normalize_text(x)]
+        return ", ".join(items[:4])
+    return _normalize_text(value)
+
+
+def _canonical_claim_line(row: Dict[str, Any]) -> str:
+    subject = _normalize_text(row.get("subject_name")) or _normalize_text(row.get("subject_text")) or "The user"
+    predicate = _normalize_text(row.get("predicate")).lower()
+    tail = predicate.replace("_", ".").split(".")[-1] if predicate else "update"
+    tail = tail.replace("_", " ").strip() or "update"
+    value = _payload_text(row.get("object_payload"))
+    if value:
+        return f"{subject} {tail}: {value}"
+    return f"{subject} {tail}."
+
+
+def _canonical_claim_terms_match(predicate: Any, terms: List[str]) -> bool:
+    clean = _normalize_text(predicate).lower()
+    return bool(clean) and any(term in clean for term in terms)
+
+
+async def _fetch_canonical_signal_rows(
+    *,
+    tenant_id: str,
+    user_id: str,
+    claim_limit: int = 160,
+    entity_limit: int = 120,
+) -> Dict[str, Any]:
+    tenant_scope = _tenant_scope_candidates(tenant_id) or [_normalize_text(tenant_id)]
+    claim_rows = await db.fetch(
+        """
+        SELECT
+          c.tenant_id,
+          c.claim_event_key,
+          c.predicate,
+          c.subject_entity_id::text AS subject_entity_id,
+          c.subject_text,
+          c.object_payload,
+          c.truth_confidence,
+          c.updated_at,
+          c.created_at,
+          e.canonical_name AS subject_name,
+          e.entity_type,
+          COUNT(ce.claim_evidence_id)::int AS evidence_count
+        FROM claims c
+        LEFT JOIN entities e
+          ON e.tenant_id = c.tenant_id
+         AND e.entity_id = c.subject_entity_id
+        LEFT JOIN claim_evidence ce
+          ON ce.tenant_id = c.tenant_id
+         AND ce.claim_id = c.claim_id
+        WHERE c.tenant_id = ANY($1::text[])
+          AND c.user_id = $2
+          AND c.lifecycle_status = 'active'
+        GROUP BY
+          c.tenant_id,
+          c.claim_event_key,
+          c.predicate,
+          c.subject_entity_id,
+          c.subject_text,
+          c.object_payload,
+          c.truth_confidence,
+          c.updated_at,
+          c.created_at,
+          e.canonical_name,
+          e.entity_type
+        ORDER BY c.updated_at DESC NULLS LAST, c.claim_event_key ASC
+        LIMIT $3
+        """,
+        tenant_scope,
+        user_id,
+        max(1, min(int(claim_limit or 160), 500)),
+    )
+    entity_rows = await db.fetch(
+        """
+        SELECT
+          tenant_id,
+          entity_id::text AS entity_id,
+          canonical_name,
+          canonical_name_normalized,
+          entity_type,
+          status,
+          created_at,
+          updated_at
+        FROM entities
+        WHERE tenant_id = ANY($1::text[])
+          AND user_id = $2
+          AND status = 'active'
+        ORDER BY updated_at DESC NULLS LAST, canonical_name_normalized ASC
+        LIMIT $3
+        """,
+        tenant_scope,
+        user_id,
+        max(1, min(int(entity_limit or 120), 300)),
+    )
+    watermark_rows = await db.fetch(
+        """
+        SELECT tenant_id, last_sequence, updated_at
+        FROM canonical_tenant_watermarks
+        WHERE tenant_id = ANY($1::text[])
+        ORDER BY tenant_id ASC
+        """,
+        tenant_scope,
+    )
+    return {
+        "tenant_scope": tenant_scope,
+        "claims": claim_rows or [],
+        "entities": entity_rows or [],
+        "watermarks": watermark_rows or [],
+    }
+
+
+def _canonical_provenance_payload(
+    *,
+    projection_version: str,
+    signal_rows: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "projection_version": projection_version,
+        "canonical_claims_considered": len(signal_rows.get("claims") or []),
+        "canonical_entities_considered": len(signal_rows.get("entities") or []),
+        "canonical_watermarks": [
+            {
+                "tenant_id": _normalize_text(r.get("tenant_id")),
+                "last_sequence": int(r.get("last_sequence") or 0),
+                "updated_at": r.get("updated_at").isoformat() if isinstance(r.get("updated_at"), datetime) else _normalize_text(r.get("updated_at")) or None,
+            }
+            for r in (signal_rows.get("watermarks") or [])
+        ],
+    }
+
+
 async def _pg_get_entity_role_grounding(
     *,
     tenant_id: str,
@@ -1662,7 +2123,7 @@ async def _pg_get_entity_role_hint(
     name: Optional[str],
     entity_id: Optional[str],
 ) -> Dict[str, Any]:
-    del tenant_id
+    tenant_scope = _tenant_scope_candidates(tenant_id) or [_normalize_text(tenant_id)]
     normalized_name = canonicalize_entity_name(name)
     normalized_id = _normalize_text(entity_id)
     row = None
@@ -1692,7 +2153,78 @@ async def _pg_get_entity_role_hint(
             normalized_name,
         )
     if not isinstance(row, dict):
-        return {}
+        canonical_row = None
+        canonical_id = None
+        if normalized_id:
+            try:
+                canonical_id = str(uuid.UUID(normalized_id))
+            except Exception:
+                canonical_id = None
+        if canonical_id:
+            canonical_row = await db.fetchone(
+                """
+                SELECT entity_id::text AS entity_id, canonical_name, entity_type
+                FROM entities
+                WHERE tenant_id = ANY($1::text[])
+                  AND user_id = $2
+                  AND status = 'active'
+                  AND entity_id = $3::uuid
+                LIMIT 1
+                """,
+                tenant_scope,
+                user_id,
+                canonical_id,
+            )
+        if canonical_row is None and normalized_name:
+            canonical_row = await db.fetchone(
+                """
+                SELECT entity_id::text AS entity_id, canonical_name, entity_type
+                FROM entities
+                WHERE tenant_id = ANY($1::text[])
+                  AND user_id = $2
+                  AND status = 'active'
+                  AND lower(canonical_name) = lower($3)
+                ORDER BY updated_at DESC NULLS LAST
+                LIMIT 1
+                """,
+                tenant_scope,
+                user_id,
+                normalized_name,
+            )
+        if not isinstance(canonical_row, dict):
+            return {}
+        claim_row = await db.fetchone(
+            """
+            SELECT predicate, object_payload, truth_confidence
+            FROM claims
+            WHERE tenant_id = ANY($1::text[])
+              AND user_id = $2
+              AND lifecycle_status = 'active'
+              AND subject_entity_id = $3::uuid
+            ORDER BY truth_confidence DESC NULLS LAST, updated_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            tenant_scope,
+            user_id,
+            canonical_row.get("entity_id"),
+        )
+        role = _payload_text(claim_row.get("object_payload")) if isinstance(claim_row, dict) else None
+        entity_type = _normalize_text(canonical_row.get("entity_type")).lower()
+        edge_name = "WORKING_ON" if entity_type == "project" else "RELATED_TO_USER_AS"
+        return {
+            "entity_name": _normalize_text(canonical_row.get("canonical_name")) or normalized_name,
+            "role": _normalize_text(role) or None,
+            "relationship": _normalize_text(role) or None,
+            "edge_name": edge_name,
+            "confidence": _normalize_confidence((claim_row or {}).get("truth_confidence"), default=0.58),
+            "source": "canonical_entities_claims",
+            **_retrieval_row_metadata(
+                source_type="canonical signal",
+                derived=False,
+                evidence_backed=True,
+                data_classification="canonical signal",
+            ),
+        }
     role = _normalize_text(row.get("relationship_to_user")) or None
     entity_type = _normalize_text(row.get("type")).lower()
     edge_name = "WORKING_ON" if entity_type == "project" else "RELATED_TO_USER_AS"
@@ -1743,7 +2275,7 @@ async def _pg_get_entity_continuity_facts(
     entity_id: Optional[str],
     limit: int,
 ) -> List[Dict[str, Any]]:
-    del tenant_id
+    tenant_scope = _tenant_scope_candidates(tenant_id) or [_normalize_text(tenant_id)]
     safe_limit = max(1, min(int(limit or 8), 40))
     normalized_name = canonicalize_entity_name(name)
     normalized_id = _normalize_text(entity_id)
@@ -1775,9 +2307,47 @@ async def _pg_get_entity_continuity_facts(
             user_id,
             normalized_name,
         )
-    if not isinstance(entity_row, dict):
+    canonical_entity_row = None
+    canonical_entity_id = None
+    if normalized_id:
+        try:
+            canonical_entity_id = str(uuid.UUID(normalized_id))
+        except Exception:
+            canonical_entity_id = None
+    if canonical_entity_id:
+        canonical_entity_row = await db.fetchone(
+            """
+            SELECT entity_id::text AS entity_id, canonical_name, entity_type, updated_at
+            FROM entities
+            WHERE tenant_id = ANY($1::text[])
+              AND user_id = $2
+              AND status = 'active'
+              AND entity_id = $3::uuid
+            LIMIT 1
+            """,
+            tenant_scope,
+            user_id,
+            canonical_entity_id,
+        )
+    if canonical_entity_row is None and normalized_name:
+        canonical_entity_row = await db.fetchone(
+            """
+            SELECT entity_id::text AS entity_id, canonical_name, entity_type, updated_at
+            FROM entities
+            WHERE tenant_id = ANY($1::text[])
+              AND user_id = $2
+              AND status = 'active'
+              AND lower(canonical_name) = lower($3)
+            ORDER BY updated_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            tenant_scope,
+            user_id,
+            normalized_name,
+        )
+    if not isinstance(entity_row, dict) and not isinstance(canonical_entity_row, dict):
         return []
-    canonical_name = canonicalize_entity_name(entity_row.get("canonical_name")) or normalized_name
+    canonical_name = canonicalize_entity_name((entity_row or {}).get("canonical_name")) or canonicalize_entity_name((canonical_entity_row or {}).get("canonical_name")) or normalized_name
     out: List[Dict[str, Any]] = []
     seen: set[str] = set()
 
@@ -1910,6 +2480,63 @@ async def _pg_get_entity_continuity_facts(
             )
             if len(out) >= safe_limit:
                 return out[:safe_limit]
+    canonical_subject_id = _normalize_text((canonical_entity_row or {}).get("entity_id"))
+    if canonical_subject_id:
+        canonical_claim_rows = await db.fetch(
+            """
+            SELECT
+              c.predicate,
+              c.object_payload,
+              c.truth_confidence,
+              c.updated_at,
+              c.subject_text,
+              COUNT(ce.claim_evidence_id)::int AS evidence_count
+            FROM claims c
+            LEFT JOIN claim_evidence ce
+              ON ce.tenant_id = c.tenant_id
+             AND ce.claim_id = c.claim_id
+            WHERE c.tenant_id = ANY($1::text[])
+              AND c.user_id = $2
+              AND c.lifecycle_status = 'active'
+              AND c.subject_entity_id = $3::uuid
+            GROUP BY c.predicate, c.object_payload, c.truth_confidence, c.updated_at, c.subject_text
+            ORDER BY c.updated_at DESC NULLS LAST
+            LIMIT 40
+            """,
+            tenant_scope,
+            user_id,
+            canonical_subject_id,
+        )
+        for row in canonical_claim_rows or []:
+            if int(row.get("evidence_count") or 0) <= 0:
+                continue
+            _append_fact(
+                _canonical_claim_line(
+                    {
+                        "predicate": row.get("predicate"),
+                        "subject_name": canonical_name,
+                        "subject_text": row.get("subject_text"),
+                        "object_payload": row.get("object_payload"),
+                    }
+                ),
+                _normalize_confidence(row.get("truth_confidence"), default=0.72),
+                "canonical_claims",
+                row.get("updated_at"),
+                source_type="canonical factual",
+                derived=False,
+                evidence_backed=True,
+                data_classification="canonical factual",
+            )
+            if len(out) >= safe_limit:
+                break
+
+    out.sort(
+        key=lambda row: (
+            float(row.get("relevance") or 0.0),
+            _normalize_text(row.get("valid_at")),
+        ),
+        reverse=True,
+    )
     return out[:safe_limit]
 
 
@@ -1925,7 +2552,7 @@ async def _pg_search_nodes(
 ) -> List[Dict[str, Any]]:
     # GRAPHITI_REPLACED: search_nodes (semantic node retrieval)
     # TEMPORARY_DEGRADED_REPLACEMENT: node retrieval is synthesized from continuity tables, not canonical claim-store graph nodes.
-    del tenant_id, search_filter  # Postgres tables used here are user-scoped.
+    del search_filter  # Postgres degraded-continuity filter is currently unused.
     safe_limit = max(1, min(int(limit or 10), 50))
     query_terms = _query_terms(query)
     now_utc = (
@@ -1933,6 +2560,7 @@ async def _pg_search_nodes(
         if isinstance(reference_time, datetime) and reference_time.tzinfo
         else datetime.utcnow().replace(tzinfo=dt_timezone.utc)
     )
+    tenant_scope = _tenant_scope_candidates(tenant_id) or [_normalize_text(tenant_id)]
     candidates: List[Dict[str, Any]] = []
 
     entity_rows = await db.fetch(
@@ -2161,6 +2789,170 @@ async def _pg_search_nodes(
             }
         )
 
+    seen_entity_names = {
+        canonicalize_entity_name(row.get("canonical_name") or row.get("name") or "").lower()
+        for row in candidates
+        if canonicalize_entity_name(row.get("canonical_name") or row.get("name") or "")
+    }
+    canonical_entity_rows = await db.fetch(
+        """
+        SELECT tenant_id, entity_id::text AS entity_id, canonical_name, entity_type, created_at, updated_at
+        FROM entities
+        WHERE tenant_id = ANY($1::text[])
+          AND user_id = $2
+          AND status = 'active'
+        ORDER BY updated_at DESC NULLS LAST, canonical_name_normalized ASC
+        LIMIT 220
+        """,
+        tenant_scope,
+        user_id,
+    )
+    for row in canonical_entity_rows or []:
+        raw_type = _normalize_text(row.get("entity_type"))
+        node_type = infer_ontology_type(raw_type)
+        if not _allowed_node_type(node_type, allowed_types):
+            continue
+        name = canonicalize_entity_name(row.get("canonical_name"))
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen_entity_names:
+            continue
+        score = _score_text_match(
+            text=name,
+            query_terms=query_terms,
+            reference_ts=row.get("updated_at") or row.get("created_at"),
+            now_utc=now_utc,
+            base_score=0.11,
+        )
+        if query_terms and score < 0.08:
+            continue
+        candidates.append(
+            {
+                "uuid": _normalize_text(row.get("entity_id")) or None,
+                "name": name,
+                "summary": f"{name} is active in canonical memory.",
+                "canonical_name": name,
+                "type": node_type,
+                "group_id": f"pg:{user_id}",
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at"),
+                "attributes": {
+                    "source": "canonical_entities",
+                    "entity_type": raw_type or None,
+                    **_retrieval_row_metadata(
+                        source_type="canonical signal",
+                        derived=False,
+                        evidence_backed=True,
+                        data_classification="canonical signal",
+                    ),
+                },
+                "labels": ["Entity", node_type.title()],
+                "discipline_score": round(score, 4),
+                "_score": score,
+                **_retrieval_row_metadata(
+                    source_type="canonical signal",
+                    derived=False,
+                    evidence_backed=True,
+                    data_classification="canonical signal",
+                ),
+            }
+        )
+
+    canonical_claim_rows = await db.fetch(
+        """
+        SELECT
+          c.claim_event_key,
+          c.predicate,
+          c.object_payload,
+          c.truth_confidence,
+          c.updated_at,
+          c.subject_text,
+          e.canonical_name AS subject_name,
+          COUNT(ce.claim_evidence_id)::int AS evidence_count
+        FROM claims c
+        LEFT JOIN entities e
+          ON e.tenant_id = c.tenant_id
+         AND e.entity_id = c.subject_entity_id
+        LEFT JOIN claim_evidence ce
+          ON ce.tenant_id = c.tenant_id
+         AND ce.claim_id = c.claim_id
+        WHERE c.tenant_id = ANY($1::text[])
+          AND c.user_id = $2
+          AND c.lifecycle_status = 'active'
+        GROUP BY
+          c.claim_event_key, c.predicate, c.object_payload, c.truth_confidence, c.updated_at, c.subject_text, e.canonical_name
+        ORDER BY c.updated_at DESC NULLS LAST, c.claim_event_key ASC
+        LIMIT 260
+        """,
+        tenant_scope,
+        user_id,
+    )
+    seen_claim_events = {
+        _normalize_text(row.get("uuid")).lower()
+        for row in candidates
+        if _normalize_text(row.get("uuid")).lower().startswith("canonical_claim:")
+    }
+    for row in canonical_claim_rows or []:
+        if int(row.get("evidence_count") or 0) <= 0:
+            continue
+        event_key = _normalize_text(row.get("claim_event_key"))
+        if not event_key or event_key.lower() in seen_claim_events:
+            continue
+        text = _canonical_claim_line(
+            {
+                "predicate": row.get("predicate"),
+                "subject_name": row.get("subject_name"),
+                "subject_text": row.get("subject_text"),
+                "object_payload": row.get("object_payload"),
+            }
+        )
+        score = _score_text_match(
+            text=text,
+            query_terms=query_terms,
+            reference_ts=row.get("updated_at"),
+            now_utc=now_utc,
+            base_score=0.14 + (0.08 * _normalize_confidence(row.get("truth_confidence"), default=0.5)),
+        )
+        if query_terms and score < 0.08:
+            continue
+        predicate = _normalize_text(row.get("predicate")).lower()
+        node_type = "goal" if _canonical_claim_terms_match(predicate, ["goal", "task", "commitment", "plan"]) else "event"
+        if not _allowed_node_type(node_type, allowed_types):
+            continue
+        candidates.append(
+            {
+                "uuid": f"canonical_claim:{event_key}",
+                "name": text[:120],
+                "summary": text,
+                "canonical_name": text[:120],
+                "type": node_type,
+                "group_id": f"pg:{user_id}",
+                "created_at": row.get("updated_at"),
+                "updated_at": row.get("updated_at"),
+                "attributes": {
+                    "predicate": predicate or None,
+                    "claim_event_key": event_key,
+                    "source": "canonical_claims",
+                    **_retrieval_row_metadata(
+                        source_type="canonical factual",
+                        derived=False,
+                        evidence_backed=True,
+                        data_classification="canonical factual",
+                    ),
+                },
+                "labels": ["Entity", node_type.title()],
+                "discipline_score": round(score, 4),
+                "_score": score,
+                **_retrieval_row_metadata(
+                    source_type="canonical factual",
+                    derived=False,
+                    evidence_backed=True,
+                    data_classification="canonical factual",
+                ),
+            }
+        )
+
     candidates.sort(
         key=lambda row: (
             float(row.get("_score") or 0.0),
@@ -2206,7 +2998,7 @@ async def _pg_search_continuity_facts(
     limit: int,
     reference_time: Optional[datetime] = None,
 ) -> List[Dict[str, Any]]:
-    del tenant_id  # Postgres fact tables used here are user-scoped.
+    tenant_scope = _tenant_scope_candidates(tenant_id) or [_normalize_text(tenant_id)]
     safe_limit = max(1, min(int(limit or 10), 50))
     query_terms = _query_terms(query)
     now_utc = (
@@ -2395,6 +3187,56 @@ async def _pg_search_continuity_facts(
                 base_score=0.18,
                 data_classification="mixed/unsafe",
             )
+
+    canonical_claim_rows = await db.fetch(
+        """
+        SELECT
+          c.predicate,
+          c.object_payload,
+          c.truth_confidence,
+          c.updated_at,
+          c.subject_text,
+          e.canonical_name AS subject_name,
+          COUNT(ce.claim_evidence_id)::int AS evidence_count
+        FROM claims c
+        LEFT JOIN entities e
+          ON e.tenant_id = c.tenant_id
+         AND e.entity_id = c.subject_entity_id
+        LEFT JOIN claim_evidence ce
+          ON ce.tenant_id = c.tenant_id
+         AND ce.claim_id = c.claim_id
+        WHERE c.tenant_id = ANY($1::text[])
+          AND c.user_id = $2
+          AND c.lifecycle_status = 'active'
+          AND ($3::timestamptz IS NULL OR c.updated_at <= $3::timestamptz)
+        GROUP BY c.predicate, c.object_payload, c.truth_confidence, c.updated_at, c.subject_text, e.canonical_name
+        ORDER BY c.updated_at DESC NULLS LAST
+        LIMIT 240
+        """,
+        tenant_scope,
+        user_id,
+        reference_time,
+    )
+    for row in canonical_claim_rows or []:
+        if int(row.get("evidence_count") or 0) <= 0:
+            continue
+        _append_fact(
+            _canonical_claim_line(
+                {
+                    "predicate": row.get("predicate"),
+                    "subject_name": row.get("subject_name"),
+                    "subject_text": row.get("subject_text"),
+                    "object_payload": row.get("object_payload"),
+                }
+            ),
+            "canonical_claims",
+            row.get("updated_at"),
+            base_score=0.32 + (0.16 * _normalize_confidence(row.get("truth_confidence"), default=0.5)),
+            source_type="canonical factual",
+            derived=False,
+            evidence_backed=True,
+            data_classification="canonical factual",
+        )
 
     out.sort(
         key=lambda row: (
@@ -11825,6 +12667,9 @@ async def session_startbrief(
         user_model_narrative: Optional[str] = None
         user_model_narrative_stable: Optional[str] = None
         user_model_narrative_current: Optional[str] = None
+        canonical_signal_rows: Dict[str, Any] = {"claims": [], "entities": [], "watermarks": []}
+        canonical_recent_changes: List[str] = []
+        canonical_entity_hint_rows: List[Dict[str, Any]] = []
         entity_hints: List[SessionStartBriefEntityHint] = []
         entity_profiles: List[SessionStartBriefEntityProfile] = []
         resume_bridge_text: Optional[str] = None
@@ -12106,6 +12951,50 @@ async def session_startbrief(
             logger.error(f"startbrief user model hint lookup failed: {e}")
 
         try:
+            canonical_signal_rows = await _fetch_canonical_signal_rows(
+                tenant_id=tenantId,
+                user_id=userId,
+                claim_limit=120,
+                entity_limit=80,
+            )
+            for row in canonical_signal_rows.get("claims") or []:
+                if int(row.get("evidence_count") or 0) <= 0:
+                    continue
+                line = _shorten_line(_canonical_claim_line(row), 180)
+                if line:
+                    canonical_recent_changes.append(line)
+                if len(canonical_recent_changes) >= 6:
+                    break
+            for entity_row in (canonical_signal_rows.get("entities") or []):
+                name = canonicalize_entity_name(entity_row.get("canonical_name"))
+                if not name:
+                    continue
+                entity_type = infer_ontology_type(entity_row.get("entity_type"))
+                if entity_type not in {"person", "project"}:
+                    continue
+                canonical_entity_hint_rows.append(
+                    {
+                        "entityId": _normalize_text(entity_row.get("entity_id")) or None,
+                        "name": name,
+                        "type": entity_type,
+                        "role": _entity_role_from_user_model(user_model_data, name),
+                        "importance": 0.62,
+                        "salience": 0.55,
+                        "lastSeenAt": _normalize_text(entity_row.get("updated_at")) or None,
+                        "source": "canonical_entities",
+                        "confidence": 0.62,
+                        "updatedAt": _normalize_text(entity_row.get("updated_at")) or None,
+                    }
+                )
+                if len(canonical_entity_hint_rows) >= 6:
+                    break
+        except Exception as e:
+            logger.warning("startbrief canonical signal fallback lookup failed: %s", e)
+            canonical_signal_rows = {"claims": [], "entities": [], "watermarks": []}
+            canonical_recent_changes = []
+            canonical_entity_hint_rows = []
+
+        try:
             raw_entity_hints = await _build_entity_candidates(
                 tenant_id=tenantId,
                 user_id=userId,
@@ -12154,6 +13043,26 @@ async def session_startbrief(
         except Exception as e:
             logger.error("startbrief entity hints build failed: %s", e)
             entity_hints = []
+        if not entity_hints and canonical_entity_hint_rows:
+            entity_hints = [
+                SessionStartBriefEntityHint(
+                    entityId=_normalize_text(item.get("entityId")) or None,
+                    name=_normalize_text(item.get("name")) or "unknown",
+                    type=_normalize_text(item.get("type")) or "other",
+                    role=_normalize_text(item.get("role")) or None,
+                    importance=_importance_label(item.get("importance")),
+                    salience=float(item.get("salience")) if item.get("salience") is not None else None,
+                    lastSeenAt=_normalize_text(item.get("lastSeenAt")) or None,
+                    source=_normalize_text(item.get("source")) or None,
+                    confidence=(
+                        _normalize_confidence(item.get("confidence"), default=0.0)
+                        if item.get("confidence") is not None
+                        else None
+                    ),
+                    updatedAt=_normalize_text(item.get("updatedAt")) or _normalize_text(item.get("lastSeenAt")) or None,
+                )
+                for item in canonical_entity_hint_rows[:5]
+            ]
 
         sessions_today_count = 0
         local_day = reference_now.date()
@@ -12201,6 +13110,8 @@ async def session_startbrief(
 
         identity_basics = _trusted_identity_basics(user_model_data)
         recent_changes = _build_recent_high_signal_changes(recent_session_summaries, loop_items, max_items=3)
+        if not recent_changes and canonical_recent_changes:
+            recent_changes = _dedupe_keep_order(canonical_recent_changes, limit=3)
         local_time = reference_now.strftime("%H:%M")
         first_session_today = sessions_today_count == 0
         handover_text = _compose_structured_handover_text(
@@ -12244,6 +13155,8 @@ async def session_startbrief(
             summary_content_quality = "none_fetched"
         elif recent_changes:
             summary_content_quality = "used_for_recent_changes"
+        if summary_content_quality == "none_fetched" and canonical_recent_changes:
+            summary_content_quality = "canonical_claim_fallback"
         summary_norm_stats["evidence_ids_used_count"] = len(evidence_ids)
         summary_norm_stats["evidence_ids_fetched_count"] = len(fetched_summary_ids)
         logger.info(
@@ -12304,6 +13217,10 @@ async def session_startbrief(
                 "fallback_success": bool(summary_norm_stats.get("fallback_success")),
                 "daily_analysis_date_used": None,
                 "freshness": ingest_freshness,
+                "canonical_provenance": _canonical_provenance_payload(
+                    projection_version="t9a.startbrief_reanchor.v1",
+                    signal_rows=canonical_signal_rows,
+                ),
             },
             entity_hints=entity_hints,
             entity_profiles=[],

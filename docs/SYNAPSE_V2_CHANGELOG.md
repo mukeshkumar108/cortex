@@ -29,6 +29,65 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-20 15:02 UTC — T9a
+- Summary of what changed:
+  - Completed T9a continuation by re-anchoring remaining mixed-authority synthesis surfaces without rewriting synthesis behavior.
+  - Re-anchored `session/startbrief` to consume canonical fallback inputs (claims/entities) and emit canonical provenance/watermark metadata in evidence payload.
+  - Re-anchored continuity wrappers/helpers to include canonical fallback rows while preserving derived-first continuity behavior:
+    - `_pg_get_entity_role_hint`
+    - `_pg_get_entity_continuity_facts`
+    - `_pg_search_nodes`
+    - `_pg_search_continuity_facts`
+  - Added shared canonical signal/provenance helpers for consistent versioned provenance metadata across re-anchored surfaces.
+  - Kept output contracts stable; no retrieval contract changes; no synthesis prompt rewrites.
+- Files changed:
+  - `src/main.py`
+  - `tests/test_t9a_remaining_reanchor.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+  - `docs/SYNAPSE_V2_CHANGELOG.md`
+- Tests added/updated:
+  - `tests/test_t9a_remaining_reanchor.py`:
+    - canonical fallback role hint when derived entity profile is absent
+    - canonical fallback nodes in continuity search wrapper
+    - `session/startbrief` canonical provenance/watermark metadata emission
+  - Regression confirmation:
+    - `tests/test_t9a_handover_reanchor.py`
+- Acceptance criteria satisfied:
+  - Remaining T9a synthesis/continuity surfaces now consume canonical fallback inputs with provenance discipline.
+  - Derived-first behavior remains in place where intentional; output shape remains stable.
+  - Minimal parity/contract checks exist for handover and startbrief re-anchored outputs plus continuity wrappers.
+- Known remaining gaps:
+  - None for T9a re-anchoring scope.
+- Status: done
+
+### 2026-04-20 14:12 UTC — T9a
+- Summary of what changed:
+  - Re-anchored legacy `session/handover` synthesis inputs to canonical layer with **derived-first, canonical-fallback** behavior:
+    - canonical `claims` (evidence-backed active claims) for living-context/identity/thread fallbacks
+    - canonical `entities` for people/project fallbacks
+    - `canonical_tenant_watermarks` for committed watermark provenance metadata
+  - Preserved existing output structure (identity/living/thread/handover packet shape) while adding explicit derived/canonical provenance block.
+  - Avoided synthesis rewrites: no single-pass replacement, no observer-effect protection removal, no flattening to structured-only output.
+  - Added focused tests for canonical input consumption and output contract/quality parity support on the handover synthesis surface.
+- Files changed:
+  - `src/main.py`
+  - `tests/test_t9a_handover_reanchor.py`
+  - `tests/fixtures/t9a_handover_quality_golden.json`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+  - `docs/SYNAPSE_V2_CHANGELOG.md`
+- Tests added/updated:
+  - `tests/test_t9a_handover_reanchor.py`:
+    - canonical fallback populates handover identity/living/thread/people/project context + watermark provenance
+    - derived-source precedence is preserved when legacy projection rows exist
+    - golden fixture contract validation for handover output shape/provenance keys
+- Acceptance criteria satisfied:
+  - Re-anchored synthesis builder consumes canonical claims/entities/watermarks without changing handover output contract shape.
+  - Canonical provenance/version metadata is emitted on re-anchored output.
+  - Minimal quality-parity/golden support exists for identity/living/thread/handover packet outputs.
+- Known remaining gaps:
+  - Broader synthesis/projection surfaces (`session/startbrief` and continuity-node search wrappers) remain mixed-authority and are not fully re-anchored yet.
+- Status: partially done
+
 ### 2026-04-20 13:24 UTC — T12a
 - Summary of what changed:
   - Added offline replay/audit harness for canonical memory replays with deterministic run contract over fixed inputs and fixed resolver/policy versions.

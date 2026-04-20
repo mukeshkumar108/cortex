@@ -1,0 +1,44 @@
+{
+  "schema_version": "t9a.handover.golden.v1",
+  "required_top_keys": [
+    "generated_at",
+    "living_context",
+    "sophie_directives",
+    "active_contradictions",
+    "open_threads",
+    "people",
+    "projects",
+    "episodic_recall",
+    "identity",
+    "provenance"
+  ],
+  "required_living_keys": [
+    "current_focus",
+    "primary_tension",
+    "unspoken_goal",
+    "emotional_texture",
+    "relationship_pulse"
+  ],
+  "required_identity_keys": [
+    "current_chapter",
+    "core_values",
+    "persistent_goals",
+    "what_they_want"
+  ],
+  "required_thread_keys": [
+    "title",
+    "detail",
+    "category",
+    "priority",
+    "thread_type",
+    "follow_up_after",
+    "salience"
+  ],
+  "required_provenance_keys": [
+    "projection_version",
+    "canonical_claims_considered",
+    "canonical_entities_considered",
+    "canonical_watermarks",
+    "derived_inputs_present"
+  ]
+}
