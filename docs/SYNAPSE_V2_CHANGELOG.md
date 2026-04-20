@@ -29,6 +29,39 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-19 17:38 UTC — T4b
+- Summary of what changed:
+  - Added deterministic quarantine routing in `persist_extract_result` so weak claim candidates are partitioned into quarantine instead of flowing forward as normal extraction candidates.
+  - Implemented explicit, testable quarantine rules: `low_confidence`, `weak_grounding`, `malformed_candidate`, `unsupported_predicate`, and `policy_mismatch`.
+  - Persisted quarantined candidates into `claims_quarantine` with run/session linkage, reason/reason-code, confidence/grounding fields, status, and metadata.
+  - Preserved extraction stage safety: no claim writes and no retrieval/synthesis behavior changes.
+  - Added additive migration to harden `claims_quarantine` contract and indexes for review/audit scans.
+- Files changed:
+  - `migrations/038_t4b_claims_quarantine_hardening.sql`
+  - `src/extraction_results.py`
+  - `tests/test_extract_results_pipeline.py`
+  - `tests/test_schema_migration.py`
+  - `schema.sql`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+- Tests added/updated:
+  - `tests/test_extract_results_pipeline.py`:
+    - low-confidence candidate is quarantined with required metadata
+    - malformed claim-candidate shape is quarantined deterministically
+    - valid candidate persists without quarantine
+    - existing structured-failure behavior for malformed top-level payload remains
+    - no claims writes from extraction/quarantine path
+  - `tests/test_schema_migration.py`:
+    - verifies `claims_quarantine` contract columns + quarantine index presence
+- Acceptance criteria satisfied:
+  - Weak/malformed extraction candidates are safely quarantined and auditable.
+  - Quarantine routing is additive and does not mutate canonical claims.
+  - Deterministic rules and metadata surfaces are covered by tests.
+- Known remaining gaps:
+  - Promotion/review tooling is intentionally deferred.
+  - Ops dashboards/metrics for quarantine throughput are deferred to later tickets.
+  - This environment lacks `pytest`/`asyncpg`; test execution must be completed externally before marking T4b fully done.
+- Status: partially done
+
 ### 2026-04-19 17:27 UTC — T4
 - Summary of what changed:
   - Added durable extraction-results persistence module and contract (`src/extraction_results.py`) that writes versioned rows to `extract_results`.

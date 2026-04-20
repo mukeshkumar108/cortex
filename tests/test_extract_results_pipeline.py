@@ -206,6 +206,209 @@ async def test_t4_malformed_candidate_payload_captured_as_structured_failure():
 
 
 @pytest.mark.asyncio
+async def test_t4b_low_confidence_candidate_is_quarantined():
+    tenant = f"tenant-{uuid4().hex}"
+    user = f"user-{uuid4().hex}"
+    session_id = f"session-{uuid4().hex}"
+
+    candidate_payload = {
+        "schema_version": "t4.extract_results.v1",
+        "candidates": [
+            {
+                "type": "claim_candidate",
+                "predicate": "user.preference",
+                "subject_text": user,
+                "object_payload": {"value": "green tea"},
+                "confidence": 0.42,
+                "evidence_spans": [{"turn_index": 0, "start": 0, "end": 10}],
+            },
+            {
+                "type": "claim_candidate",
+                "predicate": "user.preference",
+                "subject_text": user,
+                "object_payload": {"value": "black coffee"},
+                "confidence": 0.93,
+                "evidence_spans": [{"turn_index": 0, "start": 11, "end": 30}],
+            },
+        ],
+    }
+
+    async with app.router.lifespan_context(app):
+        db = session_module._manager.db
+        policy_version = await PredicatePolicyService(db).get_current_policy_version()
+        result = await persist_extract_result(
+            db=db,
+            tenant_id=tenant,
+            user_id=user,
+            session_id=session_id,
+            messages=[],
+            extractor_model_version="t4-extractor-v1",
+            prompt_version="t4-prompt-v1",
+            policy_version=policy_version,
+            reference_time=datetime.utcnow(),
+            candidate_payload=candidate_payload,
+        )
+        assert result.status == "partial"
+        assert result.deduped is False
+
+    conn = await asyncpg.connect(_db_url())
+    try:
+        extract_row = await conn.fetchrow(
+            """
+            SELECT status, candidates
+            FROM extract_results
+            WHERE tenant_id = $1 AND extract_result_id = $2
+            """,
+            tenant,
+            result.extract_result_id,
+        )
+        assert extract_row is not None
+        assert extract_row["status"] == "partial"
+        candidates = extract_row["candidates"]
+        if isinstance(candidates, str):
+            candidates = json.loads(candidates)
+        assert isinstance(candidates, dict)
+        assert len(candidates.get("candidates") or []) == 1
+
+        quarantine_row = await conn.fetchrow(
+            """
+            SELECT
+              tenant_id, user_id, session_id, extract_run_id, reason_code, confidence, quarantine_status
+            FROM claims_quarantine
+            WHERE tenant_id = $1 AND extract_result_id = $2
+            ORDER BY quarantine_id DESC
+            LIMIT 1
+            """,
+            tenant,
+            result.extract_result_id,
+        )
+        assert quarantine_row is not None
+        assert quarantine_row["tenant_id"] == tenant
+        assert quarantine_row["user_id"] == user
+        assert quarantine_row["session_id"] == session_id
+        assert str(quarantine_row["extract_run_id"]) == result.extract_run_id
+        assert quarantine_row["reason_code"] == "low_confidence"
+        assert float(quarantine_row["confidence"]) == pytest.approx(0.42, rel=0.0, abs=1e-6)
+        assert quarantine_row["quarantine_status"] == "pending"
+
+        claim_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM claims WHERE tenant_id = $1 AND user_id = $2",
+            tenant,
+            user,
+        )
+        assert int(claim_count or 0) == 0
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_t4b_malformed_claim_candidate_is_quarantined():
+    tenant = f"tenant-{uuid4().hex}"
+    user = f"user-{uuid4().hex}"
+    session_id = f"session-{uuid4().hex}"
+
+    candidate_payload = {
+        "schema_version": "t4.extract_results.v1",
+        "candidates": [
+            {
+                "type": "claim_candidate",
+                "subject_text": user,
+                "object_payload": {"value": "berlin"},
+                "confidence": 0.95,
+                "evidence_spans": [{"turn_index": 1, "start": 0, "end": 12}],
+            }
+        ],
+    }
+
+    async with app.router.lifespan_context(app):
+        db = session_module._manager.db
+        policy_version = await PredicatePolicyService(db).get_current_policy_version()
+        result = await persist_extract_result(
+            db=db,
+            tenant_id=tenant,
+            user_id=user,
+            session_id=session_id,
+            messages=[],
+            extractor_model_version="t4-extractor-v1",
+            prompt_version="t4-prompt-v1",
+            policy_version=policy_version,
+            reference_time=datetime.utcnow(),
+            candidate_payload=candidate_payload,
+        )
+        assert result.status == "quarantined"
+
+    conn = await asyncpg.connect(_db_url())
+    try:
+        reason_code = await conn.fetchval(
+            """
+            SELECT reason_code
+            FROM claims_quarantine
+            WHERE tenant_id = $1 AND extract_result_id = $2
+            ORDER BY quarantine_id DESC
+            LIMIT 1
+            """,
+            tenant,
+            result.extract_result_id,
+        )
+        assert reason_code == "malformed_candidate"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_t4b_valid_candidate_persists_without_quarantine():
+    tenant = f"tenant-{uuid4().hex}"
+    user = f"user-{uuid4().hex}"
+    session_id = f"session-{uuid4().hex}"
+
+    candidate_payload = {
+        "schema_version": "t4.extract_results.v1",
+        "candidates": [
+            {
+                "type": "claim_candidate",
+                "predicate": "user.preference",
+                "subject_text": user,
+                "object_payload": {"value": "matcha"},
+                "confidence": 0.93,
+                "evidence_spans": [{"turn_index": 0, "start": 0, "end": 6}],
+            }
+        ],
+    }
+
+    async with app.router.lifespan_context(app):
+        db = session_module._manager.db
+        policy_version = await PredicatePolicyService(db).get_current_policy_version()
+        result = await persist_extract_result(
+            db=db,
+            tenant_id=tenant,
+            user_id=user,
+            session_id=session_id,
+            messages=[],
+            extractor_model_version="t4-extractor-v1",
+            prompt_version="t4-prompt-v1",
+            policy_version=policy_version,
+            reference_time=datetime.utcnow(),
+            candidate_payload=candidate_payload,
+        )
+        assert result.status == "succeeded"
+
+    conn = await asyncpg.connect(_db_url())
+    try:
+        quarantine_count = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM claims_quarantine
+            WHERE tenant_id = $1 AND extract_result_id = $2
+            """,
+            tenant,
+            result.extract_result_id,
+        )
+        assert int(quarantine_count or 0) == 0
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_t4_duplicate_retry_behavior_is_deterministic():
     tenant = f"tenant-{uuid4().hex}"
     user = f"user-{uuid4().hex}"

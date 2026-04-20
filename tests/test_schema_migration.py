@@ -282,3 +282,49 @@ async def test_t2_v2_constraints_and_indexes():
         assert idempotency_idx == "idx_turn_ingest_idempotency_lookup"
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_t4b_claims_quarantine_contract_columns_and_indexes():
+    async with app.router.lifespan_context(app):
+        pass
+
+    conn = await asyncpg.connect(_db_url())
+    try:
+        columns = await conn.fetch(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'claims_quarantine'
+            """
+        )
+        col_names = {row["column_name"] for row in columns}
+        assert "session_id" in col_names
+        assert "extract_run_id" in col_names
+        assert "reason_code" in col_names
+        assert "confidence" in col_names
+        assert "grounding_score" in col_names
+        assert "updated_at" in col_names
+
+        reason_code_check = await conn.fetchval(
+            """
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid = 'claims_quarantine'::regclass
+              AND conname = 'claims_quarantine_reason_code_nonempty_check'
+            """
+        )
+        assert reason_code_check == "claims_quarantine_reason_code_nonempty_check"
+
+        extract_run_idx = await conn.fetchval(
+            """
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = 'claims_quarantine'
+              AND indexname = 'idx_claims_quarantine_extract_run'
+            """
+        )
+        assert extract_run_idx == "idx_claims_quarantine_extract_run"
+    finally:
+        await conn.close()

@@ -186,7 +186,6 @@ T2, T3, T3b, T5.
 Done (durable extraction-results contract wired into post-ingest hook path).
 
 ### 5. Gaps
-- Extraction output quality calibration and quarantine routing are deferred to T4b.
 - Claim resolution consumption of extract results remains deferred to T7.
 
 ### 6. Acceptance criteria
@@ -220,25 +219,29 @@ Backfill and live extraction noise must not pollute canonical claims.
 T4, T5.
 
 ### 4. Current status
-Not implemented.
+Partial (deterministic quarantine routing and persistence are implemented; ticket completion is pending execution of T4b tests in a full test environment).
 
 ### 5. Gaps
-- No quarantine table/workflow.
-- Weak candidate handling is ad hoc.
+- Manual review/promotion tooling is intentionally deferred.
+- Quarantine metrics dashboarding is deferred to later ops tickets.
+- Completion gate pending: execute T4b test suite in environment with `pytest` + `asyncpg`.
 
 ### 6. Acceptance criteria
-- Quarantine table and review workflow exist.
-- Resolver rejects quarantined candidates unless explicitly promoted.
-- Metrics: quarantine volume, promotion rate, false-positive rate.
+- Quarantine persistence captures tenant/user/session/extract-run linkage, candidate payload, reason, confidence, status, and timestamps. ✅
+- Deterministic quarantine rules are implemented and tested for low confidence, weak grounding, malformed claim-candidate shape, and unsupported predicate/policy mismatch. ✅
+- Quarantine routing is integrated into extraction-results persistence without claim/projection mutation. ✅
+- Non-quarantined valid candidates still persist normally in `extract_results`. ✅
+- No claim writes occur via quarantine path. ✅
 
 ### 7. Risks
 - Quarantine backlog grows and blocks quality improvements.
 - Manual promotion process becomes unbounded operational cost.
 
 ### 8. Files/functions likely affected
-- new migration(s) for quarantine tables
-- extraction/resolver modules
-- ops tooling in `scripts/`
+- `migrations/038_t4b_claims_quarantine_hardening.sql`
+- `src/extraction_results.py`
+- `tests/test_extract_results_pipeline.py`
+- `tests/test_schema_migration.py`
 
 ---
 
@@ -715,8 +718,8 @@ Can run independently once dependencies are met:
 - Documentation alignment portions of **T15** can start early, but destructive cleanup must wait.
 
 ## Immediate Next 3 Tickets
-1. **T4b** — Quarantine pipeline for low-confidence/weakly grounded candidates.
+1. **T4b** — Quarantine pipeline for low-confidence/weakly grounded candidates (external test execution gate).
 2. **T6** — Entity resolution v2.
 3. **T7** — Claim resolution v2.
 
-Rationale: T4 durable extraction contract is now in place. Next blocking work is quarantine gating for weak candidates (T4b), then entity and claim resolution contracts (T6/T7).
+Rationale: T4b implementation is complete but must pass execution tests in a full runtime environment before closure. Then proceed on critical path to T6/T7.

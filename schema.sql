@@ -320,14 +320,20 @@ CREATE TABLE IF NOT EXISTS claims_quarantine (
     quarantine_id BIGSERIAL PRIMARY KEY,
     tenant_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
+    session_id TEXT,
     extract_result_id BIGINT,
+    extract_run_id UUID,
     candidate_payload JSONB NOT NULL,
     reason TEXT NOT NULL,
+    reason_code TEXT NOT NULL DEFAULT 'quarantine_rule',
+    confidence DOUBLE PRECISION,
+    grounding_score DOUBLE PRECISION,
     quarantine_status TEXT NOT NULL DEFAULT 'pending',
     reviewed_by TEXT,
     reviewed_at TIMESTAMPTZ,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS canonical_mutations (
