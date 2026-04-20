@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import asyncpg
 import pytest
+from fastapi import HTTPException
 
 from src.main import app, graphiti_client
 from src.graphiti_client import NARRATIVE_EXTRACTION_INSTRUCTIONS
@@ -409,14 +410,9 @@ async def test_session_brief_narrative_summary_does_not_duplicate_facts():
 
 
 @pytest.mark.asyncio
-async def test_internal_graphiti_debug_endpoints():
+async def test_internal_graphiti_debug_endpoints(monkeypatch):
     os.environ["INTERNAL_TOKEN"] = "test_token"
     get_settings.cache_clear()
-
-    async def _stub_recent_episodes(**_kwargs):
-        return [
-            {"name": "session_raw_x", "summary": "User talked about bugs", "reference_time": "2026-02-05T01:00:00Z"}
-        ]
 
     async def _stub_search_facts(**_kwargs):
         return [{"text": "User is frustrated about bugs", "relevance": 0.8, "source": "graphiti"}]
@@ -424,7 +420,12 @@ async def test_internal_graphiti_debug_endpoints():
     async def _stub_search_nodes(**_kwargs):
         return [{"summary": "Ashley", "type": "person", "uuid": "u1", "attributes": {"role": "girlfriend"}}]
 
-    graphiti_client.get_recent_episodes = _stub_recent_episodes
+    async def _stub_pg_recent_episodes(**_kwargs):
+        return [
+            {"name": "session_raw_x", "summary": "User talked about bugs", "reference_time": "2026-02-05T01:00:00Z"}
+        ]
+
+    monkeypatch.setattr("src.main._pg_get_recent_episodes", _stub_pg_recent_episodes, raising=True)
     graphiti_client.search_facts = _stub_search_facts
     graphiti_client.search_nodes = _stub_search_nodes
 
@@ -439,12 +440,12 @@ async def test_internal_graphiti_debug_endpoints():
     )
     assert episodes["count"] == 1
 
-    query_resp = await debug_graphiti_query(
-        request=MemoryQueryRequest(tenantId="t", userId="u", query="Ashley"),
-        x_internal_token="test_token"
-    )
-    assert len(query_resp["facts"]) == 1
-    assert len(query_resp["entities"]) == 1
+    with pytest.raises(HTTPException) as exc:
+        await debug_graphiti_query(
+            request=MemoryQueryRequest(tenantId="t", userId="u", query="Ashley"),
+            x_internal_token="test_token"
+        )
+    assert exc.value.status_code == 410
 
 
 @pytest.mark.asyncio

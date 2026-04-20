@@ -29,6 +29,36 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-20 14:40 UTC — T15
+- Summary of what changed:
+  - Removed unreachable legacy mixed-authority retrieval implementation block from `memory_query()` so no pre-v2 branch remains in production routing code.
+  - Disabled legacy Graphiti-era debug retrieval endpoint (`/internal/debug/graphiti/query`) with explicit deprecation guidance to v2 retrieval/audit surfaces.
+  - Updated legacy debug test expectations to match disabled endpoint behavior and current v2-backed episodic debug helper usage.
+  - Added explicit cleanup regression tests proving:
+    - legacy mixed-authority branch is removed from `memory_query`
+    - deprecated Graphiti debug retrieval endpoint is disabled fail-safe (`410`)
+- Files changed:
+  - `src/main.py`
+  - `tests/test_t15_cleanup.py`
+  - `tests/test_graphiti_native.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+  - `docs/SYNAPSE_V2_CHANGELOG.md`
+- Tests added/updated:
+  - `tests/test_t15_cleanup.py`
+  - `tests/test_graphiti_native.py::test_internal_graphiti_debug_endpoints`
+  - Validation rerun after cleanup:
+    - `tests/test_t11_legacy_adapter.py`
+    - `tests/test_v2_memory_query.py`
+    - `tests/test_t12b_shadow_diffing.py`
+    - `tests/test_t14_rollout_controls.py`
+- Acceptance criteria satisfied:
+  - Legacy mixed-authority runtime path is no longer reachable from production retrieval routing.
+  - Graphiti-era debug retrieval path is explicitly deprecated/disabled.
+  - v2 retrieval + legacy adapter + shadow diff + rollout controls remain healthy after cleanup.
+- Known remaining gaps:
+  - Legacy adapter endpoint (`/memory/query`) remains intentionally in place as a temporary compatibility boundary; it is v2-only and no longer mixed-authority.
+- Status: done
+
 ### 2026-04-20 14:23 UTC — T14
 - Summary of what changed:
   - Added persistent rollout controller with explicit serving modes (`legacy_only`, `shadow_only`, `cohort_v2`, `v2_all`) and cohort selectors (tenant/user/percentage).

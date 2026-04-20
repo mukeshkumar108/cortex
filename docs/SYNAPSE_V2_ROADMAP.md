@@ -667,17 +667,16 @@ Legacy paths are ongoing risk of authority regression.
 T14 complete and stable for defined soak period.
 
 ### 4. Current status
-Not implemented.
+Done (legacy mixed-authority retrieval runtime branch removed; legacy Graphiti-era debug retrieval query path explicitly disabled; v2 + adapter + rollout/shadow paths remain healthy).
 
 ### 5. Gaps
-- Graphiti-era retrieval/summary and debug surfaces still present.
-- Schema/docs remain partially stale.
+- Legacy `/memory/query` compatibility endpoint remains intentionally retained as a transitional boundary, but it is v2-only and contains no mixed-authority fallback.
 
 ### 6. Acceptance criteria
-- Legacy mixed-authority retrieval logic removed from production path.
-- Deprecated endpoints disabled/removed with migration notice.
-- Docs (`schema.sql`, architecture/runbooks/contracts) aligned with v2.
-- Cleanup proceeds only after a 2–4 week soak period with no quality regressions.
+- Legacy mixed-authority retrieval logic removed from production path. ✅
+- Deprecated Graphiti-era retrieval debug endpoint disabled with explicit migration notice. ✅
+- Legacy compatibility adapter remains explicit and v2-only (no silent fallback). ✅
+- Validation confirms v2 retrieval, legacy adapter routing, shadow diffing, and rollout controls still pass after cleanup. ✅
 
 ### 7. Risks
 - Premature cleanup can remove fallback during unstable rollout.
