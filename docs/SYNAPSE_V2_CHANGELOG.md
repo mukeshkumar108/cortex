@@ -29,6 +29,38 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-20 10:31 UTC — T7
+- Summary of what changed:
+  - Added canonical claim resolver module that consumes `extract_results` candidates and resolves deterministic claim lifecycle outcomes using policy-bound slot/event semantics.
+  - Implemented claim lifecycle handling for `active`, `superseded`, and `retracted`, including single-active-slot supersession behavior for exclusive predicates.
+  - Enforced fail-closed candidate handling for missing evidence, unsupported predicates, unknown/missing policy versions, ambiguous subject resolution state, and assistant-authored candidates by default.
+  - Implemented deterministic evidence linkage writes into `claim_evidence`; no candidate without evidence is promoted into canonical claims.
+  - Added mutation logging for claim create/reinforce/supersede/retract transitions via `canonical_mutations`.
+  - Kept scope to truth infrastructure only: no retrieval changes, no projection rewrites, no synthesis behavior changes.
+- Files changed:
+  - `src/claim_resolution.py`
+  - `tests/test_claim_resolution.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+  - `docs/SYNAPSE_V2_CHANGELOG.md`
+- Tests added/updated:
+  - `tests/test_claim_resolution.py`:
+    - new active claim creation
+    - reinforce same-slot equivalent claim
+    - supersede conflicting exclusive-slot claim
+    - reject claim with no evidence
+    - reject unknown policy version
+    - reject assistant-authored claim by default
+    - deterministic repeat execution behavior
+    - unsupported predicate fail-closed rejection
+- Acceptance criteria satisfied:
+  - Canonical claims are policy-bound, deterministic, and lifecycle-managed.
+  - Canonical claims are evidence-backed (`claim_evidence`) with fail-closed no-evidence behavior.
+  - Exclusive slot conflicts supersede deterministically without blind overwrite.
+  - Repeat execution converges to stable claim state without duplicate claim creation.
+- Known remaining gaps:
+  - T7 resolver module is not yet wired into the runtime pipeline orchestrator; integration sequencing remains part of later pipeline rollout work.
+- Status: done
+
 ### 2026-04-20 10:05 UTC — T6
 - Summary of what changed:
   - Added a canonical entity resolver module with deterministic mention resolution and explicit result contract fields: `resolved_entity_id`, `resolution_status`, `resolution_confidence`, `resolver_version`.

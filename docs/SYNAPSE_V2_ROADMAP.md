@@ -319,11 +319,10 @@ Canonical semantic memory is claims; lifecycle errors directly corrupt factual r
 T0, T2, T4, T5, T6.
 
 ### 4. Current status
-Not implemented as v2 canonical resolver.
+Done (deterministic canonical claim resolver implemented with policy-bound lifecycle transitions, fail-closed candidate rejection, and evidence linkage).
 
 ### 5. Gaps
-- No canonical claim lifecycle table/logic in current runtime.
-- No strict separation between extracted signals and finalized claims.
+- None for T7 claim-resolution scope.
 
 ### 6. Acceptance criteria
 - Resolver writes `active/superseded/retracted` deterministically.
@@ -335,9 +334,8 @@ Not implemented as v2 canonical resolver.
 - Claims without evidence entering factual lane.
 
 ### 8. Files/functions likely affected
-- new resolver module(s)
-- `src/main.py` background job wiring
-- migrations for claim tables and constraints
+- `src/claim_resolution.py`
+- `tests/test_claim_resolution.py`
 
 ---
 
@@ -714,8 +712,8 @@ Can run independently once dependencies are met:
 - Documentation alignment portions of **T15** can start early, but destructive cleanup must wait.
 
 ## Immediate Next 3 Tickets
-1. **T7** — Claim resolution v2.
-2. **T8** — Canonical mutation log + watermarks.
-3. **T12a** — Offline replay, diffing, and audit harness.
+1. **T8** — Canonical mutation log + watermarks.
+2. **T12a** — Offline replay, diffing, and audit harness.
+3. **T9a** — Re-anchor existing synthesis to canonical layer.
 
-Rationale: T4/T4b/T6 are closed with execution validation; proceed on critical path with T7 and T8, then replay/audit hardening.
+Rationale: T4/T4b/T6/T7 are closed with execution validation; proceed on critical path with mutation-log watermarks, then replay/audit, then projection re-anchoring.
