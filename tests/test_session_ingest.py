@@ -687,22 +687,22 @@ async def test_session_ingest_commit_freshness_and_debug_status(monkeypatch):
             assert int(freshness.get("pending_raw_episode_jobs") or 0) >= 1
 
         # Process raw job -> enqueue hooks, then process hooks.
-        first = await session_module.drain_outbox(
-            graphiti_client=graphiti_client,
-            limit=20,
-            tenant_id=tenant,
-            budget_seconds=3.0,
-            per_row_timeout_seconds=5.0
-        )
-        assert first["sent"] >= 1
-        second = await session_module.drain_outbox(
-            graphiti_client=graphiti_client,
-            limit=20,
-            tenant_id=tenant,
-            budget_seconds=3.0,
-            per_row_timeout_seconds=5.0
-        )
-        assert second["claimed"] >= 1
+        total_claimed = 0
+        total_sent = 0
+        for _ in range(6):
+            drain = await session_module.drain_outbox(
+                graphiti_client=graphiti_client,
+                limit=20,
+                tenant_id=tenant,
+                budget_seconds=3.0,
+                per_row_timeout_seconds=5.0
+            )
+            total_claimed += int(drain.get("claimed", 0) or 0)
+            total_sent += int(drain.get("sent", 0) or 0)
+            if int(drain.get("claimed", 0) or 0) == 0:
+                break
+        assert total_claimed >= 1
+        assert total_sent >= 1
 
         async with AsyncClient(
             transport=ASGITransport(app=app),
@@ -836,7 +836,7 @@ async def test_session_close_after_ingest_does_not_duplicate_raw_or_hooks(monkey
         await conn.close()
 
     assert int(raw_count or 0) == 1
-    assert int(hook_count or 0) == 2
+    assert int(hook_count or 0) == 3
 
 
 @pytest.mark.asyncio

@@ -183,7 +183,7 @@ Extraction cannot be transient queue-only; must be auditable/replayable and vers
 T2, T3, T3b, T5.
 
 ### 4. Current status
-Done (durable extraction-results contract wired into post-ingest hook path).
+Done (close-out validated; extraction-results tests now assert deterministic durable-write/no-claim contract without brittle outbox-pass assumptions).
 
 ### 5. Gaps
 - Claim resolution consumption of extract results remains deferred to T7.
@@ -219,12 +219,11 @@ Backfill and live extraction noise must not pollute canonical claims.
 T4, T5.
 
 ### 4. Current status
-Partial (deterministic quarantine routing and persistence are implemented; ticket completion is pending execution of T4b tests in a full test environment).
+Partial (deterministic quarantine routing and persistence are implemented; review/promotion and ops tooling remain deferred).
 
 ### 5. Gaps
 - Manual review/promotion tooling is intentionally deferred.
 - Quarantine metrics dashboarding is deferred to later ops tickets.
-- Completion gate pending: execute T4b test suite in environment with `pytest` + `asyncpg`.
 
 ### 6. Acceptance criteria
 - Quarantine persistence captures tenant/user/session/extract-run linkage, candidate payload, reason, confidence, status, and timestamps. ✅

@@ -29,6 +29,29 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-20 09:44 UTC — T4
+- Summary of what changed:
+  - Closed T4 validation gaps by hardening extraction-results tests around actual outbox-drain contract (single-pass or multi-pass) instead of fixed second-pass assumptions.
+  - Fixed fail-closed policy-version test lifecycle to run persistence assertions inside app lifespan, avoiding stale/closed asyncpg resource reuse.
+  - Updated directly related session-ingest hook regression to current T4 hook cardinality (`session_summary`, `open_loops`, `extract_results`) and deterministic drain assertions.
+- Files changed:
+  - `tests/test_extract_results_pipeline.py`
+  - `tests/test_session_ingest.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+  - `docs/SYNAPSE_V2_CHANGELOG.md`
+- Tests added/updated:
+  - `tests/test_extract_results_pipeline.py`:
+    - `test_t4_pipeline_writes_extract_results_and_does_not_write_claims` (deterministic drain-loop assertions)
+    - `test_t4_missing_policy_version_fails_closed` (lifespan-scoped DB lifecycle)
+  - `tests/test_session_ingest.py`:
+    - `test_session_close_after_ingest_does_not_duplicate_raw_or_hooks` (hook cardinality + deterministic drain assertions)
+- Acceptance criteria satisfied:
+  - Durable extraction results are verified without claim writes under deterministic test behavior.
+  - Missing/unknown policy version fail-closed behavior is validated with a correct app/db lifecycle.
+- Known remaining gaps:
+  - Resolver consumption of extraction results remains deferred to T7 by design.
+- Status: done
+
 ### 2026-04-19 17:38 UTC — T4b
 - Summary of what changed:
   - Added deterministic quarantine routing in `persist_extract_result` so weak claim candidates are partitioned into quarantine instead of flowing forward as normal extraction candidates.

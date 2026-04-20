@@ -68,22 +68,22 @@ async def test_t4_pipeline_writes_extract_results_and_does_not_write_claims(monk
             )
             assert resp.status_code == 200
 
-        first = await session_module.drain_outbox(
-            graphiti_client=graphiti_client,
-            limit=30,
-            tenant_id=tenant,
-            budget_seconds=3.0,
-            per_row_timeout_seconds=5.0,
-        )
-        assert first["sent"] >= 1
-        second = await session_module.drain_outbox(
-            graphiti_client=graphiti_client,
-            limit=30,
-            tenant_id=tenant,
-            budget_seconds=3.0,
-            per_row_timeout_seconds=5.0,
-        )
-        assert second["claimed"] >= 1
+        total_claimed = 0
+        total_sent = 0
+        for _ in range(6):
+            drain = await session_module.drain_outbox(
+                graphiti_client=graphiti_client,
+                limit=30,
+                tenant_id=tenant,
+                budget_seconds=3.0,
+                per_row_timeout_seconds=5.0,
+            )
+            total_claimed += int(drain.get("claimed", 0) or 0)
+            total_sent += int(drain.get("sent", 0) or 0)
+            if int(drain.get("claimed", 0) or 0) == 0:
+                break
+        assert total_claimed >= 1
+        assert total_sent >= 1
 
     conn = await asyncpg.connect(_db_url())
     try:
@@ -135,23 +135,20 @@ async def test_t4_missing_policy_version_fails_closed():
     tenant = f"tenant-{uuid4().hex}"
     user = f"user-{uuid4().hex}"
     session_id = f"session-{uuid4().hex}"
-    db = session_module._manager.db if session_module._manager is not None else None
-    if db is None:
-        async with app.router.lifespan_context(app):
-            db = session_module._manager.db
-
-    with pytest.raises(ExtractionContractError) as exc:
-        await persist_extract_result(
-            db=db,
-            tenant_id=tenant,
-            user_id=user,
-            session_id=session_id,
-            messages=[],
-            extractor_model_version="t4-extractor-v1",
-            prompt_version="t4-prompt-v1",
-            policy_version="v2.missing",
-            reference_time=datetime.utcnow(),
-        )
+    async with app.router.lifespan_context(app):
+        db = session_module._manager.db
+        with pytest.raises(ExtractionContractError) as exc:
+            await persist_extract_result(
+                db=db,
+                tenant_id=tenant,
+                user_id=user,
+                session_id=session_id,
+                messages=[],
+                extractor_model_version="t4-extractor-v1",
+                prompt_version="t4-prompt-v1",
+                policy_version="v2.missing",
+                reference_time=datetime.utcnow(),
+            )
     assert exc.value.code == "EXTRACT_UNKNOWN_POLICY_VERSION"
 
 
