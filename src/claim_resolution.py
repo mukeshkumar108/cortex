@@ -233,6 +233,29 @@ class ClaimResolver:
         raw_candidates = candidates_payload.get("candidates") if isinstance(candidates_payload, dict) else None
         candidate_list = [c for c in (raw_candidates or []) if isinstance(c, dict)]
 
+        return await self.resolve_candidates_for_scope(
+            tenant_id=str(extract_row["tenant_id"]),
+            user_id=str(extract_row["user_id"]),
+            session_id=str(extract_row["session_id"]),
+            extract_result_id=int(extract_row["extract_result_id"]),
+            policy_version=effective_policy_version,
+            candidate_list=candidate_list,
+            allow_assistant_authored=allow_assistant_authored,
+            resolver_version=resolver_version,
+        )
+
+    async def resolve_candidates_for_scope(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        session_id: str,
+        extract_result_id: int,
+        policy_version: str,
+        candidate_list: List[Dict[str, Any]],
+        allow_assistant_authored: bool = False,
+        resolver_version: str = CLAIM_RESOLVER_VERSION,
+    ) -> ClaimResolutionResult:
         created: List[int] = []
         reinforced: List[int] = []
         superseded: List[int] = []
@@ -240,15 +263,17 @@ class ClaimResolver:
         rejected: List[ClaimCandidateReject] = []
 
         # Deterministic iteration by candidate list order.
-        for idx, candidate in enumerate(candidate_list):
+        for idx, candidate in enumerate(candidate_list or []):
+            if not isinstance(candidate, dict):
+                continue
             result = await self._apply_candidate(
-                tenant_id=str(extract_row["tenant_id"]),
-                user_id=str(extract_row["user_id"]),
-                session_id=str(extract_row["session_id"]),
-                extract_result_id=int(extract_row["extract_result_id"]),
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=session_id,
+                extract_result_id=extract_result_id,
                 candidate_index=idx,
                 candidate=candidate,
-                policy_version=effective_policy_version,
+                policy_version=policy_version,
                 allow_assistant_authored=allow_assistant_authored,
                 resolver_version=resolver_version,
             )
@@ -260,11 +285,11 @@ class ClaimResolver:
             retracted.extend(result.get("retracted", []))
 
         return ClaimResolutionResult(
-            extract_result_id=int(extract_row["extract_result_id"]),
-            tenant_id=str(extract_row["tenant_id"]),
-            user_id=str(extract_row["user_id"]),
-            session_id=str(extract_row["session_id"]),
-            predicate_policy_version=effective_policy_version,
+            extract_result_id=extract_result_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            predicate_policy_version=policy_version,
             resolver_version=resolver_version,
             created_claim_ids=created,
             reinforced_claim_ids=reinforced,

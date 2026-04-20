@@ -5,7 +5,7 @@ from datetime import datetime, timezone as dt_timezone
 from typing import Any, Dict, List, Optional
 import uuid
 
-from .canonicalization import normalize_text
+from .canonicalization import normalize_text, stable_short_hash
 from .canonical_mutation_log import CanonicalMutationLogger
 from .db import Database
 
@@ -53,6 +53,26 @@ def _normalize_alias(value: Any) -> str:
 
 def _normalize_name(value: Any) -> str:
     return normalize_text(value, casefold=False)
+
+
+def _build_entity_uuid(
+    *,
+    tenant_id: str,
+    user_id: str,
+    canonical_name_normalized: str,
+    entity_type: str,
+) -> str:
+    digest = stable_short_hash(
+        {
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "canonical_name_normalized": canonical_name_normalized,
+            "entity_type": entity_type,
+        },
+        version="t6.entity_id.v1",
+        length=32,
+    )
+    return str(uuid.UUID(hex=digest))
 
 
 class EntityResolver:
@@ -196,6 +216,7 @@ class EntityResolver:
         created = await self.db.fetchone(
             """
             INSERT INTO entities (
+                entity_id,
                 tenant_id,
                 user_id,
                 canonical_name,
@@ -207,10 +228,16 @@ class EntityResolver:
                 updated_at
             )
             VALUES (
-                $1, $2, $3, $4, $5, 'active', $6::jsonb, $7, $7
+                $1::uuid, $2, $3, $4, $5, $6, 'active', $7::jsonb, $8, $8
             )
             RETURNING entity_id::text AS entity_id
             """,
+            _build_entity_uuid(
+                tenant_id=tenant,
+                user_id=user,
+                canonical_name_normalized=alias_normalized,
+                entity_type=normalized_type,
+            ),
             tenant,
             user,
             canonical_name,

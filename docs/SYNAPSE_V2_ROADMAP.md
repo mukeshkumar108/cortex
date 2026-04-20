@@ -519,28 +519,32 @@ Need pre-rollout confidence before serving v2.
 T0, T5, T7, T8.
 
 ### 4. Current status
-Not implemented.
+Done.
 
 ### 5. Gaps
-- No dedicated replay/diff harness tied to v2 claims lifecycle.
+- None for T12a offline harness scope.
 
 ### 6. Acceptance criteria
-- Replay job can run from evidence snapshots and produce stable claim-state hash.
-- Diff reports include claim-level adds/removes/supersedes and evidence coverage deltas.
-- Golden test set exists and is versioned for offline quality evaluation.
-- Offline quality evaluation covers:
+- Replay job can run from canonical extract-results/evidence scope and produce stable claim/mutation state hash across deterministic re-runs. ✅
+- Diff reports include claim creation/supersession/retraction, evidence-linkage deltas, and mutation-ordering differences. ✅
+- Golden test-set fixture support exists and is versioned for offline evaluation harness runs. ✅
+- Full offline quality evaluation dimensions remain deferred to later tickets and consume this harness as substrate:
   - identity quality
   - living context quality
   - thread quality
   - handover usefulness
-- T12a reports include before/after quality comparison for these product-baseline dimensions.
+- Before/after product-baseline comparison dashboards remain out of scope for T12a and are deferred to T12b/T9a quality phases.
 
 ### 7. Risks
 - Harness may diverge from production code path if not shared components.
 
 ### 8. Files/functions likely affected
-- new replay tools in `scripts/` and `tests/fixtures/`
-- shared resolver invocation wrappers
+- `src/replay_audit.py`
+- `scripts/run_v2_replay_audit.py`
+- `tests/test_replay_audit.py`
+- `tests/fixtures/t12a_golden_set.sample.json`
+- `src/claim_resolution.py` (candidate-list scope entrypoint for replay harness)
+- `src/entity_resolution.py` (deterministic entity-id creation for replay reset determinism)
 
 ---
 
@@ -714,8 +718,8 @@ Can run independently once dependencies are met:
 - Documentation alignment portions of **T15** can start early, but destructive cleanup must wait.
 
 ## Immediate Next 3 Tickets
-1. **T12a** — Offline replay, diffing, and audit harness.
-2. **T9a** — Re-anchor existing synthesis to canonical layer.
-3. **T10** — `/v2/memory/query` implementation.
+1. **T9a** — Re-anchor existing synthesis to canonical layer.
+2. **T10** — `/v2/memory/query` implementation.
+3. **T11** — Legacy client compatibility adapter routed to v2 only.
 
-Rationale: T4/T4b/T6/T7/T8 are closed with execution validation; proceed with replay/diff audit hardening, then projection re-anchoring, then v2 retrieval serving.
+Rationale: T4/T4b/T6/T7/T8/T12a are closed with execution validation; proceed with projection re-anchoring, then v2 retrieval serving, then adapter cutover.

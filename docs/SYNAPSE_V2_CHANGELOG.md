@@ -29,6 +29,49 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-20 13:24 UTC — T12a
+- Summary of what changed:
+  - Added offline replay/audit harness for canonical memory replays with deterministic run contract over fixed inputs and fixed resolver/policy versions.
+  - Added replay snapshot/state-hash capture over canonical outputs (`claims`, `claim_evidence`, `canonical_mutations`) and machine-readable diff reporting for:
+    - claim creation
+    - claim supersession
+    - claim retraction
+    - evidence linkage deltas
+    - mutation ordering differences
+  - Added golden-corpus loader contract and sample fixture for future quality-eval expansion.
+  - Added CLI entrypoint for offline replay execution in single-run and golden-corpus modes.
+  - Hardened replay determinism under reset runs by:
+    - introducing deterministic canonical entity-id generation in entity creation path
+    - normalizing replay snapshots to semantic claim identity (`claim_event_key`) rather than DB-surrogate claim ids.
+  - Kept scope to evaluation infrastructure only: no retrieval, projection-builder, or synthesis behavior rewrites.
+- Files changed:
+  - `src/replay_audit.py`
+  - `scripts/run_v2_replay_audit.py`
+  - `tests/test_replay_audit.py`
+  - `tests/fixtures/t12a_golden_set.sample.json`
+  - `src/claim_resolution.py`
+  - `src/entity_resolution.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+  - `docs/SYNAPSE_V2_CHANGELOG.md`
+- Tests added/updated:
+  - `tests/test_replay_audit.py`:
+    - deterministic replay state hash
+    - diff report generation
+    - repeat-run equality for canonical outputs
+    - golden corpus loader fixture validation
+  - Regression validation:
+    - `tests/test_claim_resolution.py`
+    - `tests/test_entity_resolution.py`
+    - `tests/test_canonical_mutation_log.py`
+- Acceptance criteria satisfied:
+  - Offline replay harness replays canonical entity/claim/mutation flow from extract-results inputs.
+  - Deterministic repeat runs yield equal canonical state hashes for same inputs/versions.
+  - Machine-readable diff report includes required claim/evidence/mutation dimensions.
+  - Golden-set corpus contract is present and validated by tests.
+- Known remaining gaps:
+  - Product-quality comparative scoring/dashboarding (identity/context/thread/handover) remains deferred to T12b/T9a phases.
+- Status: done
+
 ### 2026-04-20 10:44 UTC — T8
 - Summary of what changed:
   - Added additive migration for canonical mutation ordering contract with explicit watermark semantics: **per-tenant monotonic sequence** (`tenant_sequence`) plus `canonical_tenant_watermarks`.

@@ -1,0 +1,18 @@
+{
+  "schema_version": "t12a.golden.v1",
+  "description": "Sample golden corpus for offline replay hash/diff checks.",
+  "cases": [
+    {
+      "case_id": "sample_relationship_status",
+      "tenant_id": "tenant-sample",
+      "extract_result_ids": [
+        1001,
+        1002
+      ],
+      "policy_version": "v2.p1",
+      "reset_before_run": true,
+      "allow_assistant_authored": false,
+      "expected_notes": "Populate real extract_result_ids per environment before execution."
+    }
+  ]
+}
