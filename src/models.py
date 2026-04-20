@@ -128,6 +128,41 @@ class MemoryQueryRequest(BaseModel):
     focusQuery: Optional[str] = None
 
 
+class MemoryQueryV2Request(BaseModel):
+    tenantId: str
+    userId: str
+    query: str
+    lane: Optional[str] = Field(default="hybrid", pattern="^(factual|episodic|continuity|hybrid)$")
+    limit: Optional[int] = 10
+    referenceTime: Optional[str] = None
+
+
+class MemoryQueryV2Item(BaseModel):
+    lane: str
+    itemType: str
+    text: Optional[str] = None
+    relevance: Optional[float] = None
+    source: Optional[str] = None
+    sourceTenant: Optional[str] = None
+    derived: Optional[bool] = None
+    dataClassification: Optional[str] = None
+    claimSlotKey: Optional[str] = None
+    claimEventKey: Optional[str] = None
+    lifecycleStatus: Optional[str] = None
+    evidence: List[Dict[str, Any]] = []
+    episodeId: Optional[str] = None
+    sessionId: Optional[str] = None
+    referenceTime: Optional[str] = None
+    linkedEntities: List[str] = []
+    metadata: Dict[str, Any] = {}
+
+
+class MemoryQueryV2Response(BaseModel):
+    lane: str
+    items: List[MemoryQueryV2Item] = []
+    metadata: Dict[str, Any] = {}
+
+
 class EpisodeRecallItem(BaseModel):
     episodeId: Optional[str] = None
     sessionId: Optional[str] = None

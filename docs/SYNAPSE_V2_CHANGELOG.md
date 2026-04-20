@@ -29,6 +29,36 @@ Scope: tickets defined in [SYNAPSE_V2_ROADMAP.md](/opt/synapse/docs/SYNAPSE_V2_R
 
 ## Entries
 
+### 2026-04-20 15:20 UTC — T10
+- Summary of what changed:
+  - Implemented authoritative `POST /v2/memory/query` retrieval contract with explicit lanes: `factual`, `episodic`, `continuity`, `hybrid`.
+  - Added dedicated v2 request/response models with stable lane-labeled output items and provenance metadata.
+  - Enforced hard lane rules in v2 path:
+    - factual lane emits canonical claim rows only and drops rows with no evidence links
+    - continuity lane emits derived-only rows and filters out canonical factual rows
+    - hybrid lane returns lane-labeled union without collapsing lane provenance
+  - Kept scope retrieval-contract-only: no synthesis builder rewrites and no legacy adapter migration (T11).
+- Files changed:
+  - `src/models.py`
+  - `src/main.py`
+  - `tests/test_v2_memory_query.py`
+  - `docs/SYNAPSE_V2_ROADMAP.md`
+  - `docs/SYNAPSE_V2_CHANGELOG.md`
+- Tests added/updated:
+  - `tests/test_v2_memory_query.py`:
+    - factual lane evidence-backed-only behavior
+    - continuity derived-only filtering
+    - episodic-only lane dispatch
+    - hybrid lane-label preservation
+    - unsupported lane validation
+- Acceptance criteria satisfied:
+  - `/v2/memory/query` exists with strict lane boundaries and fail-closed factual filtering.
+  - Output includes explicit provenance/source metadata for migration auditing.
+  - Hybrid output preserves lane labels across factual/episodic/continuity rows.
+- Known remaining gaps:
+  - T11 legacy compatibility adapter routing remains pending by roadmap design.
+- Status: done
+
 ### 2026-04-20 15:02 UTC — T9a
 - Summary of what changed:
   - Completed T9a continuation by re-anchoring remaining mixed-authority synthesis surfaces without rewriting synthesis behavior.

@@ -467,16 +467,15 @@ Current retrieval is monolithic and mixed-authority.
 T1, T7, T8, T9a.
 
 ### 4. Current status
-Not implemented.
+Done.
 
 ### 5. Gaps
-- `/memory/query` mixes lane logic and policy heuristics in one path.
-- No authoritative v2 lane contract in code.
+- Legacy client adapter routing to v2 remains deferred to T11 by design.
 
 ### 6. Acceptance criteria
-- `/v2/memory/query` exists and enforces lane separation.
-- Factual lane rejects unsupported facts (no evidence => dropped).
-- Response carries explicit source metadata for migration auditability.
+- `/v2/memory/query` exists and enforces lane separation. ✅
+- Factual lane rejects unsupported facts (no evidence => dropped). ✅
+- Response carries explicit source metadata for migration auditability. ✅
 
 ### 7. Risks
 - Hybrid mode may re-mix lanes if contracts are weak.
@@ -730,8 +729,8 @@ Can run independently once dependencies are met:
 - Documentation alignment portions of **T15** can start early, but destructive cleanup must wait.
 
 ## Immediate Next 3 Tickets
-1. **T10** — `/v2/memory/query` implementation.
-2. **T11** — Legacy client compatibility adapter routed to v2 only.
-3. **T12b** — Live shadow-read diffing and rollout audit dashboard.
+1. **T11** — Legacy client compatibility adapter routed to v2 only.
+2. **T12b** — Live shadow-read diffing and rollout audit dashboard.
+3. **T13** — Continuous invariants + repair jobs.
 
-Rationale: T4/T4b/T6/T7/T8/T9a/T12a are closed with execution validation; proceed to v2 retrieval serving, adapter cutover, and live rollout auditing.
+Rationale: T4/T4b/T6/T7/T8/T9a/T10/T12a are closed with execution validation; proceed to adapter cutover, live rollout auditing, and invariant automation.

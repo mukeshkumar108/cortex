@@ -18,6 +18,9 @@ from .models import (
     BriefResponse,
     MemoryQueryRequest,
     MemoryQueryResponse,
+    MemoryQueryV2Request,
+    MemoryQueryV2Response,
+    MemoryQueryV2Item,
     MemoryLoopsResponse,
     MemoryLoopItem,
     Fact,
@@ -1766,6 +1769,13 @@ def _resolve_memory_intent(value: Optional[str]) -> str:
     if intent in {"exact", "episodic", "hybrid"}:
         return intent
     return "exact"
+
+
+def _resolve_memory_lane_v2(value: Optional[str]) -> str:
+    lane = _normalize_text(value).lower()
+    if lane in {"factual", "episodic", "continuity", "hybrid"}:
+        return lane
+    return "hybrid"
 
 
 def _extract_session_id_from_episode_name(name: str) -> Optional[str]:
@@ -11387,6 +11397,376 @@ async def brief(request: BriefRequest):
     except Exception as e:
         logger.error(f"Brief endpoint error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _parse_reference_time_or_none(raw_value: Optional[str]) -> Optional[datetime]:
+    value = _normalize_text(raw_value)
+    if not value:
+        return None
+    if value.endswith("Z"):
+        value = value.replace("Z", "+00:00")
+    return datetime.fromisoformat(value)
+
+
+async def _v2_collect_factual_items(
+    *,
+    tenant_scope: List[str],
+    canonical_tenant: str,
+    user_id: str,
+    query: str,
+    limit: int,
+    reference_time: Optional[datetime],
+) -> List[MemoryQueryV2Item]:
+    safe_limit = max(1, min(int(limit or 10), 50))
+    fetch_limit = max(20, min(safe_limit * 6, 260))
+    query_terms = _query_terms(query)
+    now_utc = (
+        reference_time.astimezone(dt_timezone.utc)
+        if isinstance(reference_time, datetime) and reference_time.tzinfo is not None
+        else datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+    )
+    rows = await db.fetch(
+        """
+        SELECT
+          c.tenant_id,
+          c.claim_slot_key,
+          c.claim_event_key,
+          c.lifecycle_status,
+          c.predicate,
+          c.subject_text,
+          c.object_payload,
+          c.extraction_confidence,
+          c.truth_confidence,
+          c.predicate_policy_version,
+          c.updated_at,
+          e.canonical_name AS subject_name,
+          COALESCE(
+            jsonb_agg(
+              jsonb_build_object(
+                'claimEvidenceId', ce.claim_evidence_id,
+                'sessionId', ce.session_id,
+                'turnIndex', ce.turn_index,
+                'charStart', ce.char_start,
+                'charEnd', ce.char_end,
+                'evidenceText', t.content
+              )
+              ORDER BY ce.turn_index ASC, ce.claim_evidence_id ASC
+            ) FILTER (WHERE ce.claim_evidence_id IS NOT NULL),
+            '[]'::jsonb
+          ) AS evidence_links
+        FROM claims c
+        LEFT JOIN entities e
+          ON e.tenant_id = c.tenant_id
+         AND e.entity_id = c.subject_entity_id
+        LEFT JOIN claim_evidence ce
+          ON ce.tenant_id = c.tenant_id
+         AND ce.claim_id = c.claim_id
+        LEFT JOIN turns_v2 t
+          ON t.tenant_id = ce.tenant_id
+         AND t.session_id = ce.session_id
+         AND t.turn_index = ce.turn_index
+        WHERE c.tenant_id = ANY($1::text[])
+          AND c.user_id = $2
+          AND c.lifecycle_status = 'active'
+        GROUP BY
+          c.tenant_id,
+          c.claim_slot_key,
+          c.claim_event_key,
+          c.lifecycle_status,
+          c.predicate,
+          c.subject_text,
+          c.object_payload,
+          c.extraction_confidence,
+          c.truth_confidence,
+          c.predicate_policy_version,
+          c.updated_at,
+          e.canonical_name
+        ORDER BY c.updated_at DESC NULLS LAST, c.claim_event_key ASC
+        LIMIT $3
+        """,
+        tenant_scope,
+        user_id,
+        fetch_limit,
+    )
+    ranked: List[Tuple[float, str, Dict[str, Any]]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        evidence = row.get("evidence_links")
+        if not isinstance(evidence, list) or not evidence:
+            # Hard rule: no factual row without evidence links.
+            continue
+        line = _canonical_claim_line(row)
+        if not line:
+            continue
+        base_score = 0.15 + (0.12 * _normalize_confidence(row.get("truth_confidence"), default=0.5))
+        score = _score_text_match(
+            text=line,
+            query_terms=query_terms,
+            reference_ts=row.get("updated_at"),
+            now_utc=now_utc,
+            base_score=base_score,
+        )
+        if query_terms and score < 0.08:
+            continue
+        event_key = _normalize_text(row.get("claim_event_key"))
+        if not event_key:
+            continue
+        ranked.append((score, event_key, row))
+
+    ranked.sort(key=lambda item: (-float(item[0]), item[1]))
+    items: List[MemoryQueryV2Item] = []
+    for score, _event_key, row in ranked[:safe_limit]:
+        evidence_links = row.get("evidence_links")
+        evidence_rows = evidence_links if isinstance(evidence_links, list) else []
+        items.append(
+            MemoryQueryV2Item(
+                lane="factual",
+                itemType="claim",
+                text=_canonical_claim_line(row),
+                relevance=round(float(score), 4),
+                source="canonical_claims",
+                sourceTenant=_normalize_text(row.get("tenant_id")) or canonical_tenant,
+                derived=False,
+                dataClassification="canonical factual",
+                claimSlotKey=_normalize_text(row.get("claim_slot_key")) or None,
+                claimEventKey=_normalize_text(row.get("claim_event_key")) or None,
+                lifecycleStatus=_normalize_text(row.get("lifecycle_status")) or None,
+                evidence=evidence_rows,
+                metadata={
+                    "predicate": _normalize_text(row.get("predicate")) or None,
+                    "predicatePolicyVersion": _normalize_text(row.get("predicate_policy_version")) or None,
+                    "truthConfidence": float(row.get("truth_confidence") or 0.0),
+                    "extractionConfidence": float(row.get("extraction_confidence") or 0.0),
+                    **_retrieval_row_metadata(
+                        source_type="canonical factual",
+                        derived=False,
+                        evidence_backed=True,
+                        data_classification="canonical factual",
+                    ),
+                },
+            )
+        )
+    return items
+
+
+async def _v2_collect_episodic_items(
+    *,
+    tenant_scope: List[str],
+    canonical_tenant: str,
+    user_id: str,
+    query: str,
+    limit: int,
+    reference_time: Optional[datetime],
+) -> List[MemoryQueryV2Item]:
+    recall_items, _audit = await _build_episodic_recall_items(
+        tenant_scope=tenant_scope,
+        canonical_tenant=canonical_tenant,
+        user_id=user_id,
+        query=query,
+        query_terms=_query_terms(query),
+        reference_time=reference_time,
+        entity_hints=[],
+        limit=limit,
+    )
+    out: List[MemoryQueryV2Item] = []
+    for item in recall_items:
+        evidence = [x for x in (item.evidence or []) if _normalize_text(x)]
+        out.append(
+            MemoryQueryV2Item(
+                lane="episodic",
+                itemType="episode",
+                text=_normalize_text(item.summary) or None,
+                relevance=(round(float(item.score), 4) if item.score is not None else None),
+                source="episodic_recall",
+                sourceTenant=item.sourceTenant or canonical_tenant,
+                derived=False,
+                dataClassification="episodic",
+                evidence=[{"evidenceText": value} for value in evidence],
+                episodeId=item.episodeId,
+                sessionId=item.sessionId,
+                referenceTime=item.referenceTime,
+                linkedEntities=item.linkedEntities or [],
+                metadata={
+                    **_retrieval_row_metadata(
+                        source_type="episodic",
+                        derived=False,
+                        evidence_backed=bool(evidence),
+                        data_classification="episodic",
+                    ),
+                },
+            )
+        )
+    return out
+
+
+async def _v2_collect_continuity_items(
+    *,
+    tenant_scope: List[str],
+    canonical_tenant: str,
+    user_id: str,
+    query: str,
+    limit: int,
+    reference_time: Optional[datetime],
+) -> List[MemoryQueryV2Item]:
+    safe_limit = max(1, min(int(limit or 10), 50))
+    tasks = [
+        _pg_search_continuity_facts(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            query=query,
+            limit=safe_limit,
+            reference_time=reference_time,
+        )
+        for tenant_id in tenant_scope
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
+    rows: List[Dict[str, Any]] = []
+    for tenant_id, tenant_rows in zip(tenant_scope, results):
+        if isinstance(tenant_rows, Exception):
+            logger.warning("v2_memory_query continuity search failed tenant=%s user=%s err=%s", tenant_id, user_id, tenant_rows)
+            continue
+        for row in (tenant_rows or []):
+            if not isinstance(row, dict):
+                continue
+            # Hard rule: continuity lane is derived-only.
+            if not bool(row.get("derived")):
+                continue
+            if _normalize_text(row.get("source_type")).lower() != "derived continuity/projection":
+                continue
+            text = _normalize_text(row.get("text"))
+            if not text:
+                continue
+            rows.append({**row, "tenant_id": tenant_id, "text": text})
+
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in sorted(
+        rows,
+        key=lambda item: (
+            float(item.get("relevance") or 0.0),
+            _normalize_text(item.get("valid_at")),
+            _normalize_text(item.get("text")),
+        ),
+        reverse=True,
+    ):
+        key = _normalize_text(row.get("text")).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+        if len(deduped) >= safe_limit:
+            break
+
+    return [
+        MemoryQueryV2Item(
+            lane="continuity",
+            itemType="continuity_fact",
+            text=_normalize_text(row.get("text")),
+            relevance=(round(float(row.get("relevance")), 4) if row.get("relevance") is not None else None),
+            source=_normalize_text(row.get("source")) or "continuity_projection",
+            sourceTenant=_normalize_text(row.get("tenant_id")) or canonical_tenant,
+            derived=True,
+            dataClassification="derived continuity/projection",
+            evidence=[],
+            metadata={
+                **_retrieval_row_metadata(
+                    source_type="derived continuity/projection",
+                    derived=True,
+                    evidence_backed=False,
+                    data_classification="derived continuity/projection",
+                ),
+            },
+        )
+        for row in deduped
+    ]
+
+
+@app.post(
+    "/v2/memory/query",
+    response_model=MemoryQueryV2Response,
+    response_model_exclude_none=True,
+)
+async def memory_query_v2(request: MemoryQueryV2Request):
+    """
+    Authoritative Synapse v2 retrieval contract with strict lane separation.
+    """
+    try:
+        lane = _resolve_memory_lane_v2(request.lane)
+        if lane not in {"factual", "episodic", "continuity", "hybrid"}:
+            raise HTTPException(status_code=400, detail="Unsupported lane")
+        canonical_tenant, tenant_scope = _resolve_tenant_scope(request.tenantId)
+        reference_time = _parse_reference_time_or_none(request.referenceTime)
+        limit = max(1, request.limit or 10)
+
+        factual_items: List[MemoryQueryV2Item] = []
+        episodic_items: List[MemoryQueryV2Item] = []
+        continuity_items: List[MemoryQueryV2Item] = []
+
+        if lane in {"factual", "hybrid"}:
+            factual_items = await _v2_collect_factual_items(
+                tenant_scope=tenant_scope,
+                canonical_tenant=canonical_tenant,
+                user_id=request.userId,
+                query=request.query,
+                limit=limit,
+                reference_time=reference_time,
+            )
+        if lane in {"episodic", "hybrid"}:
+            episodic_items = await _v2_collect_episodic_items(
+                tenant_scope=tenant_scope,
+                canonical_tenant=canonical_tenant,
+                user_id=request.userId,
+                query=request.query,
+                limit=limit,
+                reference_time=reference_time,
+            )
+        if lane in {"continuity", "hybrid"}:
+            continuity_items = await _v2_collect_continuity_items(
+                tenant_scope=tenant_scope,
+                canonical_tenant=canonical_tenant,
+                user_id=request.userId,
+                query=request.query,
+                limit=limit,
+                reference_time=reference_time,
+            )
+
+        if lane == "factual":
+            items = factual_items
+        elif lane == "episodic":
+            items = episodic_items
+        elif lane == "continuity":
+            items = continuity_items
+        else:
+            items = factual_items + episodic_items + continuity_items
+
+        return MemoryQueryV2Response(
+            lane=lane,
+            items=items,
+            metadata={
+                "query": request.query,
+                "lane": lane,
+                "limit": limit,
+                "tenantCanonical": canonical_tenant,
+                "tenantScope": tenant_scope,
+                "counts": {
+                    "factual": len(factual_items),
+                    "episodic": len(episodic_items),
+                    "continuity": len(continuity_items),
+                    "total": len(items),
+                },
+                "lanes": {
+                    "factual": {"derived": False, "requiresEvidence": True},
+                    "episodic": {"derived": False, "requiresEvidence": False},
+                    "continuity": {"derived": True, "requiresEvidence": False},
+                },
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"v2 memory query failed: {e}")
+        raise HTTPException(status_code=500, detail="v2 memory query failed")
 
 
 @app.post(
