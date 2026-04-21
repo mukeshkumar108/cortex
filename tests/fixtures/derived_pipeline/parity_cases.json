@@ -1,0 +1,405 @@
+[
+  {
+    "fixture_id": "relationship_contradiction",
+    "description": "Ashley relationship signal includes affection plus unresolved contradiction.",
+    "sessions": [
+      {
+        "session_id": "relationship-contradiction-1",
+        "messages": [
+          {
+            "role": "user",
+            "text": "Ashley and I are trying again, but I still feel the old tension. I want Sophie to hold both: hope and caution.",
+            "timestamp": "2026-04-01T10:00:00+00:00"
+          }
+        ]
+      },
+      {
+        "session_id": "relationship-contradiction-2",
+        "messages": [
+          {
+            "role": "user",
+            "text": "I said I was committed to being steady with Ashley, but I also avoided the hard conversation again.",
+            "timestamp": "2026-04-05T10:00:00+00:00"
+          }
+        ]
+      }
+    ],
+    "expected": {
+      "pass1_summary": "Ashley relationship carries both hope and unresolved tension.",
+      "entities": [
+        "Ashley"
+      ],
+      "thread_titles": [
+        "Ashley relationship tension"
+      ],
+      "identity_who": "Someone trying to repair relationship tension without losing honesty.",
+      "identity_current_chapter": "A period of learning steadiness without pretending tension is gone.",
+      "living_current_focus": "Holding hope with Ashley while not flattening the unresolved tension.",
+      "living_primary_tension": "The user wants repair with Ashley but is still avoiding the hard conversation.",
+      "startbrief_signal": "Ashley",
+      "handover_thread": "Ashley relationship tension",
+      "specific_terms": [
+        "Ashley",
+        "hope",
+        "tension"
+      ],
+      "contradiction_terms": [
+        "hope",
+        "tension"
+      ]
+    }
+  },
+  {
+    "fixture_id": "silence_entity_evolution",
+    "description": "Jasmine remains important through silence and reconnection intent.",
+    "sessions": [
+      {
+        "session_id": "silence-entity-1",
+        "messages": [
+          {
+            "role": "user",
+            "text": "I have not mentioned Jasmine for weeks, and that silence bothers me. I still want to reconnect with my daughter.",
+            "timestamp": "2026-04-07T10:00:00+00:00"
+          }
+        ]
+      },
+      {
+        "session_id": "silence-entity-2",
+        "messages": [
+          {
+            "role": "user",
+            "text": "Jasmine feels like an unfinished thread. I keep wanting to reach out and then I freeze.",
+            "timestamp": "2026-04-10T10:00:00+00:00"
+          }
+        ]
+      }
+    ],
+    "expected": {
+      "pass1_summary": "Jasmine remains emotionally present through silence and reconnection intent.",
+      "entities": [
+        "Jasmine"
+      ],
+      "thread_titles": [
+        "Reconnecting with Jasmine"
+      ],
+      "identity_who": "Someone carrying a quiet but persistent desire to reconnect.",
+      "identity_current_chapter": "A period of facing relational repair without forcing it.",
+      "living_current_focus": "Jasmine is present through both mention and silence.",
+      "living_primary_tension": "The user wants reconnection but freezes before acting.",
+      "startbrief_signal": "Jasmine",
+      "handover_thread": "Reconnecting with Jasmine",
+      "specific_terms": [
+        "Jasmine",
+        "silence",
+        "reconnect"
+      ],
+      "reactivation_terms": [
+        "silence",
+        "reconnect"
+      ]
+    }
+  },
+  {
+    "fixture_id": "unresolved_goal_health",
+    "description": "Persistent walking/hydration goal remains unresolved with health texture.",
+    "sessions": [
+      {
+        "session_id": "goal-health-1",
+        "messages": [
+          {
+            "role": "user",
+            "text": "My walking routine keeps slipping. I need to restart because my health and hydration have been all over the place.",
+            "timestamp": "2026-04-12T10:00:00+00:00"
+          }
+        ]
+      },
+      {
+        "session_id": "goal-health-2",
+        "messages": [
+          {
+            "role": "user",
+            "text": "The walking goal is still unresolved. I do not need productivity advice; I need Sophie to remember this matters.",
+            "timestamp": "2026-04-15T10:00:00+00:00"
+          }
+        ]
+      }
+    ],
+    "expected": {
+      "pass1_summary": "Walking and hydration routine remains unresolved and meaningful.",
+      "entities": [
+        "Sophie"
+      ],
+      "thread_titles": [
+        "Walking and hydration routine"
+      ],
+      "identity_who": "Someone trying to rebuild health routines without being flattened into productivity advice.",
+      "identity_current_chapter": "A period of rebuilding consistency through care rather than pressure.",
+      "living_current_focus": "Rebuilding walking and hydration without turning it into productivity pressure.",
+      "living_primary_tension": "The user wants consistency but resists being handled with shallow advice.",
+      "startbrief_signal": "Walking and hydration routine",
+      "handover_thread": "Walking and hydration routine",
+      "specific_terms": [
+        "walking",
+        "hydration",
+        "productivity"
+      ]
+    }
+  },
+  {
+    "fixture_id": "grief_bereavement",
+    "description": "Bereavement around father's birthday requires warmth and specificity, not generic grief text.",
+    "sessions": [
+      {
+        "session_id": "grief-bereavement-1",
+        "messages": [
+          {
+            "role": "user",
+            "text": "Dad's birthday is next week. Since losing him to cancer I keep acting like I'm fine, but April always pulls the grief back up.",
+            "timestamp": "2026-04-02T09:30:00+00:00"
+          }
+        ]
+      },
+      {
+        "session_id": "grief-bereavement-2",
+        "messages": [
+          {
+            "role": "user",
+            "text": "I don't want Sophie to cheerlead me through Dad's birthday. I need her to remember it is grief, not a mood dip.",
+            "timestamp": "2026-04-06T09:30:00+00:00"
+          }
+        ]
+      }
+    ],
+    "expected": {
+      "pass1_summary": "Dad's birthday is bringing bereavement grief back into the foreground.",
+      "entities": [
+        "Dad"
+      ],
+      "thread_titles": [
+        "Dad birthday grief"
+      ],
+      "identity_who": "Someone who keeps functioning while carrying specific cancer grief around his father.",
+      "identity_current_chapter": "A period where bereavement is resurfacing around Dad's birthday.",
+      "living_current_focus": "Approaching Dad's birthday without turning cancer grief into a generic mood problem.",
+      "living_primary_tension": "The user needs the grief witnessed without cheerleading or minimization.",
+      "startbrief_signal": "Dad",
+      "handover_thread": "Dad birthday grief",
+      "specific_terms": [
+        "Dad",
+        "birthday",
+        "grief",
+        "cancer"
+      ]
+    }
+  },
+  {
+    "fixture_id": "user_correction_contradiction",
+    "description": "User explicitly corrects a prior inferred understanding; contradiction must be preserved.",
+    "sessions": [
+      {
+        "session_id": "correction-1",
+        "messages": [
+          {
+            "role": "user",
+            "text": "I think Sophie misunderstood Bluum. No, that's not right: I did not stop caring about it. I paused because I was overwhelmed and scared of failing it.",
+            "timestamp": "2026-04-08T11:00:00+00:00"
+          }
+        ]
+      },
+      {
+        "session_id": "correction-2",
+        "messages": [
+          {
+            "role": "user",
+            "text": "Please don't write Bluum off as abandoned. The correction is important: overwhelmed is not the same as done.",
+            "timestamp": "2026-04-11T11:00:00+00:00"
+          }
+        ]
+      }
+    ],
+    "expected": {
+      "pass1_summary": "User corrected the Bluum narrative: paused from overwhelm, not abandonment.",
+      "entities": [
+        "Bluum"
+      ],
+      "thread_titles": [
+        "Correcting the Bluum narrative"
+      ],
+      "identity_who": "Someone who cares deeply about Bluum but can misread being overwhelmed as failure.",
+      "identity_current_chapter": "A period of correcting false closure around Bluum.",
+      "living_current_focus": "Holding the correction that Bluum is paused from being overwhelmed, not abandoned.",
+      "living_primary_tension": "The user fears failure enough that care can look like withdrawal.",
+      "startbrief_signal": "Bluum",
+      "handover_thread": "Correcting the Bluum narrative",
+      "specific_terms": [
+        "Bluum",
+        "overwhelmed",
+        "abandoned",
+        "correction"
+      ],
+      "contradiction_terms": [
+        "paused",
+        "abandoned"
+      ]
+    }
+  },
+  {
+    "fixture_id": "relational_rupture_status_change",
+    "description": "Relationship status changes from repairable tension to rupture.",
+    "sessions": [
+      {
+        "session_id": "rupture-1",
+        "messages": [
+          {
+            "role": "user",
+            "text": "Maya and I are done. This is not just a wobble or a rough patch. Please don't call her my partner anymore.",
+            "timestamp": "2026-04-13T18:45:00+00:00"
+          }
+        ]
+      },
+      {
+        "session_id": "rupture-2",
+        "messages": [
+          {
+            "role": "user",
+            "text": "The Maya breakup still feels raw. Part of me wants to explain myself, but the relationship has ended.",
+            "timestamp": "2026-04-16T18:45:00+00:00"
+          }
+        ]
+      }
+    ],
+    "expected": {
+      "pass1_summary": "Maya relationship status changed to ended and should not be treated as partner context.",
+      "entities": [
+        "Maya"
+      ],
+      "thread_titles": [
+        "Maya breakup rupture"
+      ],
+      "identity_who": "Someone trying to accept a relational rupture without softening it into a wobble.",
+      "identity_current_chapter": "A period of absorbing the finality of the Maya breakup.",
+      "living_current_focus": "The Maya relationship has ended and should be held as rupture, not partner tension.",
+      "living_primary_tension": "The user wants to explain himself while also accepting the relationship is over.",
+      "startbrief_signal": "Maya",
+      "handover_thread": "Maya breakup rupture",
+      "specific_terms": [
+        "Maya",
+        "breakup",
+        "ended",
+        "partner"
+      ],
+      "contradiction_terms": [
+        "partner",
+        "ended"
+      ]
+    }
+  },
+  {
+    "fixture_id": "repeated_deflection_avoidance",
+    "description": "Repeated avoidance across sessions should become a specific pattern, not a generic procrastination note.",
+    "sessions": [
+      {
+        "session_id": "deflection-1",
+        "messages": [
+          {
+            "role": "user",
+            "text": "The HMRC letter is still unopened. I moved it from the table to the drawer and pretended that counted as dealing with it.",
+            "timestamp": "2026-04-03T14:00:00+00:00"
+          }
+        ]
+      },
+      {
+        "session_id": "deflection-2",
+        "messages": [
+          {
+            "role": "user",
+            "text": "I joked about the HMRC envelope again instead of opening it. I know I'm deflecting because I'm scared of what it says.",
+            "timestamp": "2026-04-09T14:00:00+00:00"
+          }
+        ]
+      },
+      {
+        "session_id": "deflection-3",
+        "messages": [
+          {
+            "role": "user",
+            "text": "Still haven't opened the HMRC letter. Please don't let Sophie treat this as just admin; it's avoidance.",
+            "timestamp": "2026-04-14T14:00:00+00:00"
+          }
+        ]
+      }
+    ],
+    "expected": {
+      "pass1_summary": "HMRC letter remains unopened and is becoming an avoidance pattern.",
+      "entities": [
+        "HMRC"
+      ],
+      "thread_titles": [
+        "Avoiding the HMRC letter"
+      ],
+      "identity_who": "Someone who can turn fear into jokes and administrative displacement.",
+      "identity_current_chapter": "A period where avoidance is clustering around the HMRC letter.",
+      "living_current_focus": "The HMRC letter in the drawer is not just admin; it is an active avoidance pattern.",
+      "living_primary_tension": "The user knows opening the letter matters but keeps converting fear into deflection.",
+      "startbrief_signal": "HMRC",
+      "handover_thread": "Avoiding the HMRC letter",
+      "specific_terms": [
+        "HMRC",
+        "letter",
+        "avoidance",
+        "drawer"
+      ]
+    }
+  },
+  {
+    "fixture_id": "silence_reactivation",
+    "description": "A silent important thread returns and should reactivate rather than be treated as brand new.",
+    "sessions": [
+      {
+        "session_id": "reactivation-1",
+        "messages": [
+          {
+            "role": "user",
+            "text": "I haven't talked about the gym for months. Today I went back, and it felt embarrassing but important.",
+            "timestamp": "2026-04-17T07:00:00+00:00"
+          }
+        ]
+      },
+      {
+        "session_id": "reactivation-2",
+        "messages": [
+          {
+            "role": "user",
+            "text": "The gym thing is active again. I don't want a big plan; I just want Sophie to notice that I returned after a long silence.",
+            "timestamp": "2026-04-19T07:00:00+00:00"
+          }
+        ]
+      }
+    ],
+    "expected": {
+      "pass1_summary": "The gym thread reactivated after months of silence.",
+      "entities": [
+        "Gym"
+      ],
+      "thread_titles": [
+        "Gym return after silence"
+      ],
+      "identity_who": "Someone who returned to embodied care while feeling embarrassed, without making it a performance.",
+      "identity_current_chapter": "A period of cautiously reactivating the gym after silence.",
+      "living_current_focus": "The gym has become active again after a long silence, and the returned effort matters.",
+      "living_primary_tension": "The user wants the return noticed without being turned into a big plan.",
+      "startbrief_signal": "Gym",
+      "handover_thread": "Gym return after silence",
+      "specific_terms": [
+        "gym",
+        "silence",
+        "returned",
+        "embarrassed"
+      ],
+      "reactivation_terms": [
+        "active again",
+        "silence"
+      ]
+    }
+  }
+]

@@ -36,6 +36,8 @@ async def test_t4_pipeline_writes_extract_results_and_does_not_write_claims(monk
     monkeypatch.setattr(settings, "extract_results_policy_version", None, raising=False)
     monkeypatch.setattr(settings, "v2_dual_write_enabled", True, raising=False)
     monkeypatch.setattr(settings, "v2_dual_write_fail_open", False, raising=False)
+    monkeypatch.setattr(settings, "canonical_live_resolution_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "canonical_live_minimal_extractor_enabled", False, raising=False)
 
     async def _stub_add_session_episode(**_kwargs):
         return {"success": True, "episode_uuid": f"ep-{uuid4().hex}"}

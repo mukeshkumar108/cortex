@@ -1,0 +1,228 @@
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from .common import as_list, call_json_llm, clean_text, format_user_turns, safe_json, text_list
+
+THREAD_EXTRACTION_PROMPT = """You are maintaining an open thread registry for a
+personal AI assistant named Sophie.
+
+Open threads are unresolved things a caring attentive
+friend would remember and follow up on later.
+
+TODAY'S SESSION:
+Date: {session_date}
+Emotional weight: {emotional_weight}
+Emotional note: {emotional_note}
+Thread signals from triage: {thread_signals}
+
+USER TURNS FROM THIS SESSION (assistant turns removed):
+{transcript_text}
+
+EXISTING OPEN THREADS (so you can update not duplicate):
+{existing_threads}
+
+Your job:
+
+For each meaningful unresolved thing in this session,
+decide one of:
+
+CREATE — new thread not in the existing list
+UPDATE — this session adds new info to an existing thread
+RESOLVE — this session indicates a thread is now resolved
+SNOOZE — thread is still open but not actively relevant
+NO_ACTION — thread still open, nothing new to add
+
+A thread is worth creating if it is:
+- A health issue, symptom, or medical situation
+- A relationship tension or unresolved situation
+- A commitment or intention the user stated
+- A worry or fear the user expressed
+- Something in progress with no clear resolution
+- Something a good friend would ask about next time
+
+A thread is NOT worth creating if it is:
+- A passing comment with no ongoing significance
+- A resolved fact (Ashley is back together —
+  that's a memory_delta not a thread)
+- Technical work on Sophie's codebase
+- Generic emotional states without specific situation
+- Something the user clearly resolved in this same session
+
+CATEGORY options:
+health / relationship / goal / commitment /
+worry / project / other
+
+PRIORITY:
+high = time-sensitive or emotionally significant
+medium = worth following up within a week or two
+low = worth noting but not urgent
+
+For follow_up_after:
+- health issues: 3-7 days
+- relationship situations: 5-10 days
+- goals/commitments: 7-14 days
+- worries: 3-7 days
+- Use session_date as the base date
+
+RULES:
+1. Only use facts stated by the USER.
+   Ignore assistant turns completely.
+2. Be specific. "User's leg was hurting" not
+   "User mentioned a health issue."
+3. One thread per distinct situation.
+   Don't merge unrelated things into one thread.
+4. Don't create threads for things already resolved
+   in the same session.
+5. If uncertain whether something is a thread —
+   lean toward creating it. Better to have a low-priority
+   thread than to miss something important.
+6. Resolution note should be specific:
+   "User confirmed kidney stones resolved,
+    just needs to drink more water"
+   not just "resolved"
+
+Return JSON only — no preamble, no markdown:
+{{
+  "actions": [
+    {{
+      "action": "CREATE",
+      "title": "User's leg was hurting",
+      "detail": "User mentioned their leg had been painful.",
+      "category": "health",
+      "priority": "medium",
+      "related_entities": ["Ashley"],
+      "follow_up_after": "2026-04-14",
+      "source_session_id": "session-id-here"
+    }},
+    {{
+      "action": "UPDATE",
+      "thread_id": "existing-thread-uuid",
+      "detail": "User confirmed kidney stones resolved but needs hydration.",
+      "last_mentioned_at": "2026-04-09",
+      "follow_up_after": "2026-04-16"
+    }},
+    {{
+      "action": "RESOLVE",
+      "thread_id": "existing-thread-uuid",
+      "resolution_note": "Ashley visited England, they reconciled."
+    }}
+  ]
+}}
+"""
+
+
+THREAD_AUDIT_PROMPT = """You are auditing an open thread registry.
+
+Current open threads:
+{open_threads}
+
+YOUR PRIMARY JOB IS DEDUPLICATION.
+
+Read every thread carefully. For each group of threads
+that describe the same underlying situation, merge them
+into one. Keep the richest, most detailed version.
+
+Two threads are the SAME situation if they describe:
+- The same health issue (even if worded differently)
+- The same relationship tension or situation
+- The same goal or commitment
+- The same worry about the same thing
+- The same frustration or recurring pattern
+
+MERGE aggressively. One rich thread beats three thin ones.
+
+SPECIAL RULE — assistant_feedback category:
+Any thread about Sophie's failures, errors,
+hallucinations, or behavioral problems should be:
+1. Merged into a SINGLE assistant_feedback thread
+2. Category set to assistant_feedback
+3. NOT treated as a personal thread about the user
+These threads inform Sophie's behavior but should
+not dominate the user's personal handover context.
+
+RESOLVE threads that are clearly complete:
+- Technical work that is mentioned as finished
+- Health issues confirmed resolved
+- Situations where a later thread confirms resolution
+
+SNOOZE threads that are stale:
+- follow_up_after more than 45 days ago
+- Not mentioned in last 30 days
+- No active signal of ongoing relevance
+
+CRITICAL — do NOT merge:
+- Different health issues even if both are health
+- Different people even if both are relationship
+- A parent and their child
+- Things that are related but genuinely distinct
+
+Return JSON only:
+{{
+  "audit_actions": [
+    {{
+      "action": "MERGE",
+      "keep_thread_id": "uuid",
+      "absorb_thread_ids": ["uuid1", "uuid2"],
+      "merged_title": "clean title for merged thread",
+      "merged_detail": "combined detail from all threads",
+      "merged_category": "correct category",
+      "reason": "all describe same Sophie trust breakdown"
+    }},
+    {{
+      "action": "RESOLVE",
+      "thread_id": "uuid",
+      "resolution_note": "specific reason"
+    }},
+    {{
+      "action": "SNOOZE",
+      "thread_id": "uuid",
+      "reason": "stale"
+    }},
+    {{
+      "action": "CATEGORY_FIX",
+      "thread_id": "uuid",
+      "new_category": "assistant_feedback",
+      "reason": "about Sophie behavior not user's life"
+    }}
+  ]
+}}
+"""
+
+
+VALID_PRIORITIES = {"high", "medium", "low"}
+VALID_CATEGORIES = {"health", "relationship", "goal", "commitment", "worry", "project", "assistant_feedback", "other"}
+
+
+VALID_CATEGORIES = {"health", "relationship", "goal", "commitment", "worry", "project", "other", "assistant_feedback"}
+VALID_PRIORITIES = {"high", "medium", "low"}
+
+
+async def extract_thread_actions(
+    *,
+    messages: List[Dict[str, Any]],
+    session_date: Any,
+    emotional_weight: str,
+    emotional_note: str | None,
+    thread_signals: List[str],
+    existing_threads: List[Dict[str, Any]],
+    model: str,
+) -> Optional[List[Dict[str, Any]]]:
+    existing_lines = []
+    for thread in existing_threads:
+        existing_lines.append(
+            f"- id={thread.get('thread_id')} status={thread.get('status')} title={thread.get('title')} detail={thread.get('detail')}"
+        )
+    prompt = THREAD_EXTRACTION_PROMPT.format(
+        session_date=session_date.isoformat() if hasattr(session_date, 'isoformat') else str(session_date),
+        emotional_weight=emotional_weight or "none",
+        emotional_note=emotional_note or "(none)",
+        thread_signals=__import__('json').dumps(thread_signals or [], ensure_ascii=False),
+        transcript_text=format_user_turns(messages),
+        existing_threads="\n".join(existing_lines),
+    )
+    parsed = await call_json_llm(prompt=prompt, model=model, max_tokens=1800, temperature=0.1)
+    if not parsed:
+        return None
+    actions = parsed.get("actions") if isinstance(parsed.get("actions"), list) else []
+    return [a for a in actions if isinstance(a, dict)]

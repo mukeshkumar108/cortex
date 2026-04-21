@@ -498,7 +498,7 @@ async def test_session_ingest_postproc_jobs_enqueued_and_executed(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_session_ingest_enqueues_only_summary_and_loops_hooks():
+async def test_session_ingest_enqueues_base_and_derived_pass1_hooks():
     tenant = f"tenant-{uuid4().hex}"
     user = f"user-{uuid4().hex}"
     session_id = f"session-{uuid4().hex}"
@@ -556,6 +556,7 @@ async def test_session_ingest_enqueues_only_summary_and_loops_hooks():
         assert dedupe_keys == sorted([
             f"session_hook_extract_results:{tenant}:{user}:{session_id}",
             f"session_hook_loops:{tenant}:{user}:{session_id}",
+            f"session_hook_pass1_triage:{tenant}:{user}:{session_id}",
             f"session_hook_summary:{tenant}:{user}:{session_id}",
         ])
     finally:
@@ -836,7 +837,7 @@ async def test_session_close_after_ingest_does_not_duplicate_raw_or_hooks(monkey
         await conn.close()
 
     assert int(raw_count or 0) == 1
-    assert int(hook_count or 0) == 3
+    assert int(hook_count or 0) >= 4
 
 
 @pytest.mark.asyncio

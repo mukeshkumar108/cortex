@@ -1,0 +1,35 @@
+{
+  "fixture_id": "basic_six_pass",
+  "model_version": "google/gemma-4-26b-a4b-it",
+  "prompt_version": "six-pass-v1",
+  "policy_version": "derived.v1",
+  "messages": [
+    {
+      "role": "user",
+      "text": "Remember that Ashley is my partner. I need to follow up on our walking goal, and I want to become more consistent.",
+      "timestamp": "2026-04-21T10:00:00+00:00"
+    }
+  ],
+  "expected": {
+    "pass1": {
+      "output_hash": "bce49401858515d500533f7a",
+      "surfaces": ["memory_delta", "identity_signal", "thread_signal"],
+      "context_relevant": true,
+      "run_entity_pass": true,
+      "run_threads_pass": true
+    },
+    "pass1_5_entities": {
+      "entities": ["Ashley"]
+    },
+    "pass3_threads": {
+      "lifecycle_state": "active",
+      "requires_evidence_turn_refs": true
+    },
+    "pass4_identity": {
+      "writes_identity_assertions": true
+    },
+    "pass5_living_context": {
+      "writes_living_context_assertions": true
+    }
+  }
+}

@@ -139,11 +139,14 @@ def _extract_subject_entity_id(candidate: Dict[str, Any]) -> Optional[str]:
         return None
 
 
-def _extract_occurred_at(candidate: Dict[str, Any]) -> Optional[str]:
+def _extract_occurred_at(candidate: Dict[str, Any]) -> Optional[datetime]:
     for key in ("occurred_at", "timestamp", "event_time"):
         normalized = normalize_timestamp(candidate.get(key))
         if normalized:
-            return normalized
+            try:
+                return datetime.fromisoformat(normalized.replace("Z", "+00:00")).astimezone(dt_timezone.utc)
+            except Exception:
+                return None
     return None
 
 

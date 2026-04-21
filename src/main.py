@@ -81,6 +81,21 @@ from .memory_ontology import (
 )
 from .canonicalization import normalize_text as canonicalize_text, stable_short_hash
 from .extraction_results import persist_extract_result, ExtractionContractError
+from .entity_resolution import EntityResolver, RESOLUTION_STATUS_AMBIGUOUS
+from .claim_resolution import ClaimResolver
+from .derived_pipeline import (
+    PASS1_5_ENTITIES,
+    PASS1_TRIAGE,
+    PASS3_THREADS,
+    PASS4_IDENTITY,
+    PASS5_LIVING_CONTEXT,
+    bump_memory_access,
+    run_pass1_5_entities,
+    run_pass1_triage,
+    run_pass3_threads,
+    run_pass4_identity,
+    run_pass5_living_context,
+)
 from .retrieval_shadow import build_shadow_diff, persist_shadow_diff, persist_shadow_error
 from .invariants import InvariantManager
 from .rollout import RolloutController, ROUTE_LEGACY, ROUTE_SHADOW, ROUTE_V2
@@ -117,6 +132,19 @@ ENERGY_HINT_TERMS = (
     "low energy",
     "high energy",
 )
+
+RELATIONSHIP_STATUS_PATTERNS = [
+    re.compile(r"\b(?:i am|i'm|im)\s+(dating|seeing)\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})\b", re.IGNORECASE),
+    re.compile(r"\b(?:i am|i'm|im)\s+(engaged|married)\s+to\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})\b", re.IGNORECASE),
+    re.compile(r"\b([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})\s+and i are\s+(dating|engaged|married)\b", re.IGNORECASE),
+    re.compile(r"\b(?:i broke up with|i'm no longer with|im no longer with)\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})\b", re.IGNORECASE),
+]
+USER_LOCATION_PATTERNS = [
+    re.compile(r"\b(?:i live in|i moved to|i am in|i'm in|im in)\s+([A-Z][A-Za-z]+(?:[\s-][A-Z][A-Za-z]+){0,3})\b", re.IGNORECASE),
+]
+USER_PREFERENCE_PATTERNS = [
+    re.compile(r"\b(?:i like|i love|i prefer)\s+([A-Za-z][A-Za-z0-9' -]{2,80})\b", re.IGNORECASE),
+]
 
 
 def _normalize_text(value: Any) -> str:
@@ -583,20 +611,10 @@ async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
 
     living = living or {}
     identity = identity or {}
-    canonical_inputs = await _load_canonical_inputs(user_id)
-    canonical_living = _canonical_living_fallback(canonical_inputs.get("claims") or [])
-    canonical_identity = _canonical_identity_fallback(canonical_inputs.get("claims") or [])
-    canonical_threads = _canonical_threads_fallback(canonical_inputs.get("claims") or [])
-    canonical_people, canonical_projects = _canonical_people_projects_fallback(
-        canonical_inputs.get("entities") or [],
-        canonical_inputs.get("claims") or [],
-    )
 
     living_focus = (
         _normalize_text(living.get("primary_tension"))
         or _normalize_text(living.get("current_focus"))
-        or _normalize_text(canonical_living.get("primary_tension"))
-        or _normalize_text(canonical_living.get("current_focus"))
     )
     episodic_recall = await _episodic_search(user_id=user_id, query=living_focus, limit=3) if living_focus else []
     derived_threads = [
@@ -611,7 +629,7 @@ async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
         }
         for t in threads
     ]
-    effective_threads = derived_threads if derived_threads else canonical_threads
+    effective_threads = derived_threads
     effective_people = [
         {
             "name": _normalize_text(p.get("canonical_name")),
@@ -622,20 +640,20 @@ async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
             "open_questions": p.get("open_questions") if isinstance(p.get("open_questions"), list) else [],
             "salience": float(p.get("salience_score") or 0.0),
         }
-        for p in (people or canonical_people)
+        for p in people
     ]
-    effective_projects = _cluster_projects(projects if projects else canonical_projects)
+    effective_projects = _cluster_projects(projects)
     source_provenance = {
         "projection_version": "t9a.handover_reanchor.v1",
-        "canonical_claims_considered": len(canonical_inputs.get("claims") or []),
-        "canonical_entities_considered": len(canonical_inputs.get("entities") or []),
-        "canonical_watermarks": [
-            {
-                "tenant_id": _normalize_text(r.get("tenant_id")),
-                "last_sequence": int(r.get("last_sequence") or 0),
-                "updated_at": r.get("updated_at").isoformat() if isinstance(r.get("updated_at"), datetime) else _normalize_text(r.get("updated_at")) or None,
-            }
-            for r in (canonical_inputs.get("watermarks") or [])
+        "canonical_claims_considered": 0,
+        "canonical_entities_considered": 0,
+        "canonical_watermarks": [],
+        "runtime_sources": [
+            "living_context",
+            "open_threads",
+            "entity_profiles",
+            "identity_profile",
+            "session_classifications",
         ],
         "derived_inputs_present": {
             "living_context": bool(living),
@@ -649,11 +667,11 @@ async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
     return {
         "generated_at": datetime.now(dt_timezone.utc).isoformat(),
         "living_context": {
-            "current_focus": _normalize_text(living.get("current_focus")) or _normalize_text(canonical_living.get("current_focus")) or None,
-            "primary_tension": _normalize_text(living.get("primary_tension")) or _normalize_text(canonical_living.get("primary_tension")) or None,
-            "unspoken_goal": _normalize_text(living.get("unspoken_goal")) or _normalize_text(canonical_living.get("unspoken_goal")) or None,
-            "emotional_texture": _normalize_text(living.get("emotional_texture")) or _normalize_text(canonical_living.get("emotional_texture")) or None,
-            "relationship_pulse": _normalize_text(living.get("relationship_pulse")) or _normalize_text(canonical_living.get("relationship_pulse")) or None,
+            "current_focus": _normalize_text(living.get("current_focus")) or None,
+            "primary_tension": _normalize_text(living.get("primary_tension")) or None,
+            "unspoken_goal": _normalize_text(living.get("unspoken_goal")) or None,
+            "emotional_texture": _normalize_text(living.get("emotional_texture")) or None,
+            "relationship_pulse": _normalize_text(living.get("relationship_pulse")) or None,
         },
         "sophie_directives": living.get("sophie_directives") if isinstance(living.get("sophie_directives"), list) else [],
         "active_contradictions": living.get("active_contradictions") if isinstance(living.get("active_contradictions"), list) else [],
@@ -662,15 +680,10 @@ async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
         "projects": effective_projects,
         "episodic_recall": episodic_recall,
         "identity": {
-            "current_chapter": _normalize_text(identity.get("current_chapter")) or _normalize_text(canonical_identity.get("current_chapter")) or None,
-            "core_values": (
-                (identity.get("core_values") if isinstance(identity.get("core_values"), list) else [])
-                or (canonical_identity.get("core_values") if isinstance(canonical_identity.get("core_values"), list) else [])
-            )[:3],
-            "persistent_goals": (
-                identity.get("persistent_goals") if isinstance(identity.get("persistent_goals"), list) else []
-            ) or (canonical_identity.get("persistent_goals") if isinstance(canonical_identity.get("persistent_goals"), list) else []),
-            "what_they_want": _normalize_text(identity.get("what_they_want")) or _normalize_text(canonical_identity.get("what_they_want")) or None,
+            "current_chapter": _normalize_text(identity.get("current_chapter")) or None,
+            "core_values": (identity.get("core_values") if isinstance(identity.get("core_values"), list) else [])[:3],
+            "persistent_goals": identity.get("persistent_goals") if isinstance(identity.get("persistent_goals"), list) else [],
+            "what_they_want": _normalize_text(identity.get("what_they_want")) or None,
         },
         "provenance": source_provenance,
     }
@@ -4412,6 +4425,126 @@ def _build_recent_high_signal_changes(
             else:
                 changes.append(_shorten_line(text, 180))
     return _dedupe_keep_order(changes, limit=max_items)
+
+
+async def _load_recent_session_summaries_from_classifications(
+    *,
+    user_id: str,
+    limit: int = 12,
+) -> List[Dict[str, Any]]:
+    rows = await db.fetch(
+        """
+        SELECT
+          session_id,
+          session_date,
+          one_line_summary,
+          emotional_note,
+          emotional_weight,
+          tension_signal,
+          raw_triage_output->'memory_deltas' AS deltas,
+          processed_at
+        FROM session_classifications
+        WHERE user_id = $1
+          AND is_memory_worthy = true
+        ORDER BY processed_at DESC NULLS LAST, session_date DESC NULLS LAST
+        LIMIT $2
+        """,
+        user_id,
+        max(1, min(int(limit or 12), 40)),
+    )
+    out: List[Dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        deltas = row.get("deltas") if isinstance(row.get("deltas"), list) else []
+        summary_facts = (
+            _normalize_text(row.get("one_line_summary"))
+            or _normalize_text(deltas[0] if deltas else None)
+            or _normalize_text(row.get("tension_signal"))
+        )
+        moment = _normalize_text(row.get("emotional_note"))
+        if not summary_facts and not moment:
+            continue
+        processed_at = row.get("processed_at")
+        created_at = (
+            processed_at.isoformat()
+            if isinstance(processed_at, datetime)
+            else _normalize_text(row.get("session_date")) or None
+        )
+        out.append(
+            {
+                "session_id": _normalize_text(row.get("session_id")),
+                "created_at": created_at,
+                "summary_facts": summary_facts,
+                "tone": _normalize_text(row.get("emotional_weight")) or "low",
+                "moment": moment,
+                "unresolved": [],
+                "decisions": [],
+                "salience": "medium" if _normalize_text(row.get("emotional_weight")).lower() in {"high", "medium"} else "low",
+                "summary_text": summary_facts,
+                "bridge_text": "",
+                "reference_time": created_at,
+            }
+        )
+    return out
+
+
+async def _build_startbrief_entity_hints_from_profiles(
+    *,
+    user_id: str,
+    limit: int = 5,
+) -> List[SessionStartBriefEntityHint]:
+    rows = await db.fetch(
+        """
+        SELECT
+          entity_id::text AS entity_id,
+          canonical_name,
+          type,
+          relationship_to_user,
+          salience_score,
+          importance_score,
+          confidence,
+          last_seen_at,
+          last_updated_at
+        FROM entity_profiles
+        WHERE user_id = $1
+          AND status = 'active'
+        ORDER BY salience_score DESC NULLS LAST, last_updated_at DESC NULLS LAST, canonical_name_normalized ASC
+        LIMIT $2
+        """,
+        user_id,
+        max(1, min(int(limit or 5), 20)),
+    )
+    hints: List[SessionStartBriefEntityHint] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        name = canonicalize_entity_name(row.get("canonical_name"))
+        if not name:
+            continue
+        hints.append(
+            SessionStartBriefEntityHint(
+                entityId=_normalize_text(row.get("entity_id")) or None,
+                name=name,
+                type=infer_ontology_type(row.get("type")) or "other",
+                role=_normalize_text(row.get("relationship_to_user")) or None,
+                importance=_importance_label(row.get("importance_score")),
+                salience=float(row.get("salience_score") or 0.0),
+                lastSeenAt=(
+                    row.get("last_seen_at").isoformat()
+                    if isinstance(row.get("last_seen_at"), datetime)
+                    else _normalize_text(row.get("last_seen_at")) or None
+                ),
+                source="entity_profiles",
+                confidence=_normalize_confidence(row.get("confidence"), default=0.6),
+                updatedAt=(
+                    row.get("last_updated_at").isoformat()
+                    if isinstance(row.get("last_updated_at"), datetime)
+                    else _normalize_text(row.get("last_updated_at")) or None
+                ),
+            )
+        )
+    return hints[: max(1, min(int(limit or 5), 10))]
 
 
 def _compose_structured_handover_text(
@@ -10984,6 +11117,50 @@ async def _get_session_ingest_freshness(
     }
 
 
+async def _enqueue_post_ingest_hook(
+    *,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    hook_name: str,
+    reference_time: datetime,
+    episode_uuid: Optional[str] = None,
+) -> None:
+    payload = {
+        "tenant_id": tenant_id,
+        "user_id": user_id,
+        "session_id": session_id,
+        "reference_time": reference_time.isoformat(),
+        "episode_uuid": episode_uuid,
+        "hook": hook_name,
+    }
+    await db.execute(
+        """
+        INSERT INTO graphiti_outbox (
+            tenant_id, user_id, session_id, role, text, ts, status, attempts,
+            job_type, payload, dedupe_key
+        )
+        VALUES ($1,$2,$3,'system',$4,$5,'pending',0,$6,$7::jsonb,$8)
+        ON CONFLICT (dedupe_key)
+        DO UPDATE SET
+            payload=EXCLUDED.payload,
+            status=CASE WHEN graphiti_outbox.status='sent' THEN graphiti_outbox.status ELSE 'pending' END,
+            attempts=CASE WHEN graphiti_outbox.status='sent' THEN graphiti_outbox.attempts ELSE 0 END,
+            last_error=CASE WHEN graphiti_outbox.status='sent' THEN graphiti_outbox.last_error ELSE NULL END,
+            next_attempt_at=CASE WHEN graphiti_outbox.status='sent' THEN graphiti_outbox.next_attempt_at ELSE NULL END,
+            sent_at=CASE WHEN graphiti_outbox.status='sent' THEN graphiti_outbox.sent_at ELSE NULL END
+        """,
+        tenant_id,
+        user_id,
+        session_id,
+        f"{session.JOB_TYPE_POST_INGEST_HOOK}:{hook_name}",
+        reference_time,
+        session.JOB_TYPE_POST_INGEST_HOOK,
+        payload,
+        f"session_hook_{hook_name}:{tenant_id}:{user_id}:{session_id}",
+    )
+
+
 async def _execute_post_ingest_hook(hook_name: str, payload: Dict[str, Any]) -> bool:
     tenant_id = _normalize_text(payload.get("tenant_id"))
     user_id = _normalize_text(payload.get("user_id"))
@@ -11094,7 +11271,13 @@ async def _execute_post_ingest_hook(hook_name: str, payload: Dict[str, Any]) -> 
         settings = get_settings()
         if not bool(settings.extract_results_enabled):
             return True
-        await persist_extract_result(
+        candidate_payload = payload.get("candidate_payload")
+        if candidate_payload is None and bool(settings.canonical_live_minimal_extractor_enabled):
+            candidate_payload = _build_minimal_claim_candidate_payload(
+                user_id=user_id,
+                messages=messages_payload,
+            )
+        extract_result = await persist_extract_result(
             db=db,
             tenant_id=tenant_id,
             user_id=user_id,
@@ -11104,7 +11287,7 @@ async def _execute_post_ingest_hook(hook_name: str, payload: Dict[str, Any]) -> 
             prompt_version=str(settings.extract_results_prompt_version or "").strip() or "t4-prompt-v1",
             policy_version=_normalize_text(settings.extract_results_policy_version) or None,
             reference_time=reference_time,
-            candidate_payload=payload.get("candidate_payload"),
+            candidate_payload=candidate_payload,
             raw_output=payload.get("raw_output"),
             metadata={
                 "hook": session.POST_INGEST_HOOK_EXTRACT_RESULTS,
@@ -11114,6 +11297,127 @@ async def _execute_post_ingest_hook(hook_name: str, payload: Dict[str, Any]) -> 
                     "end_index": (len(messages_payload) - 1) if messages_payload else None,
                 },
             },
+        )
+        if bool(settings.canonical_live_resolution_enabled):
+            if not extract_result.deduped:
+                summary = await _run_live_canonical_resolution_from_extract_result(
+                    tenant_id=tenant_id,
+                    extract_result_id=int(extract_result.extract_result_id),
+                    allow_assistant_authored=bool(settings.canonical_live_allow_assistant_authored_claims),
+                )
+                await db.execute(
+                    """
+                    UPDATE extract_results
+                    SET raw_output = COALESCE(raw_output, '{}'::jsonb) || $3::jsonb
+                    WHERE tenant_id = $1 AND extract_result_id = $2
+                    """,
+                    tenant_id,
+                    int(extract_result.extract_result_id),
+                        {"live_canonical_resolution": summary},
+                )
+        return True
+
+    if hook_name == session.POST_INGEST_HOOK_PASS1_TRIAGE:
+        settings = get_settings()
+        if not bool(settings.derived_pipeline_enabled):
+            return True
+        result = await run_pass1_triage(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            messages=messages_payload,
+            reference_time=reference_time,
+            settings=settings,
+        )
+        episode_uuid = _normalize_text(payload.get("episode_uuid")) or None
+        if result.run_entity_pass:
+            await _enqueue_post_ingest_hook(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=session_id,
+                hook_name=session.POST_INGEST_HOOK_PASS1_5_ENTITIES,
+                reference_time=reference_time,
+                episode_uuid=episode_uuid,
+            )
+        if result.run_threads_pass:
+            await _enqueue_post_ingest_hook(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=session_id,
+                hook_name=session.POST_INGEST_HOOK_PASS3_THREADS,
+                reference_time=reference_time,
+                episode_uuid=episode_uuid,
+            )
+        if result.should_run_identity:
+            await _enqueue_post_ingest_hook(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=session_id,
+                hook_name=session.POST_INGEST_HOOK_PASS4_IDENTITY,
+                reference_time=reference_time,
+                episode_uuid=episode_uuid,
+            )
+        if result.should_run_living_context:
+            await _enqueue_post_ingest_hook(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=session_id,
+                hook_name=session.POST_INGEST_HOOK_PASS5_LIVING_CONTEXT,
+                reference_time=reference_time,
+                episode_uuid=episode_uuid,
+            )
+        return True
+
+    if hook_name == session.POST_INGEST_HOOK_PASS1_5_ENTITIES:
+        settings = get_settings()
+        if not bool(settings.derived_pipeline_enabled):
+            return True
+        await run_pass1_5_entities(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            messages=messages_payload,
+            settings=settings,
+        )
+        return True
+
+    if hook_name == session.POST_INGEST_HOOK_PASS3_THREADS:
+        settings = get_settings()
+        if not bool(settings.derived_pipeline_enabled):
+            return True
+        await run_pass3_threads(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            messages=messages_payload,
+            settings=settings,
+        )
+        return True
+
+    if hook_name == session.POST_INGEST_HOOK_PASS4_IDENTITY:
+        settings = get_settings()
+        if not bool(settings.derived_pipeline_enabled):
+            return True
+        await run_pass4_identity(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            settings=settings,
+        )
+        return True
+
+    if hook_name == session.POST_INGEST_HOOK_PASS5_LIVING_CONTEXT:
+        settings = get_settings()
+        if not bool(settings.derived_pipeline_enabled):
+            return True
+        await run_pass5_living_context(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            settings=settings,
         )
         return True
 
@@ -11483,6 +11787,199 @@ def _parse_reference_time_or_none(raw_value: Optional[str]) -> Optional[datetime
     if value.endswith("Z"):
         value = value.replace("Z", "+00:00")
     return datetime.fromisoformat(value)
+
+
+def _build_minimal_claim_candidate_payload(*, user_id: str, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    candidates: List[Dict[str, Any]] = []
+    for turn_index, message in enumerate(messages or []):
+        if not isinstance(message, dict):
+            continue
+        role = _normalize_text(message.get("role")).lower()
+        text = _normalize_text(message.get("text"))
+        if role != "user" or not text:
+            continue
+        timestamp = _normalize_text(message.get("timestamp")) or None
+
+        for pattern in RELATIONSHIP_STATUS_PATTERNS:
+            for match in pattern.finditer(text):
+                if pattern.pattern.startswith("\\b(?:i broke up with"):
+                    name = _normalize_text(match.group(1))
+                    status_value = "not together"
+                elif len(match.groups()) >= 2 and pattern.pattern.startswith("\\b([A-Z]"):
+                    name = _normalize_text(match.group(1))
+                    status_value = _normalize_text(match.group(2)).lower()
+                else:
+                    status_value = _normalize_text(match.group(1)).lower()
+                    name = _normalize_text(match.group(2))
+                if not name:
+                    continue
+                candidates.append(
+                    {
+                        "type": "claim_candidate",
+                        "predicate": "relationship.status",
+                        "subject_text": name,
+                        "object_payload": {"value": status_value},
+                        "source_role": "user",
+                        "confidence": 0.86,
+                        "timestamp": timestamp,
+                        "evidence_spans": [
+                            {
+                                "turn_index": turn_index,
+                                "start": int(match.start()),
+                                "end": int(match.end()),
+                                "text": text[int(match.start()):int(match.end())],
+                            }
+                        ],
+                    }
+                )
+
+        for pattern in USER_LOCATION_PATTERNS:
+            for match in pattern.finditer(text):
+                location = _normalize_text(match.group(1)).strip(".,!? ")
+                if not location:
+                    continue
+                candidates.append(
+                    {
+                        "type": "claim_candidate",
+                        "predicate": "user.location",
+                        "subject_text": user_id,
+                        "object_payload": {"value": location},
+                        "source_role": "user",
+                        "confidence": 0.83,
+                        "timestamp": timestamp,
+                        "evidence_spans": [
+                            {
+                                "turn_index": turn_index,
+                                "start": int(match.start()),
+                                "end": int(match.end()),
+                                "text": text[int(match.start()):int(match.end())],
+                            }
+                        ],
+                    }
+                )
+
+        for pattern in USER_PREFERENCE_PATTERNS:
+            for match in pattern.finditer(text):
+                pref = _normalize_text(match.group(1)).strip(".,!? ")
+                if len(pref) < 3:
+                    continue
+                candidates.append(
+                    {
+                        "type": "claim_candidate",
+                        "predicate": "user.preference",
+                        "subject_text": user_id,
+                        "object_payload": {"value": pref},
+                        "source_role": "user",
+                        "confidence": 0.78,
+                        "timestamp": timestamp,
+                        "evidence_spans": [
+                            {
+                                "turn_index": turn_index,
+                                "start": int(match.start()),
+                                "end": int(match.end()),
+                                "text": text[int(match.start()):int(match.end())],
+                            }
+                        ],
+                    }
+                )
+
+    deduped: List[Dict[str, Any]] = []
+    seen: set[Tuple[str, str, str]] = set()
+    for candidate in candidates:
+        key = (
+            _normalize_text(candidate.get("predicate")).lower(),
+            _normalize_text(candidate.get("subject_text")).lower(),
+            _payload_text(candidate.get("object_payload")).lower(),
+        )
+        if not all(key):
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return {
+        "schema_version": "t4.extract_results.v1",
+        "candidates": deduped,
+    }
+
+
+async def _run_live_canonical_resolution_from_extract_result(
+    *,
+    tenant_id: str,
+    extract_result_id: int,
+    allow_assistant_authored: bool,
+) -> Dict[str, Any]:
+    row = await db.fetchone(
+        """
+        SELECT extract_result_id, tenant_id, user_id, session_id, predicate_policy_version, candidates
+        FROM extract_results
+        WHERE tenant_id = $1
+          AND extract_result_id = $2
+        LIMIT 1
+        """,
+        tenant_id,
+        int(extract_result_id),
+    )
+    if not row:
+        return {"resolved": False, "reason": "extract_result_not_found"}
+
+    payload = row.get("candidates") if isinstance(row.get("candidates"), dict) else {}
+    candidate_list = [dict(c) for c in (payload.get("candidates") or []) if isinstance(c, dict)]
+    if not candidate_list:
+        return {"resolved": False, "reason": "no_candidates"}
+
+    entity_resolver = EntityResolver(db)
+    claim_resolver = ClaimResolver(db)
+    source_run = str(int(row["extract_result_id"]))
+    prepared_candidates: List[Dict[str, Any]] = []
+    entity_resolved = 0
+    entity_ambiguous = 0
+
+    for candidate in candidate_list:
+        next_candidate = dict(candidate)
+        predicate = _normalize_text(next_candidate.get("predicate")).lower()
+        if predicate == "relationship.status":
+            subject_text = _normalize_text(next_candidate.get("subject_text") or next_candidate.get("subject"))
+            if subject_text and not _normalize_text(next_candidate.get("subject_entity_id")):
+                resolved = await entity_resolver.resolve_entity_mention(
+                    tenant_id=tenant_id,
+                    user_id=str(row["user_id"]),
+                    mention_text=subject_text,
+                    entity_type="person",
+                    allow_create=True,
+                    metadata={
+                        "source_run_id": source_run,
+                        "source_extract_result_id": int(row["extract_result_id"]),
+                        "source": "live_canonical_resolution_hook",
+                    },
+                )
+                next_candidate["subject_resolution_status"] = resolved.resolution_status
+                if resolved.resolution_status == RESOLUTION_STATUS_AMBIGUOUS:
+                    entity_ambiguous += 1
+                if resolved.resolved_entity_id:
+                    entity_resolved += 1
+                    next_candidate["subject_entity_id"] = resolved.resolved_entity_id
+        prepared_candidates.append(next_candidate)
+
+    claim_result = await claim_resolver.resolve_candidates_for_scope(
+        tenant_id=tenant_id,
+        user_id=str(row["user_id"]),
+        session_id=str(row["session_id"]),
+        extract_result_id=int(row["extract_result_id"]),
+        policy_version=_normalize_text(row.get("predicate_policy_version")),
+        candidate_list=prepared_candidates,
+        allow_assistant_authored=bool(allow_assistant_authored),
+    )
+    return {
+        "resolved": True,
+        "entity_resolved": entity_resolved,
+        "entity_ambiguous": entity_ambiguous,
+        "claims_created": len(claim_result.created_claim_ids),
+        "claims_reinforced": len(claim_result.reinforced_claim_ids),
+        "claims_superseded": len(claim_result.superseded_claim_ids),
+        "claims_retracted": len(claim_result.retracted_claim_ids),
+        "claims_rejected": len(claim_result.rejected_candidates),
+    }
 
 
 async def _v2_collect_factual_items(
@@ -12703,21 +13200,11 @@ async def session_startbrief(
         if tzinfo:
             reference_now = reference_now.astimezone(tzinfo)
 
-        settings = get_settings()
         time_of_day_label = _time_of_day_label(reference_now.replace(tzinfo=None))
         reference_now_utc = reference_now.astimezone(dt_timezone.utc)
         time_gap_human = None
         last_activity_time: Optional[datetime] = None
         recent_session_summaries: List[Dict[str, Any]] = []
-        user_model_hints: List[str] = []
-        user_model_hint_rows: List[Dict[str, Any]] = []
-        user_model_data: Dict[str, Any] = {}
-        user_model_narrative: Optional[str] = None
-        user_model_narrative_stable: Optional[str] = None
-        user_model_narrative_current: Optional[str] = None
-        canonical_signal_rows: Dict[str, Any] = {"claims": [], "entities": [], "watermarks": []}
-        canonical_recent_changes: List[str] = []
-        canonical_entity_hint_rows: List[Dict[str, Any]] = []
         entity_hints: List[SessionStartBriefEntityHint] = []
         entity_profiles: List[SessionStartBriefEntityProfile] = []
         resume_bridge_text: Optional[str] = None
@@ -12740,205 +13227,31 @@ async def session_startbrief(
             "latest_pending_session_id": None,
         }
 
-        # Prefer session/message timestamps for time gap.
         session_id = sessionId or await _get_latest_session_id(tenantId, userId)
-        last_user_text = None
-        # Prefer transcript last message timestamp (session/ingest path)
-        try:
-            row = await db.fetchone(
-                """
-                SELECT messages
-                FROM session_transcript
-                WHERE tenant_id = $1 AND user_id = $2
-                  AND updated_at <= $3
-                ORDER BY updated_at DESC
-                LIMIT 1
-                """,
-                tenantId,
-                userId,
-                reference_now_utc
-            )
-            messages = row.get("messages") if row else None
-            if isinstance(messages, list) and messages:
-                last_msg = messages[-1]
-                ts = last_msg.get("timestamp")
-                if isinstance(ts, str):
-                    try:
-                        last_activity_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                    except Exception:
-                        last_activity_time = None
-                last_user_text = next(
-                    (m.get("text") for m in reversed(messages) if m.get("role") == "user" and m.get("text")),
-                    None
-                )
-        except Exception:
-            last_activity_time = None
 
-        # Fallback to session buffer if available
-        if session_id and not last_activity_time:
-            try:
-                last_activity_time = await session.get_last_interaction_time(tenantId, session_id)
-            except Exception:
-                last_activity_time = None
-            if last_user_text is None:
-                try:
-                    working_memory = await session.get_working_memory(tenantId, session_id)
-                    for msg in reversed(working_memory):
-                        if msg.role == "user" and msg.text:
-                            last_user_text = msg.text
-                            break
-                except Exception:
-                    last_user_text = None
+        # Strict cutover source: Postgres-derived session classifications only.
+        recent_session_summaries = await _load_recent_session_summaries_from_classifications(
+            user_id=userId,
+            limit=10,
+        )
+        fetched_summary_ids = [
+            _normalize_text(s.get("session_id"))
+            for s in recent_session_summaries
+            if _normalize_text(s.get("session_id"))
+        ]
+        summary_norm_stats["nodes_seen"] = len(recent_session_summaries)
+        summary_norm_stats["nodes_normalized_nonempty"] = len(recent_session_summaries)
+        summary_norm_stats["fallback_used"] = False
+        summary_norm_stats["fallback_success"] = False
 
-        try:
-            logger.info("startbrief graphiti: get_latest_session_summary_node")
-            summary_node = await graphiti_client.get_latest_session_summary_node(
-                tenant_id=tenantId,
-                user_id=userId
-            )
-            recent_nodes = await graphiti_client.get_recent_session_summary_nodes(
-                tenant_id=tenantId,
-                user_id=userId,
-                limit=10
-            )
-            for node in recent_nodes:
-                summary_norm_stats["nodes_seen"] = int(summary_norm_stats.get("nodes_seen") or 0) + 1
-                fetched_id = _extract_startbrief_summary_identifier(node)
-                if fetched_id and fetched_id not in fetched_summary_ids:
-                    fetched_summary_ids.append(fetched_id)
-                normalized = _normalize_startbrief_session_summary_node(node, stats=summary_norm_stats)
-                if not normalized:
-                    continue
-                created_at = _normalize_text(normalized.get("created_at"))
-                created_dt = _parse_optional_dt(created_at)
-                if _is_unreasonably_future(created_dt, reference_now_utc):
-                    continue
-                summary_facts = _normalize_text(normalized.get("latest_thread_text"))
-                tone = _normalize_text(normalized.get("tone"))
-                moment = _normalize_text(normalized.get("moment"))
-                if not summary_facts and not moment:
-                    continue
-                summary_norm_stats["nodes_normalized_nonempty"] = int(summary_norm_stats.get("nodes_normalized_nonempty") or 0) + 1
-                recent_session_summaries.append({
-                    "session_id": _normalize_text(normalized.get("session_id")),
-                    "created_at": created_at,
-                    "summary_facts": summary_facts,
-                    "tone": tone,
-                    "moment": moment,
-                    "unresolved": normalized.get("unresolved") if isinstance(normalized.get("unresolved"), list) else [],
-                    "decisions": normalized.get("decisions") if isinstance(normalized.get("decisions"), list) else [],
-                    "salience": _normalize_text(normalized.get("salience")) or "low",
-                    "summary_text": _normalize_text(normalized.get("summary_text")),
-                    "bridge_text": _normalize_text(normalized.get("bridge_text")),
-                    "reference_time": _normalize_text(normalized.get("reference_time") or created_at),
-                })
-
-            needs_properties_fallback = (
-                int(summary_norm_stats.get("nodes_seen") or 0) > 0
-                and int(summary_norm_stats.get("nodes_normalized_nonempty") or 0) == 0
-            )
-            if needs_properties_fallback and fetched_summary_ids:
-                summary_norm_stats["fallback_used"] = True
-                try:
-                    fallback_nodes = await graphiti_client.get_session_summary_nodes_by_ids(
-                        tenant_id=tenantId,
-                        user_id=userId,
-                        ids=fetched_summary_ids[:5],
-                        limit=5
-                    )
-                    for node in fallback_nodes or []:
-                        normalized = _normalize_startbrief_session_summary_node(node, stats=summary_norm_stats)
-                        if not normalized:
-                            continue
-                        created_at = _normalize_text(normalized.get("created_at"))
-                        created_dt = _parse_optional_dt(created_at)
-                        if _is_unreasonably_future(created_dt, reference_now_utc):
-                            continue
-                        summary_facts = _normalize_text(normalized.get("latest_thread_text"))
-                        tone = _normalize_text(normalized.get("tone"))
-                        moment = _normalize_text(normalized.get("moment"))
-                        if not summary_facts and not moment:
-                            continue
-                        summary_norm_stats["nodes_normalized_nonempty"] = int(summary_norm_stats.get("nodes_normalized_nonempty") or 0) + 1
-                        recent_session_summaries.append({
-                            "session_id": _normalize_text(normalized.get("session_id")),
-                            "created_at": created_at,
-                            "summary_facts": summary_facts,
-                            "tone": tone,
-                            "moment": moment,
-                            "unresolved": normalized.get("unresolved") if isinstance(normalized.get("unresolved"), list) else [],
-                            "decisions": normalized.get("decisions") if isinstance(normalized.get("decisions"), list) else [],
-                            "salience": _normalize_text(normalized.get("salience")) or "low",
-                            "summary_text": _normalize_text(normalized.get("summary_text")),
-                            "bridge_text": _normalize_text(normalized.get("bridge_text")),
-                            "reference_time": _normalize_text(normalized.get("reference_time") or created_at),
-                        })
-                    summary_norm_stats["fallback_success"] = bool(recent_session_summaries)
-                except Exception as e:
-                    logger.warning("startbrief properties fallback failed: %s", e)
-                    summary_norm_stats["fallback_success"] = False
-            if summary_node:
-                normalized_latest = _normalize_startbrief_session_summary_node(summary_node)
-                attrs = normalized_latest.get("attributes") if normalized_latest else {}
-                summary_end = _parse_optional_dt(
-                    (normalized_latest.get("reference_time") if normalized_latest else None)
-                    or (attrs.get("reference_time") if isinstance(attrs, dict) else None)
-                    or (normalized_latest.get("created_at") if normalized_latest else None)
-                )
-                if _is_unreasonably_future(summary_end, reference_now_utc):
-                    summary_end = None
-                bridge_candidate = _normalize_text(
-                    (normalized_latest.get("bridge_text") if normalized_latest else None) or (
-                        attrs.get("bridge_text") if isinstance(attrs, dict) else None
-                    )
-                )
-                resume_use_bridge = should_use_bridge(summary_end, reference_now)
-                resume_bridge_text = bridge_candidate if (resume_use_bridge and bridge_candidate) else None
-                if not last_activity_time:
-                    last_time = _parse_optional_dt(normalized_latest.get("created_at") if normalized_latest else None)
-                    if isinstance(last_time, datetime) and last_time.astimezone(dt_timezone.utc) <= reference_now_utc:
-                        last_activity_time = last_time
-        except Exception:
-            resume_bridge_text = None
-
-        # Fallback to legacy episode summaries if no SessionSummary nodes are found
-        if not recent_session_summaries:
-            try:
-                logger.info("startbrief graphiti: get_recent_episode_summaries (fallback)")
-                episodes = await graphiti_client.get_recent_episode_summaries(
-                    tenant_id=tenantId,
-                    user_id=userId,
-                    limit=3
-                )
-                if episodes:
-                    for ep in episodes:
-                        summary_value = _normalize_text(ep.get("summary"))
-                        if not summary_value:
-                            continue
-                        recent_session_summaries.append({
-                            "session_id": _normalize_text(session_id),
-                            "created_at": _normalize_text(ep.get("reference_time")),
-                            "summary_facts": summary_value,
-                            "tone": "",
-                            "moment": "",
-                            "unresolved": [],
-                            "decisions": [],
-                            "salience": "low",
-                            "summary_text": summary_value,
-                            "bridge_text": "",
-                            "reference_time": _normalize_text(ep.get("reference_time")),
-                        })
-                    if not last_activity_time:
-                        last_time = episodes[0].get("reference_time")
-                        if isinstance(last_time, str):
-                            try:
-                                last_time = datetime.fromisoformat(last_time.replace("Z", "+00:00"))
-                            except Exception:
-                                last_time = None
-                        if isinstance(last_time, datetime):
-                            last_activity_time = last_time
-            except Exception:
-                pass
+        for summary in recent_session_summaries:
+            ts = _parse_optional_dt(summary.get("created_at"))
+            if isinstance(ts, datetime):
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=dt_timezone.utc)
+                if ts.astimezone(dt_timezone.utc) <= reference_now_utc:
+                    if last_activity_time is None or ts.astimezone(dt_timezone.utc) > last_activity_time.astimezone(dt_timezone.utc):
+                        last_activity_time = ts
 
         if last_activity_time:
             if last_activity_time.tzinfo is None:
@@ -12987,162 +13300,42 @@ async def session_startbrief(
                 break
 
         yesterday_analysis = {"date": None, "themes": [], "steering_note": None}
+        identity_profile_row = await db.fetchone(
+            """
+            SELECT current_chapter, what_they_want
+            FROM identity_profile
+            WHERE user_id = $1
+            LIMIT 1
+            """,
+            userId,
+        )
+        identity_profile_row = identity_profile_row or {}
 
         try:
-            _, tenant_scope = _resolve_tenant_scope(tenantId)
-            scoped_user_models = await _fetch_user_model_rows_for_scope(tenant_scope=tenant_scope, user_id=userId)
-            user_model_row = scoped_user_models[0] if scoped_user_models else None
-            if user_model_row:
-                user_model = _normalize_user_model(user_model_row.get("model"))
-                user_model_data = user_model
-        except Exception as e:
-            logger.error(f"startbrief user model hint lookup failed: {e}")
-
-        try:
-            canonical_signal_rows = await _fetch_canonical_signal_rows(
-                tenant_id=tenantId,
+            entity_hints = await _build_startbrief_entity_hints_from_profiles(
                 user_id=userId,
-                claim_limit=120,
-                entity_limit=80,
+                limit=5,
             )
-            for row in canonical_signal_rows.get("claims") or []:
-                if int(row.get("evidence_count") or 0) <= 0:
-                    continue
-                line = _shorten_line(_canonical_claim_line(row), 180)
-                if line:
-                    canonical_recent_changes.append(line)
-                if len(canonical_recent_changes) >= 6:
-                    break
-            for entity_row in (canonical_signal_rows.get("entities") or []):
-                name = canonicalize_entity_name(entity_row.get("canonical_name"))
-                if not name:
-                    continue
-                entity_type = infer_ontology_type(entity_row.get("entity_type"))
-                if entity_type not in {"person", "project"}:
-                    continue
-                canonical_entity_hint_rows.append(
-                    {
-                        "entityId": _normalize_text(entity_row.get("entity_id")) or None,
-                        "name": name,
-                        "type": entity_type,
-                        "role": _entity_role_from_user_model(user_model_data, name),
-                        "importance": 0.62,
-                        "salience": 0.55,
-                        "lastSeenAt": _normalize_text(entity_row.get("updated_at")) or None,
-                        "source": "canonical_entities",
-                        "confidence": 0.62,
-                        "updatedAt": _normalize_text(entity_row.get("updated_at")) or None,
-                    }
-                )
-                if len(canonical_entity_hint_rows) >= 6:
-                    break
-        except Exception as e:
-            logger.warning("startbrief canonical signal fallback lookup failed: %s", e)
-            canonical_signal_rows = {"claims": [], "entities": [], "watermarks": []}
-            canonical_recent_changes = []
-            canonical_entity_hint_rows = []
-
-        try:
-            raw_entity_hints = await _build_entity_candidates(
-                tenant_id=tenantId,
-                user_id=userId,
-                reference_time=reference_now,
-                user_model=user_model_data,
-                context_texts=[
-                    *[
-                        _normalize_text(x.get("text"))
-                        for x in loop_items[:4]
-                        if isinstance(x, dict) and _normalize_text(x.get("text"))
-                    ],
-                    _normalize_text(last_user_text),
-                ],
-                max_hints=5,
-            )
-            entity_hints = [
-                SessionStartBriefEntityHint(
-                    entityId=_normalize_text(item.get("entityId")) or None,
-                    name=_normalize_text(item.get("name")) or "unknown",
-                    type=_normalize_text(item.get("type")) or "other",
-                    role=_normalize_text(item.get("role")) or None,
-                    importance=_importance_label(item.get("importance")),
-                    salience=float(item.get("salience")) if item.get("salience") is not None else None,
-                    lastSeenAt=_normalize_text(item.get("lastSeenAt")) or None,
-                    source=_normalize_text(item.get("source")) or None,
-                    confidence=(
-                        _normalize_confidence(item.get("confidence"), default=0.0)
-                        if item.get("confidence") is not None
-                        else None
-                    ),
-                    updatedAt=_normalize_text(item.get("updatedAt")) or _normalize_text(item.get("lastSeenAt")) or None,
-                )
-                for item in (raw_entity_hints or [])
-                if _normalize_text(item.get("name"))
-            ][:5]
-            entity_hints = sorted(
-                entity_hints,
-                key=lambda x: (
-                    {"high": 3, "medium": 2, "low": 1}.get(_normalize_text(x.importance).lower(), 0),
-                    float(x.salience or 0.0),
-                    _normalize_text(x.lastSeenAt),
-                    _normalize_text(x.name).lower(),
-                ),
-                reverse=True,
-            )[:5]
         except Exception as e:
             logger.error("startbrief entity hints build failed: %s", e)
             entity_hints = []
-        if not entity_hints and canonical_entity_hint_rows:
-            entity_hints = [
-                SessionStartBriefEntityHint(
-                    entityId=_normalize_text(item.get("entityId")) or None,
-                    name=_normalize_text(item.get("name")) or "unknown",
-                    type=_normalize_text(item.get("type")) or "other",
-                    role=_normalize_text(item.get("role")) or None,
-                    importance=_importance_label(item.get("importance")),
-                    salience=float(item.get("salience")) if item.get("salience") is not None else None,
-                    lastSeenAt=_normalize_text(item.get("lastSeenAt")) or None,
-                    source=_normalize_text(item.get("source")) or None,
-                    confidence=(
-                        _normalize_confidence(item.get("confidence"), default=0.0)
-                        if item.get("confidence") is not None
-                        else None
-                    ),
-                    updatedAt=_normalize_text(item.get("updatedAt")) or _normalize_text(item.get("lastSeenAt")) or None,
-                )
-                for item in canonical_entity_hint_rows[:5]
-            ]
 
         sessions_today_count = 0
         local_day = reference_now.date()
         try:
-            local_midnight = reference_now.replace(hour=0, minute=0, second=0, microsecond=0)
-            day_start_utc = local_midnight.astimezone(dt_timezone.utc)
             sessions_today_row = await db.fetchone(
                 """
                 SELECT count(*) AS sessions_today
-                FROM session_transcript
-                WHERE tenant_id = $1
-                  AND user_id = $2
-                  AND updated_at >= $3
-                  AND updated_at <= $4
+                FROM session_classifications
+                WHERE user_id = $1
+                  AND session_date = $2::date
                 """,
-                tenantId,
                 userId,
-                day_start_utc,
-                reference_now_utc
+                local_day,
             )
             sessions_today_count = int((sessions_today_row or {}).get("sessions_today") or 0)
         except Exception:
             sessions_today_count = 0
-
-        if sessions_today_count <= 0:
-            for s in recent_session_summaries:
-                created = _parse_optional_dt(s.get("created_at"))
-                if not created:
-                    continue
-                created_local = created.astimezone(reference_now.tzinfo) if (created.tzinfo and reference_now.tzinfo) else created
-                if created_local.date() == local_day:
-                    sessions_today_count += 1
 
         gap_minutes: Optional[int] = None
         if last_activity_time:
@@ -13156,10 +13349,14 @@ async def session_startbrief(
         else:
             depth_label = "multi_day"
 
-        identity_basics = _trusted_identity_basics(user_model_data)
+        identity_basics = {}
+        chapter_hint = _normalize_text(identity_profile_row.get("current_chapter"))
+        if chapter_hint:
+            identity_basics["current_chapter"] = _shorten_line(chapter_hint, 180)
+        wants_hint = _normalize_text(identity_profile_row.get("what_they_want"))
+        if wants_hint:
+            identity_basics["what_they_want"] = _shorten_line(wants_hint, 180)
         recent_changes = _build_recent_high_signal_changes(recent_session_summaries, loop_items, max_items=3)
-        if not recent_changes and canonical_recent_changes:
-            recent_changes = _dedupe_keep_order(canonical_recent_changes, limit=3)
         local_time = reference_now.strftime("%H:%M")
         first_session_today = sessions_today_count == 0
         handover_text = _compose_structured_handover_text(
@@ -13203,8 +13400,6 @@ async def session_startbrief(
             summary_content_quality = "none_fetched"
         elif recent_changes:
             summary_content_quality = "used_for_recent_changes"
-        if summary_content_quality == "none_fetched" and canonical_recent_changes:
-            summary_content_quality = "canonical_claim_fallback"
         summary_norm_stats["evidence_ids_used_count"] = len(evidence_ids)
         summary_norm_stats["evidence_ids_fetched_count"] = len(fetched_summary_ids)
         logger.info(
@@ -13267,7 +13462,7 @@ async def session_startbrief(
                 "freshness": ingest_freshness,
                 "canonical_provenance": _canonical_provenance_payload(
                     projection_version="t9a.startbrief_reanchor.v1",
-                    signal_rows=canonical_signal_rows,
+                    signal_rows={"claims": [], "entities": [], "watermarks": []},
                 ),
             },
             entity_hints=entity_hints,
@@ -13292,6 +13487,16 @@ async def session_startbrief(
             )
         except Exception as e:
             logger.error("startbrief history log failed: %s", e)
+        if bool(get_settings().derived_pipeline_access_bump_enabled):
+            try:
+                await bump_memory_access(
+                    db=db,
+                    tenant_id=tenantId,
+                    user_id=userId,
+                    surfaces=["memory_delta", "identity_signal", "thread_signal", "entity_mention"],
+                )
+            except Exception as e:
+                logger.warning("startbrief memory access bump failed: %s", e)
         return response
     except Exception as e:
         logger.error(f"Session startbrief failed: {e}")
@@ -15126,7 +15331,17 @@ async def session_handover(
     if not effective_user_id:
         raise HTTPException(status_code=400, detail="user_id (or userId) is required")
     try:
-        return await _build_handover_packet(effective_user_id)
+        packet = await _build_handover_packet(effective_user_id)
+        if bool(get_settings().derived_pipeline_access_bump_enabled):
+            try:
+                await bump_memory_access(
+                    db=db,
+                    user_id=effective_user_id,
+                    surfaces=["living_context_statement", "thread_update", "identity_trait", "entity_mention"],
+                )
+            except Exception as e:
+                logger.warning("handover memory access bump failed user=%s err=%s", effective_user_id, e)
+        return packet
     except Exception as e:
         logger.error(f"session handover failed user=%s err=%s", effective_user_id, e)
         raise HTTPException(status_code=500, detail="session handover failed")

@@ -45,6 +45,11 @@ POST_INGEST_HOOK_OPEN_LOOPS = "open_loops"
 POST_INGEST_HOOK_EXTRACT_RESULTS = "extract_results"
 POST_INGEST_HOOK_USER_MODEL_DELTA = "user_model_delta"
 POST_INGEST_HOOK_DAILY_ANALYSIS = "daily_analysis"
+POST_INGEST_HOOK_PASS1_TRIAGE = "pass1_triage"
+POST_INGEST_HOOK_PASS1_5_ENTITIES = "pass1_5_entities"
+POST_INGEST_HOOK_PASS3_THREADS = "pass3_threads"
+POST_INGEST_HOOK_PASS4_IDENTITY = "pass4_identity"
+POST_INGEST_HOOK_PASS5_LIVING_CONTEXT = "pass5_living_context"
 SESSION_INGEST_GRAPHITI_MAX_MESSAGES = 400
 SESSION_INGEST_GRAPHITI_MAX_CHARS = 120000
 SESSION_INGEST_HOOK_MAX_MESSAGES = 200
@@ -1381,6 +1386,17 @@ class SessionManager:
             text=f"{JOB_TYPE_POST_INGEST_HOOK}:{POST_INGEST_HOOK_EXTRACT_RESULTS}",
             dedupe_key=f"session_hook_extract_results:{tenant_id}:{user_id}:{session_id}"
         )
+        if bool(getattr(self.settings, "derived_pipeline_enabled", False)):
+            await self._enqueue_outbox_job(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=session_id,
+                job_type=JOB_TYPE_POST_INGEST_HOOK,
+                payload={**base_payload, "hook": POST_INGEST_HOOK_PASS1_TRIAGE},
+                ts=reference_time,
+                text=f"{JOB_TYPE_POST_INGEST_HOOK}:{POST_INGEST_HOOK_PASS1_TRIAGE}",
+                dedupe_key=f"session_hook_pass1_triage:{tenant_id}:{user_id}:{session_id}"
+            )
 
     async def _handle_session_raw_episode_job(self, row: Dict[str, Any], graphiti_client) -> None:
         payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}

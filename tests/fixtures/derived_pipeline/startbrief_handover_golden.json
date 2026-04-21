@@ -1,0 +1,20 @@
+{
+  "startbrief": {
+    "handover_depth": "continuation",
+    "entity_hints": ["Ashley"],
+    "recent_change_contains": "User is trying to become more consistent.",
+    "canonical_claims_considered": 0
+  },
+  "handover": {
+    "living_context": {
+      "current_focus": "Becoming consistent while holding relational pressure.",
+      "primary_tension": "Wanting change while avoiding the deeper stakes."
+    },
+    "identity": {
+      "current_chapter": "A period of reconstruction."
+    },
+    "open_threads": ["Walking goal"],
+    "people": ["Ashley"],
+    "canonical_claims_considered": 0
+  }
+}
