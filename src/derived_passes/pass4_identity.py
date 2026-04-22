@@ -3,13 +3,15 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from .common import as_list, call_json_llm, clean_text, format_user_turns, safe_json, text_list
+from .synthesis_quality import conservative_rewrite_text, sanitize_list_of_dicts
 
 IDENTITY_SYNTHESIS_PROMPT = """You are synthesizing an identity profile for the user
 of a personal AI assistant named Sophie.
 
-This is NOT a status report. This is a deep reading
-of who this person is — their values, patterns, fears,
-and the story they are living.
+This is NOT a status report and NOT a character study.
+Capture only stable, useful memory that helps Sophie
+respond better: durable anchors, repeated patterns,
+explicit preferences, known constraints, and uncertainty.
 
 OBSERVER EFFECT WARNING:
 If an existing profile is shown below, treat it as
@@ -34,13 +36,37 @@ evidence from the sessions. Note uncertainty where
 the evidence is thin. Do not invent or psychologize
 beyond what is clearly present.
 
+QUALITY CONSTRAINTS:
+- Do not write a personality essay.
+- Do not write personality verdicts, global character claims,
+  or phrases like "the user is someone who...".
+- Do not dramatize the user or frame them as a tragic,
+  heroic, broken, complex, or literary character.
+- Do not use generic literary phrases like "deep complexity",
+  "navigating a life shaped by", "beneath it all", "trying to prove",
+  "driven by", "weight of", "defined by", "rollercoaster", or similar.
+- Do not infer global character from a single session.
+- Do not infer hidden motives or internal motives, fears, shame,
+  guilt, avoidance, or aspirations unless they are explicit or
+  repeatedly evidenced.
+- Do not causally connect facts unless the connection is
+  explicit, repeated, or represented as uncertainty.
+- Prefer concrete stable patterns, durable anchors,
+  explicit preferences, known constraints, and uncertainty.
+- Frame stable patterns as observed behavior, not identity essence.
+- If support is thin, use uncertainty language or leave the field sparse.
+- Every identity claim must help Sophie respond better.
+  If it is merely clever, flattering, dramatic, or poetic,
+  leave it out.
+
 INWARD-FACING SECTIONS ARE CRITICAL:
 Most AI systems only capture what a person is doing.
-Your job is to also capture who they are when they
-are not performing. What are they afraid of? What do
-they want for themselves, not just for their projects?
-What patterns keep showing up that they may not even
-name directly?
+Your job is to capture only inward-facing signals that
+are useful and evidenced: explicit hopes, repeated
+concerns, recurring interaction preferences, durable
+constraints, and uncertainties Sophie should hold.
+If a section has weak evidence, say that plainly or
+leave it sparse.
 
 Return JSON only — no preamble, no markdown:
 {{
@@ -118,21 +144,21 @@ async def synthesize_identity_profile(
         session_evidence="\n".join(session_lines),
         persistent_goals=_json_lines(persistent_goals),
     )
-    parsed = await call_json_llm(prompt=prompt, model=model, max_tokens=2800, temperature=0.2)
+    parsed = await call_json_llm(prompt=prompt, model=model, max_tokens=2800, temperature=0.1)
     return parsed or None
 
 
 def normalize_identity_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "who_they_are": clean_text(parsed.get("who_they_are")) or None,
-        "core_values": as_list(parsed.get("core_values")),
-        "recurring_patterns": as_list(parsed.get("recurring_patterns")),
-        "family_history": clean_text(parsed.get("family_history")) or None,
-        "faith_and_beliefs": clean_text(parsed.get("faith_and_beliefs")) or None,
-        "what_they_want": clean_text(parsed.get("what_they_want")) or None,
-        "recurring_fears": as_list(parsed.get("recurring_fears")),
-        "what_they_avoid": clean_text(parsed.get("what_they_avoid")) or None,
-        "how_they_relate": clean_text(parsed.get("how_they_relate")) or None,
-        "persistent_goals": as_list(parsed.get("persistent_goals")),
-        "current_chapter": clean_text(parsed.get("current_chapter")) or None,
+        "who_they_are": conservative_rewrite_text(parsed.get("who_they_are")) or None,
+        "core_values": sanitize_list_of_dicts(parsed.get("core_values")),
+        "recurring_patterns": sanitize_list_of_dicts(parsed.get("recurring_patterns")),
+        "family_history": conservative_rewrite_text(parsed.get("family_history")) or None,
+        "faith_and_beliefs": conservative_rewrite_text(parsed.get("faith_and_beliefs")) or None,
+        "what_they_want": conservative_rewrite_text(parsed.get("what_they_want")) or None,
+        "recurring_fears": sanitize_list_of_dicts(parsed.get("recurring_fears")),
+        "what_they_avoid": conservative_rewrite_text(parsed.get("what_they_avoid")) or None,
+        "how_they_relate": conservative_rewrite_text(parsed.get("how_they_relate")) or None,
+        "persistent_goals": sanitize_list_of_dicts(parsed.get("persistent_goals")),
+        "current_chapter": conservative_rewrite_text(parsed.get("current_chapter")) or None,
     }

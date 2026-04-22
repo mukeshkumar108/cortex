@@ -95,7 +95,10 @@ from .derived_pipeline import (
     run_pass3_threads,
     run_pass4_identity,
     run_pass5_living_context,
+    run_conservative_memory_audits,
+    run_silence_detection,
 )
+from .derived_passes.synthesis_quality import conservative_rewrite_text
 from .retrieval_shadow import build_shadow_diff, persist_shadow_diff, persist_shadow_error
 from .invariants import InvariantManager
 from .rollout import RolloutController, ROUTE_LEGACY, ROUTE_SHADOW, ROUTE_V2
@@ -151,6 +154,65 @@ def _normalize_text(value: Any) -> str:
     return canonicalize_text(value, casefold=False)
 
 
+def _relationship_anchor_rank(value: Any) -> int:
+    relationship = _normalize_text(value).lower().replace(" ", "_")
+    return {
+        "daughter": 100,
+        "son": 100,
+        "child": 100,
+        "girlfriend": 95,
+        "boyfriend": 95,
+        "partner": 95,
+        "spouse": 95,
+        "mother": 90,
+        "father": 90,
+        "parent": 90,
+        "sister": 85,
+        "brother": 85,
+    }.get(relationship, 0)
+
+
+def _entity_has_serving_content(row: Dict[str, Any]) -> bool:
+    if _normalize_text(row.get("profile_text")) or _normalize_text(row.get("profile_snippet")):
+        return True
+    key_facts = row.get("key_facts")
+    if isinstance(key_facts, list) and any(bool(item) for item in key_facts):
+        return True
+    open_questions = row.get("open_questions")
+    if isinstance(open_questions, list) and any(_normalize_text(item) for item in open_questions):
+        return True
+    return _relationship_anchor_rank(row.get("relationship_to_user")) >= 85
+
+
+PROJECT_ENTITY_RELATIONSHIPS = {
+    "active_project",
+    "user_project",
+    "owned_project",
+    "core_project",
+    "primary_project",
+}
+
+
+def _entity_is_human_person(row: Dict[str, Any]) -> bool:
+    entity_type = _normalize_text(row.get("type")).lower()
+    relationship = _normalize_text(row.get("relationship_to_user")).lower().replace(" ", "_")
+    if relationship in PROJECT_ENTITY_RELATIONSHIPS:
+        return False
+    if relationship in {"assistant", "system", "tool"}:
+        return False
+    return entity_type == "person"
+
+
+def _entity_hint_type(row: Dict[str, Any]) -> str:
+    relationship = _normalize_text(row.get("relationship_to_user")).lower().replace(" ", "_")
+    if relationship in PROJECT_ENTITY_RELATIONSHIPS:
+        return "project"
+    entity_type = _normalize_text(row.get("type")).lower()
+    if entity_type in {"assistant", "system"}:
+        return entity_type
+    return infer_ontology_type(row.get("type")) or "other"
+
+
 def _format_vector(vector: List[float]) -> str:
     return "[" + ",".join(str(float(x)) for x in vector) + "]"
 
@@ -192,8 +254,8 @@ def _cluster_projects(projects: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             {
                 "cluster_name": "Sophie / Synapse",
                 "components": [_normalize_text(p.get("canonical_name")) for p in sophie_cluster if _normalize_text(p.get("canonical_name"))],
-                "primary_profile": _normalize_text(primary.get("profile_text")) or None,
-                "current_status": _normalize_text(primary.get("last_known_status")) or None,
+                "primary_profile": conservative_rewrite_text(primary.get("profile_text")) or None,
+                "current_status": conservative_rewrite_text(primary.get("last_known_status")) or None,
                 "salience": max(float(p.get("salience_score") or 0.0) for p in sophie_cluster),
             }
         )
@@ -203,8 +265,8 @@ def _cluster_projects(projects: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             {
                 "cluster_name": _normalize_text(p.get("canonical_name")),
                 "components": [_normalize_text(p.get("canonical_name"))],
-                "primary_profile": _normalize_text(p.get("profile_text")) or None,
-                "current_status": _normalize_text(p.get("last_known_status")) or None,
+                "primary_profile": conservative_rewrite_text(p.get("profile_text")) or None,
+                "current_status": conservative_rewrite_text(p.get("last_known_status")) or None,
                 "salience": float(p.get("salience_score") or 0.0),
             }
         )
@@ -262,283 +324,6 @@ async def _episodic_search(
 
 
 async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
-    def _payload_value(payload: Any) -> str:
-        if isinstance(payload, dict):
-            for key in ("value", "text", "status", "summary", "name", "title"):
-                value = _normalize_text(payload.get(key))
-                if value:
-                    return value
-            compact = _normalize_text(json.dumps(payload, sort_keys=True, ensure_ascii=True))
-            return compact
-        if isinstance(payload, list):
-            parts = [_normalize_text(x) for x in payload if _normalize_text(x)]
-            return ", ".join(parts[:3])
-        return _normalize_text(payload)
-
-    def _claim_sentence(row: Dict[str, Any]) -> str:
-        predicate = _normalize_text(row.get("predicate")).lower()
-        subject = _normalize_text(row.get("subject_name")) or _normalize_text(row.get("subject_text")) or "The user"
-        value = _payload_value(row.get("object_payload"))
-        tail = predicate.replace("_", ".").split(".")[-1] if predicate else "update"
-        tail = tail.replace("_", " ").strip() or "update"
-        if value:
-            return f"{subject} {tail}: {value}"
-        return f"{subject} {tail}."
-
-    def _claim_matches(predicate: str, terms: List[str]) -> bool:
-        clean = _normalize_text(predicate).lower()
-        return bool(clean) and any(term in clean for term in terms)
-
-    async def _load_canonical_inputs(target_user_id: str) -> Dict[str, Any]:
-        claim_rows = await db.fetch(
-            """
-            SELECT
-              c.tenant_id,
-              c.claim_event_key,
-              c.predicate,
-              c.subject_entity_id::text AS subject_entity_id,
-              c.subject_text,
-              c.object_payload,
-              c.truth_confidence,
-              c.updated_at,
-              c.created_at,
-              e.canonical_name AS subject_name,
-              e.entity_type,
-              COUNT(ce.claim_evidence_id)::int AS evidence_count
-            FROM claims c
-            LEFT JOIN entities e
-              ON e.tenant_id = c.tenant_id
-             AND e.entity_id = c.subject_entity_id
-            LEFT JOIN claim_evidence ce
-              ON ce.tenant_id = c.tenant_id
-             AND ce.claim_id = c.claim_id
-            WHERE c.user_id = $1
-              AND c.lifecycle_status = 'active'
-            GROUP BY
-              c.tenant_id,
-              c.claim_event_key,
-              c.predicate,
-              c.subject_entity_id,
-              c.subject_text,
-              c.object_payload,
-              c.truth_confidence,
-              c.updated_at,
-              c.created_at,
-              e.canonical_name,
-              e.entity_type
-            ORDER BY c.updated_at DESC NULLS LAST, c.claim_event_key ASC
-            LIMIT 300
-            """,
-            target_user_id,
-        )
-        entity_rows = await db.fetch(
-            """
-            SELECT
-              tenant_id,
-              entity_id::text AS entity_id,
-              canonical_name,
-              entity_type,
-              status,
-              created_at,
-              updated_at
-            FROM entities
-            WHERE user_id = $1
-              AND status = 'active'
-            ORDER BY updated_at DESC NULLS LAST, canonical_name_normalized ASC
-            LIMIT 200
-            """,
-            target_user_id,
-        )
-        watermark_rows = await db.fetch(
-            """
-            SELECT
-              w.tenant_id,
-              w.last_sequence,
-              w.updated_at
-            FROM canonical_tenant_watermarks w
-            WHERE EXISTS (
-                SELECT 1
-                FROM claims c
-                WHERE c.tenant_id = w.tenant_id
-                  AND c.user_id = $1
-            )
-            OR EXISTS (
-                SELECT 1
-                FROM entities e
-                WHERE e.tenant_id = w.tenant_id
-                  AND e.user_id = $1
-            )
-            ORDER BY w.tenant_id ASC
-            """,
-            target_user_id,
-        )
-        return {
-            "claims": claim_rows or [],
-            "entities": entity_rows or [],
-            "watermarks": watermark_rows or [],
-        }
-
-    def _canonical_living_fallback(claims_rows: List[Dict[str, Any]]) -> Dict[str, Optional[str]]:
-        rows = [r for r in (claims_rows or []) if int(r.get("evidence_count") or 0) > 0]
-        if not rows:
-            return {
-                "current_focus": None,
-                "primary_tension": None,
-                "unspoken_goal": None,
-                "emotional_texture": None,
-                "relationship_pulse": None,
-            }
-
-        def _pick(terms: List[str]) -> Optional[str]:
-            for row in rows:
-                if not _claim_matches(str(row.get("predicate") or ""), terms):
-                    continue
-                text = _claim_sentence(row)
-                if text:
-                    return _shorten_line(text, 220)
-            return None
-
-        focus = _pick(["focus", "goal", "plan", "priority", "project", "work"])
-        tension = _pick(["tension", "conflict", "stress", "worry", "problem", "blocker"])
-        unspoken_goal = _pick(["want", "intent", "desire", "goal"])
-        emotional = _pick(["emotion", "mood", "feeling", "affect", "state"])
-        relationship = _pick(["relationship", "partner", "family", "friend"])
-        return {
-            "current_focus": focus,
-            "primary_tension": tension,
-            "unspoken_goal": unspoken_goal,
-            "emotional_texture": emotional,
-            "relationship_pulse": relationship,
-        }
-
-    def _canonical_identity_fallback(claims_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-        rows = [r for r in (claims_rows or []) if int(r.get("evidence_count") or 0) > 0]
-        if not rows:
-            return {
-                "current_chapter": None,
-                "core_values": [],
-                "persistent_goals": [],
-                "what_they_want": None,
-            }
-        chapter = None
-        core_values: List[str] = []
-        goals: List[str] = []
-        what_they_want = None
-        seen_values = set()
-        seen_goals = set()
-        for row in rows:
-            predicate = _normalize_text(row.get("predicate")).lower()
-            sentence = _shorten_line(_claim_sentence(row), 220)
-            if not sentence:
-                continue
-            if chapter is None and _claim_matches(predicate, ["chapter", "season", "phase", "identity"]):
-                chapter = sentence
-            if _claim_matches(predicate, ["value", "belief", "principle"]):
-                key = sentence.lower()
-                if key not in seen_values and len(core_values) < 3:
-                    seen_values.add(key)
-                    core_values.append(sentence)
-            if _claim_matches(predicate, ["goal", "objective", "commitment"]):
-                key = sentence.lower()
-                if key not in seen_goals and len(goals) < 6:
-                    seen_goals.add(key)
-                    goals.append(sentence)
-            if what_they_want is None and _claim_matches(predicate, ["want", "intent", "desire"]):
-                what_they_want = sentence
-        if chapter is None and goals:
-            chapter = goals[0]
-        return {
-            "current_chapter": chapter,
-            "core_values": core_values,
-            "persistent_goals": goals,
-            "what_they_want": what_they_want,
-        }
-
-    def _canonical_threads_fallback(claims_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        rows = [r for r in (claims_rows or []) if int(r.get("evidence_count") or 0) > 0]
-        out: List[Dict[str, Any]] = []
-        seen = set()
-        for row in rows:
-            predicate = _normalize_text(row.get("predicate")).lower()
-            if not _claim_matches(predicate, ["goal", "task", "deadline", "commit", "habit", "plan", "project", "relationship"]):
-                continue
-            title = _shorten_line(_claim_sentence(row), 180)
-            if not title:
-                continue
-            key = title.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            conf = _normalize_confidence(row.get("truth_confidence"), default=0.62)
-            out.append(
-                {
-                    "title": title,
-                    "detail": _normalize_text(_payload_value(row.get("object_payload"))) or None,
-                    "category": predicate.split(".")[0] if "." in predicate else "other",
-                    "priority": "high" if conf >= 0.85 else ("medium" if conf >= 0.6 else "low"),
-                    "thread_type": "persistent_goal" if "goal" in predicate else "situational",
-                    "follow_up_after": row.get("updated_at").isoformat() if isinstance(row.get("updated_at"), datetime) else None,
-                    "salience": float(conf),
-                }
-            )
-            if len(out) >= 5:
-                break
-        return out
-
-    def _canonical_people_projects_fallback(
-        entities_rows: List[Dict[str, Any]],
-        claims_rows: List[Dict[str, Any]],
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        claims_by_subject: Dict[str, List[Dict[str, Any]]] = {}
-        for row in claims_rows or []:
-            subject_id = _normalize_text(row.get("subject_entity_id"))
-            if not subject_id:
-                continue
-            claims_by_subject.setdefault(subject_id, []).append(row)
-        people: List[Dict[str, Any]] = []
-        projects: List[Dict[str, Any]] = []
-        for entity in entities_rows or []:
-            entity_type = _normalize_text(entity.get("entity_type")).lower()
-            name = _normalize_text(entity.get("canonical_name"))
-            entity_id = _normalize_text(entity.get("entity_id"))
-            if not name or entity_type not in {"person", "project"}:
-                continue
-            snippets = [
-                _shorten_line(_claim_sentence(row), 180)
-                for row in (claims_by_subject.get(entity_id) or [])[:3]
-                if _shorten_line(_claim_sentence(row), 180)
-            ]
-            profile_text = ". ".join(snippets[:2]) if snippets else f"{name} remains in active canonical context."
-            status = snippets[0] if snippets else None
-            salience = max(
-                [_normalize_confidence(r.get("truth_confidence"), default=0.6) for r in (claims_by_subject.get(entity_id) or [])] or [0.6]
-            )
-            row_payload = {
-                "canonical_name": name,
-                "relationship_to_user": None,
-                "profile_text": profile_text,
-                "last_known_status": status,
-                "key_facts": snippets[:3],
-                "open_questions": [],
-                "salience_score": float(salience),
-                "aliases": [],
-            }
-            if entity_type == "person":
-                people.append(row_payload)
-            else:
-                projects.append(row_payload)
-        people = sorted(
-            people,
-            key=lambda row: (float(row.get("salience_score") or 0.0), _normalize_text(row.get("canonical_name")).lower()),
-            reverse=True,
-        )[:6]
-        projects = sorted(
-            projects,
-            key=lambda row: (float(row.get("salience_score") or 0.0), _normalize_text(row.get("canonical_name")).lower()),
-            reverse=True,
-        )
-        return people, projects
-
     living = await db.fetchone(
         """
         SELECT current_focus, recent_narrative,
@@ -565,13 +350,13 @@ async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
             ELSE 1
           END,
           salience_score DESC
-        LIMIT 5
+        LIMIT 15
         """,
         user_id,
     )
     people = await db.fetch(
         """
-        SELECT canonical_name, relationship_to_user,
+        SELECT canonical_name, type, relationship_to_user,
                profile_text, last_known_status,
                key_facts, open_questions,
                salience_score
@@ -608,6 +393,48 @@ async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
         """,
         user_id,
     )
+    low_confidence = await db.fetch(
+        """
+        SELECT item_id, surface, statement_text, question_text, confidence
+        FROM low_confidence_items
+        WHERE user_id=$1 AND status='open'
+        ORDER BY confidence ASC NULLS FIRST, last_seen_at DESC
+        LIMIT 5
+        """,
+        user_id,
+    )
+    contradictions = await db.fetch(
+        """
+        SELECT topic, earlier_view, recent_view
+        FROM memory_contradictions
+        WHERE user_id=$1 AND status='active'
+        ORDER BY last_seen_at DESC
+        LIMIT 3
+        """,
+        user_id,
+    )
+    silence_flags = await db.fetch(
+        """
+        SELECT target_type, target_name, silence_days
+        FROM memory_silence_flags
+        WHERE user_id=$1 AND status='active'
+        ORDER BY silence_days DESC, updated_at DESC
+        LIMIT 1
+        """,
+        user_id,
+    )
+    events = await db.fetch(
+        """
+        SELECT event_type, title, description, event_time
+        FROM memory_events
+        WHERE user_id=$1
+          AND lifecycle_state='active'
+          AND event_type IN ('upcoming_event','commitment','anniversary','deadline')
+        ORDER BY event_time ASC NULLS LAST, updated_at DESC
+        LIMIT 1
+        """,
+        user_id,
+    )
 
     living = living or {}
     identity = identity or {}
@@ -628,21 +455,74 @@ async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
             "salience": float(t.get("salience_score") or 0.0),
         }
         for t in threads
+        if _handover_thread_allowed(dict(t))
     ]
+    derived_threads = derived_threads[:5]
     effective_threads = derived_threads
+    for event in events[:1]:
+        effective_threads.append(
+            {
+                "title": _normalize_text(event.get("title")),
+                "detail": _normalize_text(event.get("description")) or None,
+                "category": _normalize_text(event.get("event_type")),
+                "priority": "medium",
+                "thread_type": "anticipatory_signal",
+                "follow_up_after": event.get("event_time").isoformat() if isinstance(event.get("event_time"), datetime) else None,
+                "salience": 0.68,
+            }
+        )
     effective_people = [
         {
             "name": _normalize_text(p.get("canonical_name")),
             "relationship": _normalize_text(p.get("relationship_to_user")),
-            "profile": _normalize_text(p.get("profile_text")),
-            "current_status": _normalize_text(p.get("last_known_status")),
+            "profile": conservative_rewrite_text(p.get("profile_text")),
+            "current_status": conservative_rewrite_text(p.get("last_known_status")),
             "key_facts": p.get("key_facts") if isinstance(p.get("key_facts"), list) else [],
             "open_questions": p.get("open_questions") if isinstance(p.get("open_questions"), list) else [],
             "salience": float(p.get("salience_score") or 0.0),
         }
         for p in people
+        if _entity_has_serving_content(dict(p)) and _entity_is_human_person(dict(p))
     ]
     effective_projects = _cluster_projects(projects)
+    directive_items = living.get("sophie_directives") if isinstance(living.get("sophie_directives"), list) else []
+    directive_items = list(directive_items)
+    material_low_confidence = [
+        item
+        for item in low_confidence
+        if _is_material_low_confidence(_normalize_text(item.get("question_text")) or _normalize_text(item.get("statement_text")))
+    ]
+    for item in material_low_confidence[:1]:
+        text = _normalize_text(item.get("question_text")) or _normalize_text(item.get("statement_text"))
+        if text:
+            directive_items.append(
+                {
+                    "directive": f"Hold uncertainty gently: {text}",
+                    "reason": "low_confidence_queue",
+                    "confidence": float(item.get("confidence") or 0.0),
+                }
+            )
+    for flag in silence_flags[:1]:
+        directive_items.append(
+            {
+                "directive": f"Hold awareness that {flag.get('target_name')} has gone quiet for {int(flag.get('silence_days') or 0)} days; surface only if natural.",
+                "reason": "silence_flag",
+                "confidence": 0.65,
+            }
+        )
+    contradiction_items = living.get("active_contradictions") if isinstance(living.get("active_contradictions"), list) else []
+    contradiction_items = list(contradiction_items)
+    for row in contradictions:
+        contradiction_items.append(
+            {
+                "topic": _normalize_text(row.get("topic")),
+                "earlier_view": _normalize_text(row.get("earlier_view")),
+                "recent_view": _normalize_text(row.get("recent_view")),
+                "resolved": False,
+                "source": "memory_contradictions",
+            }
+        )
+    contradiction_items = _dedupe_contradictions(contradiction_items, limit=3)
     source_provenance = {
         "projection_version": "t9a.handover_reanchor.v1",
         "canonical_claims_considered": 0,
@@ -654,6 +534,10 @@ async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
             "entity_profiles",
             "identity_profile",
             "session_classifications",
+            "low_confidence_items",
+            "memory_contradictions",
+            "memory_events",
+            "memory_silence_flags",
         ],
         "derived_inputs_present": {
             "living_context": bool(living),
@@ -661,29 +545,33 @@ async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
             "people_profiles": bool(people),
             "project_profiles": bool(projects),
             "identity_profile": bool(identity),
+            "low_confidence_items": bool(low_confidence),
+            "memory_contradictions": bool(contradictions),
+            "memory_events": bool(events),
+            "memory_silence_flags": bool(silence_flags),
         },
     }
 
     return {
         "generated_at": datetime.now(dt_timezone.utc).isoformat(),
         "living_context": {
-            "current_focus": _normalize_text(living.get("current_focus")) or None,
-            "primary_tension": _normalize_text(living.get("primary_tension")) or None,
-            "unspoken_goal": _normalize_text(living.get("unspoken_goal")) or None,
-            "emotional_texture": _normalize_text(living.get("emotional_texture")) or None,
-            "relationship_pulse": _normalize_text(living.get("relationship_pulse")) or None,
+            "current_focus": conservative_rewrite_text(living.get("current_focus")) or None,
+            "primary_tension": conservative_rewrite_text(living.get("primary_tension")) or None,
+            "unspoken_goal": conservative_rewrite_text(living.get("unspoken_goal")) or None,
+            "emotional_texture": conservative_rewrite_text(living.get("emotional_texture")) or None,
+            "relationship_pulse": conservative_rewrite_text(living.get("relationship_pulse")) or None,
         },
-        "sophie_directives": living.get("sophie_directives") if isinstance(living.get("sophie_directives"), list) else [],
-        "active_contradictions": living.get("active_contradictions") if isinstance(living.get("active_contradictions"), list) else [],
+        "sophie_directives": directive_items,
+        "active_contradictions": contradiction_items,
         "open_threads": effective_threads,
         "people": effective_people,
         "projects": effective_projects,
         "episodic_recall": episodic_recall,
         "identity": {
-            "current_chapter": _normalize_text(identity.get("current_chapter")) or None,
+            "current_chapter": conservative_rewrite_text(identity.get("current_chapter")) or None,
             "core_values": (identity.get("core_values") if isinstance(identity.get("core_values"), list) else [])[:3],
             "persistent_goals": identity.get("persistent_goals") if isinstance(identity.get("persistent_goals"), list) else [],
-            "what_they_want": _normalize_text(identity.get("what_they_want")) or None,
+            "what_they_want": conservative_rewrite_text(identity.get("what_they_want")) or None,
         },
         "provenance": source_provenance,
     }
@@ -783,7 +671,7 @@ def _word_tokens(value: str) -> List[str]:
 
 
 def _has_proper_possessive(value: str) -> bool:
-    # "Ashley's presentation" / "Ashley’s presentation"
+    # "Riley's presentation" / "Riley’s presentation"
     clean = _normalize_text(value)
     return bool(re.search(r"\b[A-Z][a-z]+['’]s\b", clean))
 
@@ -4406,6 +4294,106 @@ def _trusted_identity_basics(user_model: Optional[Dict[str, Any]]) -> Dict[str, 
     return basics
 
 
+def _is_trivial_memory_change(text: Any) -> bool:
+    value = _normalize_text(text).lower()
+    if not value:
+        return True
+    compact = re.sub(r"[^a-z0-9 ]+", "", value).strip()
+    if compact in {
+        "hi",
+        "hello",
+        "hey",
+        "hey sophie",
+        "hi sophie",
+        "hello sophie",
+        "good morning",
+        "good morning sophie",
+        "good afternoon",
+        "good afternoon sophie",
+        "good evening",
+        "good evening sophie",
+        "user hey good morning sophie",
+        "user checked if the assistant was present",
+    }:
+        return True
+    if re.fullmatch(r"(user )?(hey|hi|hello|good morning|good afternoon|good evening)[, ]+(sophie)?", compact):
+        return True
+    return False
+
+
+def _is_material_low_confidence(text: Any) -> bool:
+    value = _normalize_text(text).lower()
+    if not value:
+        return False
+    if any(term in value for term in ("where does", "where is", "what city", "what town", "what country", "how old", "birthday")):
+        return False
+    return any(
+        term in value
+        for term in (
+            "relationship",
+            "interpretation",
+            "unclear",
+            "ambiguous",
+            "unconfirmed",
+            "inferred",
+            "intent",
+            "contradiction",
+            "tension",
+            "family role",
+            "behavioral inference",
+            "emotional tone",
+        )
+    )
+
+
+def _dedupe_contradictions(items: List[Dict[str, Any]], *, limit: int = 3) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    by_topic: Dict[str, Dict[str, Any]] = {}
+    for raw in items or []:
+        if not isinstance(raw, dict):
+            continue
+        topic = _normalize_text(raw.get("topic")) or "current tension"
+        key = topic.lower()
+        item = {
+            **raw,
+            "topic": topic,
+            "earlier_view": _normalize_text(raw.get("earlier_view")),
+            "recent_view": _normalize_text(raw.get("recent_view")),
+        }
+        existing = by_topic.get(key)
+        if not existing:
+            by_topic[key] = item
+            out.append(item)
+            continue
+        if not existing.get("recent_view") and item.get("recent_view"):
+            existing["recent_view"] = item["recent_view"]
+        if not existing.get("earlier_view") and item.get("earlier_view"):
+            existing["earlier_view"] = item["earlier_view"]
+        if existing.get("source") == "memory_contradictions" and item.get("source") != "memory_contradictions":
+            existing.pop("source", None)
+    return out[:limit]
+
+
+def _handover_thread_allowed(row: Dict[str, Any]) -> bool:
+    priority = _normalize_text(row.get("priority")).lower()
+    category = _normalize_text(row.get("category")).lower()
+    thread_type = _normalize_text(row.get("thread_type")).lower()
+    text = f"{_normalize_text(row.get('title'))} {_normalize_text(row.get('detail'))}".lower()
+    try:
+        salience = float(row.get("salience_score") or row.get("salience") or 0.0)
+    except Exception:
+        salience = 0.0
+    if priority == "high":
+        return True
+    if thread_type == "persistent_goal":
+        return True
+    if any(term in text for term in ("after silence", "long silence", "reactivat", "returned after", "gone quiet")):
+        return True
+    if category in {"relationship", "health", "assistant_feedback"} and salience >= 0.5:
+        return True
+    return salience > 0.5 and priority == "medium"
+
+
 def _build_recent_high_signal_changes(
     recent_session_summaries: List[Dict[str, Any]],
     loop_items: List[Dict[str, Any]],
@@ -4414,7 +4402,7 @@ def _build_recent_high_signal_changes(
     changes: List[str] = []
     for summary in recent_session_summaries[:2]:
         text = _normalize_text(summary.get("summary_facts") or summary.get("summary_text") or summary.get("moment"))
-        if text and _allow_fact_text(text):
+        if text and _allow_fact_text(text) and not _is_trivial_memory_change(text):
             changes.append(_shorten_line(text, 180))
     for loop in loop_items[:2]:
         text = _normalize_text(loop.get("text"))
@@ -4457,9 +4445,10 @@ async def _load_recent_session_summaries_from_classifications(
         if not isinstance(row, dict):
             continue
         deltas = row.get("deltas") if isinstance(row.get("deltas"), list) else []
+        meaningful_deltas = [_normalize_text(delta) for delta in deltas if _normalize_text(delta) and not _is_trivial_memory_change(delta)]
         summary_facts = (
-            _normalize_text(row.get("one_line_summary"))
-            or _normalize_text(deltas[0] if deltas else None)
+            (_normalize_text(row.get("one_line_summary")) if not _is_trivial_memory_change(row.get("one_line_summary")) else "")
+            or (meaningful_deltas[0] if meaningful_deltas else "")
             or _normalize_text(row.get("tension_signal"))
         )
         moment = _normalize_text(row.get("emotional_note"))
@@ -4501,6 +4490,9 @@ async def _build_startbrief_entity_hints_from_profiles(
           canonical_name,
           type,
           relationship_to_user,
+          profile_text,
+          key_facts,
+          open_questions,
           salience_score,
           importance_score,
           confidence,
@@ -4519,6 +4511,12 @@ async def _build_startbrief_entity_hints_from_profiles(
     for row in rows or []:
         if not isinstance(row, dict):
             continue
+        if not _entity_has_serving_content(dict(row)):
+            continue
+        entity_type = _normalize_text(row.get("type")).lower()
+        relationship = _normalize_text(row.get("relationship_to_user")).lower()
+        if entity_type in {"assistant", "system"} or relationship == "assistant":
+            continue
         name = canonicalize_entity_name(row.get("canonical_name"))
         if not name:
             continue
@@ -4526,7 +4524,7 @@ async def _build_startbrief_entity_hints_from_profiles(
             SessionStartBriefEntityHint(
                 entityId=_normalize_text(row.get("entity_id")) or None,
                 name=name,
-                type=infer_ontology_type(row.get("type")) or "other",
+                type=_entity_hint_type(dict(row)),
                 role=_normalize_text(row.get("relationship_to_user")) or None,
                 importance=_importance_label(row.get("importance_score")),
                 salience=float(row.get("salience_score") or 0.0),
@@ -7195,6 +7193,33 @@ async def loop_staleness_janitor_loop(
         except Exception as e:
             logger.error(f"loop staleness janitor loop error: {e}")
         await asyncio.sleep(max(300, interval_seconds))
+
+
+async def derived_silence_detection_loop(interval_seconds: int) -> None:
+    while True:
+        try:
+            inserted = await run_silence_detection(db=db, tenant_id="default")
+            if inserted:
+                logger.info("derived silence detector active_flags_written=%s", inserted)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("derived silence detector loop error: %s", e)
+        await asyncio.sleep(max(3600, interval_seconds))
+
+
+async def derived_memory_audit_loop(interval_seconds: int) -> None:
+    await asyncio.sleep(max(3600, interval_seconds))
+    while True:
+        try:
+            summary = await run_conservative_memory_audits(db=db, tenant_id="default")
+            if any(sum(section.values()) for section in summary.values()):
+                logger.info("derived memory audit summary=%s", summary)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("derived memory audit loop error: %s", e)
+        await asyncio.sleep(max(3600, interval_seconds))
 
 
 async def v2_invariant_checker_loop(
@@ -11514,6 +11539,20 @@ async def lifespan(app: FastAPI):
                 )
             )
             logger.info("Loop staleness janitor loop started")
+        if settings.derived_pipeline_silence_detection_enabled:
+            app.state.derived_silence_detection_task = asyncio.create_task(
+                derived_silence_detection_loop(
+                    interval_seconds=settings.derived_pipeline_silence_detection_interval_seconds
+                )
+            )
+            logger.info("Derived silence detector loop started")
+        if settings.derived_pipeline_audit_enabled:
+            app.state.derived_memory_audit_task = asyncio.create_task(
+                derived_memory_audit_loop(
+                    interval_seconds=settings.derived_pipeline_audit_interval_seconds
+                )
+            )
+            logger.info("Derived memory audit loop started")
         if settings.daily_analysis_enabled:
             app.state.daily_analysis_task = asyncio.create_task(
                 daily_analysis_loop(
@@ -11592,6 +11631,22 @@ async def lifespan(app: FastAPI):
         app.state.loop_staleness_janitor_task.cancel()
         try:
             await app.state.loop_staleness_janitor_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+    if getattr(app.state, "derived_silence_detection_task", None):
+        app.state.derived_silence_detection_task.cancel()
+        try:
+            await app.state.derived_silence_detection_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+    if getattr(app.state, "derived_memory_audit_task", None):
+        app.state.derived_memory_audit_task.cancel()
+        try:
+            await app.state.derived_memory_audit_task
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -12945,7 +13000,10 @@ async def session_brief(
     now: Optional[str] = None
 ):
     """
-    Generate a session start-brief from Graphiti narrative entities.
+    Compatibility session brief built from derived Postgres memory only.
+
+    This endpoint preserves the legacy response shape, but it no longer reads
+    Graphiti narrative summaries or canonical facts as serving authority.
     """
     try:
         tenantId = _normalize_text(_canonical_tenant_id(tenantId)) or tenantId
@@ -12953,213 +13011,91 @@ async def session_brief(
         if now:
             reference_now = datetime.fromisoformat(now.replace("Z", "+00:00"))
 
-        episodes = await graphiti_client.get_recent_episode_summaries(
-            tenant_id=tenantId,
+        recent_rows = await _load_recent_session_summaries_from_classifications(
             user_id=userId,
-            limit=10
+            limit=10,
         )
-
-        # No transcript fallback; narrative summary must come from Graphiti
-
+        last_interaction = None
         time_gap_description = None
-        if episodes:
-            last_time = episodes[0].get("reference_time")
-            if isinstance(last_time, str):
-                try:
-                    last_time = datetime.fromisoformat(last_time.replace("Z", "+00:00"))
-                except Exception:
-                    last_time = None
-            if last_time:
-                delta = reference_now - last_time
+        if recent_rows:
+            last_interaction = recent_rows[0].get("created_at") or recent_rows[0].get("session_date")
+            parsed_last = _parse_optional_dt(last_interaction)
+            if isinstance(parsed_last, datetime):
+                ref = reference_now
+                if ref.tzinfo is None and parsed_last.tzinfo is not None:
+                    ref = ref.replace(tzinfo=dt_timezone.utc)
+                if parsed_last.tzinfo is None and ref.tzinfo is not None:
+                    parsed_last = parsed_last.replace(tzinfo=dt_timezone.utc)
+                delta = ref - parsed_last
                 hours = int(delta.total_seconds() // 3600)
                 minutes = int((delta.total_seconds() % 3600) // 60)
-                if hours > 0:
-                    time_gap_description = f"{hours} hours since last spoke"
-                else:
-                    time_gap_description = f"{minutes} minutes since last spoke"
+                time_gap_description = f"{hours} hours since last spoke" if hours > 0 else f"{minutes} minutes since last spoke"
 
-        from graphiti_core.search.search_filters import SearchFilters, DateFilter, ComparisonOperator
-        current_filter = SearchFilters(
-            valid_at=[[DateFilter(date=reference_now, comparison_operator=ComparisonOperator.less_than_equal)]],
-            invalid_at=[[DateFilter(date=None, comparison_operator=ComparisonOperator.is_null)]]
-        )
-
-        # GRAPHITI_REPLACED: search_nodes (unresolved tension/loop retrieval for session brief)
-        # TEMPORARY_DEGRADED_REPLACEMENT: session-brief loops/tensions are derived continuity projections.
-        tensions = await _pg_search_nodes(
-            tenant_id=tenantId,
-            user_id=userId,
-            query="current problems tasks unresolved blockers open loops",
-            limit=10,
-            reference_time=reference_now,
-            search_filter=current_filter
-        )
-        active_loops = []
-        for t in tensions:
-            attrs = t.get("attributes") if isinstance(t, dict) else None
-            t_type = (t.get("type") or "").lower() if isinstance(t, dict) else ""
-            is_tension = t_type == "tension"
-            if isinstance(attrs, dict) and ("description" in attrs or "status" in attrs):
-                is_tension = True
-            if not is_tension:
-                continue
-            status = None
-            description = None
-            if isinstance(attrs, dict):
-                status = attrs.get("status")
-                description = attrs.get("description")
-            if status and isinstance(status, str) and status.lower() != "unresolved":
-                continue
-            active_loops.append({
-                "description": _normalize_text(description or t.get("summary")),
-                "status": status or "unresolved"
-            })
-
-        # GRAPHITI_REPLACED: search_nodes (key entities retrieval for session brief)
-        # TEMPORARY_DEGRADED_REPLACEMENT: key entities here are continuity hints, not canonical facts.
-        key_entities = await _pg_search_nodes(
-            tenant_id=tenantId,
-            user_id=userId,
-            query="named people places projects tools organizations priorities",
-            limit=6,
-            reference_time=reference_now,
-            search_filter=current_filter
-        )
-        # GRAPHITI_REPLACED: search_nodes (commitment candidates retrieval for session brief)
-        # TEMPORARY_DEGRADED_REPLACEMENT: commitment candidates are inferred from continuity nodes.
-        commitment_entities = await _pg_search_nodes(
-            tenant_id=tenantId,
-            user_id=userId,
-            query="commitment schedule deadline todo follow up plan",
-            limit=6,
-            reference_time=reference_now,
-            search_filter=current_filter
-        )
-        # GRAPHITI_REPLACED: search_nodes (current focus retrieval for session brief)
-        # TEMPORARY_DEGRADED_REPLACEMENT: current focus extraction uses derived continuity nodes.
-        focus_nodes = await _pg_search_nodes(
-            tenant_id=tenantId,
-            user_id=userId,
-            query="current focus priority focused on right now today i need",
-            limit=3,
-            reference_time=reference_now,
-            search_filter=current_filter
-        )
-
-        facts_from_episodes = []
-        for ep in episodes[:4]:
-            for claim in _split_claims(ep.get("summary")):
-                if _allow_claim(claim) and not _is_explicit_user_state_claim(claim):
-                    facts_from_episodes.append(claim)
-
-        facts_from_entities = []
-        for entity in key_entities:
-            summary = _normalize_text(entity.get("summary"))
-            entity_type = (entity.get("type") or "").lower()
-            if not summary:
-                continue
-            if entity_type in {"mentalstate"}:
-                continue
-            if _allow_claim(summary) and not _is_explicit_user_state_claim(summary):
-                facts_from_entities.append(summary)
-
-        facts = _select_facts(facts_from_episodes + facts_from_entities, limit=4)
-        open_loop_descriptions = _dedupe_keep_order(
+        handover = await _build_handover_packet(userId)
+        living = handover.get("living_context") or {}
+        facts = _select_facts(
             [
-                l.get("description")
-                for l in active_loops
-                if l.get("description")
-                and _allow_claim(l.get("description"))
-                and not _is_explicit_user_state_claim(l.get("description"))
+                *(row.get("summary_facts") or row.get("summary_text") for row in recent_rows[:4]),
+                living.get("current_focus"),
+                living.get("primary_tension"),
             ],
-            limit=3
+            limit=4,
         )
-        commitment_candidates = [
-            _normalize_text(e.get("summary"))
-            for e in commitment_entities
-            if _normalize_text(e.get("summary"))
-        ] + facts_from_episodes
-        commitments = _extract_commitments(commitment_candidates, limit=3)
-
-        user_stated_state = None
-        for ep in episodes[:4]:
-            state = _extract_explicit_user_state(ep.get("summary"))
-            if state:
-                user_stated_state = state
-                break
-
+        open_loop_descriptions = _dedupe_keep_order(
+            [t.get("title") for t in (handover.get("open_threads") or []) if t.get("title")],
+            limit=3,
+        )
+        commitments = _dedupe_keep_order(
+            [t.get("title") for t in (handover.get("open_threads") or []) if _normalize_text(t.get("category")) in {"commitment", "deadline", "upcoming_event", "anniversary"}],
+            limit=3,
+        )
+        current_focus = _normalize_text(living.get("current_focus")) or None
         time_of_day_label = _time_of_day_label(reference_now)
-        energy_hint = _extract_energy_hint_from_texts([ep.get("summary") for ep in episodes[:4]])
-        last_interaction = episodes[0].get("reference_time") if episodes else None
         latest_session_id = await _get_latest_session_id(tenantId, userId)
-
         context_anchors: Dict[str, Any] = {
             "timeOfDayLabel": time_of_day_label,
             "timeGapDescription": time_gap_description,
             "sessionId": latest_session_id,
-            "lastInteraction": last_interaction
+            "lastInteraction": last_interaction.isoformat() if isinstance(last_interaction, datetime) else _normalize_text(last_interaction),
+            "source": "derived_postgres",
         }
-        current_focus = _select_current_focus(focus_nodes or [], now=reference_now)
-
         brief_context = _build_structured_sheet(
             facts=facts,
             open_loops=open_loop_descriptions,
             commitments=commitments,
             anchors=context_anchors,
-            user_stated_state=user_stated_state,
+            user_stated_state=None,
             current_focus=current_focus,
-            max_chars=720
+            max_chars=720,
         )
-
-        fact_keys = {f.lower() for f in facts}
-        narrative_candidates: List[str] = []
-        for ep in episodes[:6]:
-            narrative_candidates.extend(_split_claims(ep.get("summary")))
-
-        narrative_lines = _dedupe_keep_order(
-            [
-                _shorten_line(line, 180)
-                for line in narrative_candidates
-                if _allow_claim(line) and _allow_fact_text(line) and not _is_explicit_user_state_claim(line)
-            ],
-            limit=5
-        )
-        narrative_lines = [line for line in narrative_lines if line.lower() not in fact_keys][:3]
-        if not narrative_lines and episodes:
-            # Fallback: keep a single narrative anchor without duplicating a fact line verbatim.
-            for claim in _split_claims(episodes[0].get("summary")):
-                if not _allow_claim(claim) or _is_explicit_user_state_claim(claim):
-                    continue
-                if not _allow_fact_text(claim):
-                    continue
-                candidate = claim if claim.lower() not in fact_keys else f"Previously: {claim}"
-                if _allow_claim(candidate) and _allow_fact_text(candidate):
-                    narrative_lines = [_shorten_line(candidate, 180)]
-                    break
-
-        narrative_summary = [{"summary": line, "reference_time": last_interaction} for line in narrative_lines]
-
-        current_vibe: Dict[str, Any] = {
-            "timeOfDayLabel": time_of_day_label
-        }
-        if energy_hint:
-            current_vibe["energyHint"] = energy_hint
-
+        narrative_summary = [
+            {
+                "summary": _shorten_line(row.get("summary_facts") or row.get("summary_text"), 180),
+                "reference_time": row.get("created_at"),
+            }
+            for row in recent_rows[:3]
+            if _normalize_text(row.get("summary_facts") or row.get("summary_text"))
+        ]
+        active_loops = [
+            {"description": item, "status": "unresolved"}
+            for item in open_loop_descriptions
+        ]
+        current_vibe: Dict[str, Any] = {"timeOfDayLabel": time_of_day_label, "source": "derived_postgres"}
         return SessionBriefResponse(
             timeGapDescription=time_gap_description,
             timeOfDayLabel=time_of_day_label,
-            energyHint=energy_hint,
+            energyHint=None,
             facts=facts,
             openLoops=open_loop_descriptions,
             commitments=commitments,
             contextAnchors=context_anchors,
-            userStatedState=user_stated_state,
+            userStatedState=None,
             currentFocus=current_focus,
             temporalVibe=time_of_day_label,
             briefContext=brief_context,
             narrativeSummary=narrative_summary,
             activeLoops=active_loops,
-            currentVibe=current_vibe
+            currentVibe=current_vibe,
         )
     except Exception as e:
         logger.error(f"Session brief failed: {e}")
@@ -13389,6 +13325,60 @@ async def session_startbrief(
             "steering_note": None,
             "daily_analysis": {"date": None, "confidence": None, "updated_at": None},
         }
+        try:
+            low_confidence_rows = await db.fetch(
+                """
+                SELECT question_text, statement_text, confidence
+                FROM low_confidence_items
+                WHERE user_id=$1 AND status='open'
+                ORDER BY confidence ASC NULLS FIRST, last_seen_at DESC
+                LIMIT 5
+                """,
+                userId,
+            )
+            silence_rows = await db.fetch(
+                """
+                SELECT target_name, silence_days
+                FROM memory_silence_flags
+                WHERE user_id=$1 AND status='active'
+                ORDER BY silence_days DESC, updated_at DESC
+                LIMIT 1
+                """,
+                userId,
+            )
+            event_rows = await db.fetch(
+                """
+                SELECT title, event_type, event_time
+                FROM memory_events
+                WHERE user_id=$1
+                  AND lifecycle_state='active'
+                  AND event_type IN ('upcoming_event','commitment','anniversary','deadline')
+                ORDER BY event_time ASC NULLS LAST, updated_at DESC
+                LIMIT 1
+                """,
+                userId,
+            )
+            guidance = ops_context.setdefault("assistant_guidance", [])
+            material_low_confidence_rows = [
+                row
+                for row in low_confidence_rows
+                if _is_material_low_confidence(_normalize_text(row.get("question_text")) or _normalize_text(row.get("statement_text")))
+            ]
+            for row in material_low_confidence_rows[:1]:
+                text = _normalize_text(row.get("question_text")) or _normalize_text(row.get("statement_text"))
+                if text:
+                    guidance.append({"type": "low_confidence", "text": _shorten_line(text, 180)})
+            for row in silence_rows[:1]:
+                guidance.append(
+                    {
+                        "type": "silence_flag",
+                        "text": f"{row.get('target_name')} has gone quiet for {int(row.get('silence_days') or 0)} days; do not force it.",
+                    }
+                )
+            for row in event_rows[:1]:
+                guidance.append({"type": _normalize_text(row.get("event_type")), "text": _shorten_line(row.get("title"), 180)})
+        except Exception as e:
+            logger.warning("startbrief primitive guidance lookup failed: %s", e)
         used_summary_ids = [
             _normalize_text(s.get("session_id"))
             for s in recent_session_summaries[:2]

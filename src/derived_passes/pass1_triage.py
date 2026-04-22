@@ -31,7 +31,7 @@ Return JSON only in this exact shape:
   "identity_relevant": true,
   "emotional_weight": "none|low|medium|high",
   "emotional_note": "one short sentence if medium or high, otherwise null",
-  "tension_signal": "one sentence or null. If this session contains a hint of something unspoken, avoided, or underneath the surface, name it briefly. Examples: 'User deflected from Ashley topic back to work' | 'User expressed doubt then immediately pivoted to optimism' | 'User mentioned Jasmine briefly then moved on quickly'. Only populate if clearly present in USER turns. Null if nothing notable.",
+  "tension_signal": "one sentence or null. If this session contains a hint of something unspoken, avoided, or underneath the surface, name it briefly. Examples: 'User deflected from Riley topic back to work' | 'User expressed doubt then immediately pivoted to optimism' | 'User mentioned Jordan briefly then moved on quickly'. Only populate if clearly present in USER turns. Null if nothing notable.",
   "ignore_reasons": [
     "optional short reason for what should be ignored"
   ]
@@ -56,9 +56,9 @@ Definitions:
   These should be concrete and worth storing.
   Do NOT write generic summaries like "user discussed relationship updates."
   Prefer specific deltas like:
-  - "Ashley and the user are back together."
-  - "Ashley visited England and spent two weeks with the user."
-  - "User sent Jasmine an Easter message without expecting a reply."
+  - "Riley and the user are back together."
+  - "Riley visited England and spent two weeks with the user."
+  - "User sent Jordan an holiday message without expecting a reply."
 
 - entity_mentions:
   only include people, projects, places, or named things that matter to durable memory.

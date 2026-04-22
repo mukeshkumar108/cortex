@@ -3,13 +3,19 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from .common import as_list, call_json_llm, clean_text, format_user_turns, safe_json, text_list
+from .synthesis_quality import (
+    conservative_rewrite_text,
+    directive_is_explicit,
+    sanitize_list_of_dicts,
+)
 
 LIVING_CONTEXT_PROMPT = """You are synthesizing the current living context for
 the user of a personal AI assistant named Sophie.
 
-This is NOT a status report.
-This is a tension map — what's happening on the surface
-AND what's underneath it.
+This is NOT a status report and NOT a therapy note.
+This is a compact operating context: what matters now,
+what changed, what is uncertain, and what Sophie should
+hold without over-interpreting.
 
 ═══════════════════════════════════════════
 OBSERVER EFFECT WARNING — READ THIS FIRST
@@ -49,15 +55,16 @@ SURFACE LAYER — what's actually happening:
 - What is this person focused on right now?
 - What has happened in the last 2 weeks that matters?
 - How are their key relationships feeling right now?
-- What is the general emotional texture — the vibe?
+- What is the minimal evidence-bound emotional texture?
+  Do not use "vibe" language.
 
-TENSION MAP — what's underneath:
+TENSION MAP — unresolved current friction:
 - What is the main unresolved friction right now?
-  The thing that hasn't been named directly.
-- What are they avoiding or circling around?
-- What is this period really about beneath the surface?
-  (not just tasks, but why)
-- What are the deeper stakes of what's happening now?
+- What active thread, relationship state, project, health
+  issue, or repeated concern is shaping the current moment?
+- What uncertainty should Sophie hold lightly?
+- Do not invent hidden motives or "deeper stakes" unless
+  the evidence explicitly supports them.
 
 CONTRADICTIONS — where things have shifted:
 - Has something changed from the previous context?
@@ -70,6 +77,7 @@ SOPHIE DIRECTIVES — behavioral instructions:
 - Based on this context, what should Sophie specifically
   do or avoid?
 - These come from explicit user statements, not inference.
+- Do not create tone-prescriptive commands from inferred care style.
 
 RULES:
 1. Ground every statement in specific evidence.
@@ -84,6 +92,28 @@ RULES:
    recent. Never just overwrite the earlier one.
 6. Sophie directives must be grounded in explicit
    user statements, not inferred preferences.
+7. Do not write therapeutic, literary, or personality-essay prose.
+   Avoid generic phrases like "deep complexity", "beneath it all",
+   "stabilizing after a storm", "reclaiming agency", "rollercoaster",
+   "trying to prove", "weight of", "driven by", "defined by",
+   "underneath", or "the vibe is".
+8. Do not create causal narrative stitching unless the evidence
+   explicitly connects the facts.
+9. Prefer concrete current context, relationship state, active
+   tensions, and useful uncertainty over abstract interpretation.
+10. Do not frame the user as tragic, heroic, broken, healing,
+    avoidant, or emotionally governed unless this is explicit
+    or repeatedly evidenced.
+11. If an interpretation would not help Sophie respond better
+    in the next conversation, omit it.
+12. Field-specific constraints:
+    - primary_tension must be observable and concrete.
+    - relationship_pulse must describe current relationship state,
+      not a dramatic emotional story.
+    - emotional_texture must be minimal and evidence-bound.
+    - unspoken_goal should be null unless strongly supported across
+      multiple sessions.
+    - active_contradictions require evidence for both views.
 
 Return JSON only — no preamble, no markdown:
 {{
@@ -151,20 +181,25 @@ async def synthesize_living_context(
         open_threads=_json_lines(open_threads),
         active_entities=_json_lines(active_entities),
     )
-    parsed = await call_json_llm(prompt=prompt, model=model, max_tokens=2600, temperature=0.2)
+    parsed = await call_json_llm(prompt=prompt, model=model, max_tokens=2600, temperature=0.1)
     return parsed or None
 
 
 def normalize_living_context_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    directives = [
+        row
+        for row in sanitize_list_of_dicts(parsed.get("sophie_directives"))
+        if isinstance(row, dict) and directive_is_explicit(row)
+    ]
     return {
-        "current_focus": clean_text(parsed.get("current_focus")) or None,
-        "recent_narrative": clean_text(parsed.get("recent_narrative")) or None,
-        "relationship_pulse": clean_text(parsed.get("relationship_pulse")) or None,
-        "emotional_texture": clean_text(parsed.get("emotional_texture")) or None,
-        "primary_tension": clean_text(parsed.get("primary_tension")) or None,
-        "what_theyre_avoiding": clean_text(parsed.get("what_theyre_avoiding")) or None,
-        "unspoken_goal": clean_text(parsed.get("unspoken_goal")) or None,
-        "why_it_matters": clean_text(parsed.get("why_it_matters")) or None,
-        "active_contradictions": as_list(parsed.get("active_contradictions")),
-        "sophie_directives": as_list(parsed.get("sophie_directives")),
+        "current_focus": conservative_rewrite_text(parsed.get("current_focus")) or None,
+        "recent_narrative": conservative_rewrite_text(parsed.get("recent_narrative")) or None,
+        "relationship_pulse": conservative_rewrite_text(parsed.get("relationship_pulse")) or None,
+        "emotional_texture": conservative_rewrite_text(parsed.get("emotional_texture")) or None,
+        "primary_tension": conservative_rewrite_text(parsed.get("primary_tension")) or None,
+        "what_theyre_avoiding": conservative_rewrite_text(parsed.get("what_theyre_avoiding")) or None,
+        "unspoken_goal": conservative_rewrite_text(parsed.get("unspoken_goal"), fallback=None) or None,
+        "why_it_matters": conservative_rewrite_text(parsed.get("why_it_matters")) or None,
+        "active_contradictions": sanitize_list_of_dicts(parsed.get("active_contradictions")),
+        "sophie_directives": directives,
     }

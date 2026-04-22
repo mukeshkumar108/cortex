@@ -32,8 +32,11 @@ Classify type as one of:
   place = location user lives in or frequently mentions
   other = anything else worth tracking
 
+TENTATIVE — this may matter later, but current evidence is too weak
+to create a confident profile or surface as a real relationship yet.
+
 Decide status:
-  tentative = low signal, not enough to profile yet
+  tentative = low signal, not enough to profile or surface yet
   active = enough signal to build a full profile now
 
 Mark as ACTIVE if ANY of these are true:
@@ -53,25 +56,36 @@ SKIP — not worth tracking
   - Vague references: "someone", "a friend", "they"
   - One-off low-significance mentions
 
+For every MATCH, NEW, or TENTATIVE decision include:
+  evidence_strength: weak / medium / strong
+  memory_relevance: low / medium / high
+  relationship_confidence: 0.0-1.0
+  why_this_matters: one concrete sentence grounded in USER text
+
 RULES:
-1. Make your best guess. More evidence will arrive
-   later and the system will refine over time.
-2. Prefer MATCH over NEW when in doubt.
+1. Do not invent relationship meaning. If evidence is weak, use TENTATIVE or SKIP.
+2. Prefer MATCH over NEW when context supports it.
 3. Prefer SKIP over NEW for anything technical or media.
-4. Keep relationship_to_user coarse:
+4. A NEW active entity requires medium/strong evidence and clear memory relevance.
+5. Keep relationship_to_user coarse:
    girlfriend / daughter / son / friend / colleague /
    active_project / mother / father / other
    NOT long prose descriptions.
-5. Only extract facts from USER turns. Ignore assistant.
+6. Only extract facts from USER turns. Ignore assistant.
+7. Do not connect facts across entities. Each entity decision must stand on its own evidence.
 
 Return JSON only — no preamble, no markdown fences:
 {{
   "resolutions": [
     {{
-      "mention": "Ashley",
+      "mention": "Riley",
       "decision": "MATCH",
       "matched_entity_id": "existing-uuid",
       "confidence": 0.95,
+      "evidence_strength": "strong",
+      "memory_relevance": "high",
+      "relationship_confidence": 0.95,
+      "why_this_matters": "The user is discussing Riley as a romantic partner.",
       "reason": "same romantic partner context"
     }},
     {{
@@ -84,7 +98,27 @@ Return JSON only — no preamble, no markdown fences:
       "relationship_to_user": "active_project",
       "aliases": ["Bloom"],
       "confidence": 0.9,
+      "evidence_strength": "strong",
+      "memory_relevance": "high",
+      "relationship_confidence": 0.0,
+      "why_this_matters": "The user is actively building this product.",
       "reason": "user's product, multiple mentions"
+    }},
+    {{
+      "mention": "Jordan",
+      "decision": "TENTATIVE",
+      "canonical_name": "Jordan",
+      "canonical_name_normalized": "jordan",
+      "type": "person",
+      "status": "tentative",
+      "relationship_to_user": "other",
+      "aliases": ["Jordan"],
+      "confidence": 0.45,
+      "evidence_strength": "weak",
+      "memory_relevance": "medium",
+      "relationship_confidence": 0.2,
+      "why_this_matters": "The user mentioned Jordan, but the relationship is not clear in this session.",
+      "reason": "potentially meaningful person, insufficient relationship evidence"
     }},
     {{
       "mention": "cell SDK",
@@ -114,12 +148,17 @@ RULES:
    If any assistant text appears, ignore it completely.
 2. Be specific and grounded. No invented facts.
 3. Note uncertainty rather than guessing.
-4. Write profile_text as Sophie's internal knowledge —
+4. Do not stitch facts into a causal story unless the user explicitly said the connection
+   or the same connection is repeated in the provided evidence.
+5. Do not import facts from another entity or relationship.
+6. If the evidence is too thin for a useful profile, return profile_text as null
+   and put the uncertainty in open_questions.
+7. Write profile_text as Sophie's internal knowledge —
    warm and natural, as if a close friend is describing
    this person. Not clinical. Not a report.
-5. Keep key_facts discrete and specific — one fact
+8. Keep key_facts discrete and specific — one fact
    per entry, not compound sentences.
-6. relationship_to_user should stay coarse:
+9. relationship_to_user should stay coarse:
    girlfriend / daughter / active_project / friend etc.
 
 Return JSON only — no preamble, no markdown fences:
@@ -127,14 +166,14 @@ Return JSON only — no preamble, no markdown fences:
   "profile_text": "natural prose paragraph describing who this person/entity is, their relationship to the user, key facts, current status, recent developments",
   "key_facts": [
     {{
-      "fact": "Ashley is the user's long-term long-distance girlfriend",
+      "fact": "Riley is the user's long-term long-distance girlfriend",
       "confidence": 0.98,
       "first_mentioned": "2026-02-09",
       "last_confirmed": "2026-04-09"
     }}
   ],
   "open_questions": [
-    "Where exactly does Ashley live?"
+    "Where exactly does Riley live?"
   ],
   "last_known_status": "Back together as of April 2026 after brief breakup"
 }}

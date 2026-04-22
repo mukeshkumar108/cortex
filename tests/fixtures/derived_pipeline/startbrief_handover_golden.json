@@ -1,7 +1,7 @@
 {
   "startbrief": {
     "handover_depth": "continuation",
-    "entity_hints": ["Ashley"],
+    "entity_hints": ["Riley"],
     "recent_change_contains": "User is trying to become more consistent.",
     "canonical_claims_considered": 0
   },
@@ -14,7 +14,7 @@
       "current_chapter": "A period of reconstruction."
     },
     "open_threads": ["Walking goal"],
-    "people": ["Ashley"],
+    "people": ["Riley"],
     "canonical_claims_considered": 0
   }
 }

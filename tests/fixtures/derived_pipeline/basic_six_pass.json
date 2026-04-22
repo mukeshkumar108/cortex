@@ -6,20 +6,26 @@
   "messages": [
     {
       "role": "user",
-      "text": "Remember that Ashley is my partner. I need to follow up on our walking goal, and I want to become more consistent.",
+      "text": "Remember that Riley is my partner. I need to follow up on our walking goal, and I want to become more consistent.",
       "timestamp": "2026-04-21T10:00:00+00:00"
     }
   ],
   "expected": {
     "pass1": {
-      "output_hash": "bce49401858515d500533f7a",
-      "surfaces": ["memory_delta", "identity_signal", "thread_signal"],
+      "output_hash": "f15ac961b393949015a9b1e3",
+      "surfaces": [
+        "memory_delta",
+        "identity_signal",
+        "thread_signal"
+      ],
       "context_relevant": true,
       "run_entity_pass": true,
       "run_threads_pass": true
     },
     "pass1_5_entities": {
-      "entities": ["Ashley"]
+      "entities": [
+        "Riley"
+      ]
     },
     "pass3_threads": {
       "lifecycle_state": "active",

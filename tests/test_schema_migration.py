@@ -80,6 +80,18 @@ async def test_schema_migration():
             """
         )
         assert dedupe_constraint == "graphiti_outbox_dedupe_key_unique"
+
+        for table in ["entity_profiles", "open_threads", "derived_assertions"]:
+            cols = await conn.fetch(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name=$1
+                """,
+                table,
+            )
+            names = {row["column_name"] for row in cols}
+            assert "distinct_session_count" in names
     finally:
         await conn.close()
 

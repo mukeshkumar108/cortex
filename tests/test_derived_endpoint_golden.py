@@ -5,7 +5,7 @@ import uuid
 
 import pytest
 
-from src.main import app, db, _build_handover_packet, session_startbrief
+from src.main import app, db, _build_handover_packet, session_brief, session_startbrief
 
 FIXTURE = Path(__file__).parent / "fixtures" / "derived_pipeline" / "startbrief_handover_golden.json"
 
@@ -24,7 +24,7 @@ async def _seed_derived_user(user_id: str, session_id: str) -> None:
         """,
         session_id,
         user_id,
-        [{"role": "user", "text": "Remember Ashley and the walking goal.", "timestamp": now.isoformat()}],
+        [{"role": "user", "text": "Remember Riley and the walking goal.", "timestamp": now.isoformat()}],
     )
     await db.execute(
         """
@@ -42,7 +42,7 @@ async def _seed_derived_user(user_id: str, session_id: str) -> None:
         user_id,
         now - timedelta(hours=2),
         "User is trying to become more consistent.",
-        ["Ashley"],
+        ["Riley"],
         "Determined but strained.",
         "Wanting change while avoiding the deeper stakes.",
         {
@@ -59,14 +59,14 @@ async def _seed_derived_user(user_id: str, session_id: str) -> None:
             confidence, mention_count, first_seen_at, last_seen_at,
             source_session_ids, importance_score, salience_score
         ) VALUES (
-            $1,'Ashley','ashley','person',$2::text[],'active','partner',
-            'Ashley is relationally important.', 'present in current context',
+            $1,'Riley','riley','person',$2::text[],'active','partner',
+            'Riley is relationally important.', 'present in current context',
             0.9,3,NOW(),NOW(),$3::text[],0.9,0.9
         )
         ON CONFLICT (user_id, canonical_name_normalized) DO UPDATE SET last_seen_at=NOW()
         """,
         user_id,
-        ["Ashley"],
+        ["Riley"],
         [session_id],
     )
     await db.execute(
@@ -154,3 +154,35 @@ async def test_startbrief_and_handover_golden_derived_only():
         assert expected["handover"]["open_threads"][0] in [t["title"] for t in handover["open_threads"]]
         assert expected["handover"]["people"][0] in [p["name"] for p in handover["people"]]
         assert handover["provenance"]["canonical_claims_considered"] == 0
+
+
+@pytest.mark.asyncio
+async def test_session_brief_uses_derived_tables_only_and_preserves_shape():
+    async with app.router.lifespan_context(app):
+        user_id = _unique("brief-user")
+        session_id = _unique("brief-session")
+        await _seed_derived_user(user_id, session_id)
+
+        brief = await session_brief(
+            tenantId="default",
+            userId=user_id,
+            now=datetime.now(timezone.utc).isoformat(),
+        )
+        payload = brief.model_dump()
+        assert set(payload) >= {
+            "timeGapDescription",
+            "timeOfDayLabel",
+            "facts",
+            "openLoops",
+            "commitments",
+            "contextAnchors",
+            "currentFocus",
+            "briefContext",
+            "narrativeSummary",
+            "activeLoops",
+            "currentVibe",
+        }
+        assert payload["contextAnchors"]["source"] == "derived_postgres"
+        assert "Becoming consistent" in payload["currentFocus"]
+        assert "Walking goal" in payload["openLoops"]
+        assert payload["narrativeSummary"]

@@ -3,11 +3,11 @@
 Date audited: 2026-04-21
 Audit basis: current repository code (`src/`), migrations/schema (`migrations/`, `schema.sql`), and runtime endpoints (`src/main.py`)
 
-Update: Phase 1 live 6-pass hardening has been implemented additively. The derived synthesis pipeline now has an ingest-triggered async DAG, evidence traces, pipeline run state, Stage A quarantine, lifecycle fields, and Phase 2 memory-intelligence columns/jobs. Runtime `startbrief` and `handover` remain sourced from derived Postgres tables.
+Update: Phase 0 through Phase 2 memory-first implementation is active. The derived synthesis pipeline has an ingest-triggered async DAG, evidence traces, pipeline run state, Stage A quarantine, lifecycle fields, and meaning-memory primitive tables for low-confidence items, contradictions, events, silence flags, and relationship links. Runtime `startbrief`, `handover`, and compatibility `session/brief` remain sourced from derived Postgres tables.
 
 Governing philosophy: [SOPHIE_MEMORY_PHILOSOPHY.md](/opt/synapse/docs/SOPHIE_MEMORY_PHILOSOPHY.md). Synapse is meaning-first: the 6-pass Gemma/Postgres synthesis pipeline is the understanding and serving layer; canonical v2 is governance/audit/anchor-fact infrastructure.
 
-Important proof status: live orchestration and traceability are implemented, but faithful reproduction of the original rich 6-pass Gemma behavior is not fully proven yet. Pass 4 and Pass 5 currently write evidence-backed assertion scaffolding and metadata, but they do not yet regenerate the full rich identity/living-context prose fields from the original manual pipeline.
+Important proof status: deterministic script/live parity is covered by representative fixtures and endpoint goldens. Live-model quality still requires human review through the inspection/review harness before claiming exhaustive real-world quality.
 
 ## 1. Executive summary
 
@@ -16,7 +16,7 @@ Synapse currently has two distinct memory processes running in parallel:
 1. Gemma/Postgres derived synthesis pipeline (the 6-pass system):
 - Main tables: `session_classifications`, `entity_profiles`, `open_threads`, `identity_profile`, `living_context`
 - Primary role: high-quality continuity/synthesis context for runtime surfaces
-- Current production writes: integrated into live ingest hooks for Pass 1 / Pass 1.5 / Pass 3, with signal/time-ceiling triggers for Pass 4 / Pass 5. Historical scripts in `scripts/` remain useful for batch/backfill/operator runs.
+- Current production writes: integrated into live ingest hooks for Pass 1 / Pass 1.5 / Pass 3, with signal/time-ceiling triggers for Pass 4 / Pass 5. Historical scripts in `scripts/` call the same shared pass modules for batch/backfill/operator runs.
 
 2. Canonical v2 truth pipeline:
 - Main tables: `sessions_v2`, `turns_v2`, `extract_results`, `claims_quarantine`, `entities`, `entity_aliases`, `claims`, `claim_evidence`, `canonical_mutations`, `canonical_tenant_watermarks`
@@ -54,32 +54,42 @@ Pass 1 triage:
 - Writes: `session_classifications`
 - Typical fields: memory-worthiness, session kind, memory deltas, entity mentions, thread/identity signals, emotional/tension fields, `context_relevant`
 - Also writes atomic `derived_assertions(surface='memory_delta'|'identity_signal'|'thread_signal'|'living_context_statement')` with `source_session_ids` and `source_turn_refs`
+- Also writes selected meaning-memory primitives when present: `memory_events` for explicit events/commitments and `low_confidence_items` for uncertain statements
 
 Pass 1.5 entity pipeline:
 - Script: `scripts/run_entity_pipeline.py`
 - Live hook: `pass1_5_entities` after successful Pass 1 when entity mentions exist
 - Writes: `entity_profiles`
 - Also writes atomic `derived_assertions(surface='entity_mention')`
+- Also writes `memory_relationship_links` connecting entity mentions to source sessions
 
 Pass 3 threads pipeline:
 - Script: `scripts/run_threads_pipeline.py`
 - Live hook: `pass3_threads` after successful Pass 1 when thread signals exist
 - Writes: `open_threads`
 - Now includes `lifecycle_state`, `evidence_turn_refs`, extraction/validity confidence, memory layer, semantic category, retention floor, and access counters
+- Supports evidence-backed create/update/resolve/snooze transitions and reactivation of previously snoozed threads
 
 Pass 4 identity synthesis:
 - Script: `scripts/run_identity_synthesis.py`
 - Live hook: `pass4_identity`
 - Trigger: 3 identity-signal sessions since last successful Pass 4, or 14 days since last successful Pass 4, whichever comes first
 - Writes: `identity_profile`
-- Live hardening writes atomic assertion refs into `identity_profile.assertions` without replacing rich prose fields
+- Writes rich identity fields and atomic assertion refs into `identity_profile.assertions`
 
 Pass 5 living context synthesis:
 - Script: `scripts/run_living_context.py`
 - Live hook: `pass5_living_context`
 - Trigger: 2 context-delta sessions since last successful Pass 5, or 10 days since last successful Pass 5, whichever comes first
 - Writes: `living_context`
-- Live hardening writes atomic assertion refs into `living_context.assertions` without replacing rich prose fields
+- Writes rich living-context fields, atomic assertion refs into `living_context.assertions`, and selected contradiction/low-confidence primitives
+
+Daily silence detection:
+- Live loop: `derived_silence_detection_loop`
+- Cadence: every 86,400 seconds
+- Writes: `memory_silence_flags`
+- Scope: high-salience entities/threads quiet for 30+ days
+- Does not mutate source memory state and does not notify users directly
 
 Scoring refresh helpers:
 - Script: `scripts/run_scoring_update.py`
@@ -94,6 +104,12 @@ Scoring refresh helpers:
 `GET /session/handover`:
 - Reads from `living_context`, `open_threads`, `entity_profiles`, `identity_profile`
 - Uses `_episodic_search` backed by `session_classifications` embeddings for episodic recall
+- Selectively surfaces low-confidence, contradiction, silence, and event primitives through existing packet fields only
+
+`GET /session/brief`:
+- Compatibility response shape preserved
+- Reads derived classifications/handover state only
+- Does not read Graphiti or canonical claims as serving authority
 
 Derived continuity retrieval helpers:
 - `_pg_search_nodes`, `_pg_search_continuity_facts`, `_pg_get_entity_role_hint`, `_pg_get_entity_continuity_facts`
@@ -101,9 +117,9 @@ Derived continuity retrieval helpers:
 
 ### 2.5 Operational reality
 
-This process is quality-proven in prior testing and now has a live ingest-triggered async DAG using the existing durable outbox. The full rich LLM scripts remain available for batch/backfill; live hardening is additive and preserves endpoint output shape.
+This process is quality-proven in prior testing and now has a live ingest-triggered async DAG using the existing durable outbox. The scripts and live hooks use shared pass modules; parity tests compare both paths against the same fixtures. Live hardening is additive and preserves endpoint output shape.
 
-Current limitation: the live DAG does not yet fully prove parity with the original rich script behavior. The next validation step is a pass-level parity harness that compares live hook outputs against the proven manual Gemma pipeline outputs for the same transcript/window.
+Current limitation: deterministic fixture parity is proven, but live model outputs still require human review for specificity, warmth, and non-generic synthesis quality.
 
 ## 3. Process B: Canonical v2 truth pipeline
 
@@ -173,6 +189,7 @@ Current concrete join points:
 - `POST /v2/memory/query` hybrid lane can return canonical factual + episodic + derived continuity together (lane-labeled)
 - Some continuity helper functions include canonical-signal supplementation for specific lookups
 - Both processes now have explicit run/audit state: canonical uses `canonical_mutations`; derived synthesis uses `pipeline_runs`, `pipeline_checkpoints`, `derived_assertions`, and `derived_quarantine`
+- Derived synthesis now has meaning-memory primitive support: `low_confidence_items`, `memory_contradictions`, `memory_events`, `memory_silence_flags`, and `memory_relationship_links`
 
 Current non-join (important):
 - The Gemma 6-pass derived table writers (scripts) do not run as a first-class integrated stage inside the canonical post-ingest resolver flow
@@ -188,6 +205,10 @@ Current non-join (important):
 `GET /session/handover`:
 - Serving authority: derived tables (`living_context`, `open_threads`, `entity_profiles`, `identity_profile`) + episodic from `session_classifications`
 - Canonical fallback in packet assembly: removed from active serving path
+
+`GET /session/brief`:
+- Serving authority: derived tables and derived handover packet
+- Compatibility response shape only; not Graphiti/canonical serving authority
 
 `POST /v2/memory/query`:
 - factual: canonical claims + claim_evidence (hard evidence requirement)
@@ -231,6 +252,7 @@ Meaning-first policy:
 
 Integrated/live:
 - ingest -> derived Pass 1 triage -> async Pass 1.5 entities / Pass 3 threads -> signal/time-ceiling Pass 4 identity and Pass 5 living context
+- daily silence detection -> `memory_silence_flags`
 - ingest -> extract_results -> optional live entity/claim resolution -> canonical mutation logging
 - v2 retrieval + legacy adapter routing
 
@@ -250,25 +272,20 @@ Today’s system is not “one bad pipeline replacing one good pipeline.” It i
 
 running as complementary layers. The derived pipeline serves understanding surfaces; canonical v2 remains governance/audit and factual retrieval safety.
 
-## 10. Remaining proof needed for "faithful 6-pass live parity"
+## 10. Current proof and remaining limits
 
-The following are required before claiming the live pipeline faithfully reproduces the original rich Gemma/Postgres 6-pass system:
+Implemented proof:
 
-- Shared pass implementation:
-  - Refactor the proven scripts into importable pass modules.
-  - Make scripts and live hooks call the same pass functions.
-- Pass-level parity harness:
-  - Compare live Pass 1 output against original Pass 1 output.
-  - Compare live Pass 1.5 entity/profile decisions against original entity pipeline output.
-  - Compare live Pass 3 thread actions against original thread pipeline output.
-  - Compare live Pass 4 identity synthesis against original identity output.
-  - Compare live Pass 5 living context/tension-map synthesis against original living-context output.
-- Endpoint golden fixtures:
-  - Verify representative `startbrief` and `handover` outputs do not regress against proven-good examples.
-- Atomic evidence traces:
-  - Attach source evidence to each high-signal derived assertion, thread update, identity trait, and living-context statement.
-- Lifecycle validation:
-  - Enforce valid derived-state transitions.
-  - Quarantine invalid lifecycle transitions under `derived_quarantine.reason_code='invalid_lifecycle_transition'`.
-- Phase 2 safety:
-  - Keep decay, staleness review, and consolidation dormant until rich parity and endpoint golden tests pass.
+- Shared pass modules are used by scripts and live hooks.
+- Script/live parity fixtures cover Pass 1, Pass 1.5, Pass 3, Pass 4, Pass 5, `startbrief`, and `handover`.
+- Endpoint golden fixtures enforce derived-only `startbrief`/`handover` serving policy.
+- Atomic evidence traces exist for high-signal assertions and thread/context/identity writes.
+- Invalid lifecycle transitions are quarantined under `derived_quarantine.reason_code='invalid_lifecycle_transition'`.
+- Access bump is default-off.
+- Decay, staleness review, and consolidation functions remain dormant.
+
+Remaining limits:
+
+- Live-model prose quality is not a deterministic property; it requires review harness runs and human inspection.
+- Evidence is session/turn-level, not perfect character-span-level.
+- Primitive surfacing is intentionally selective and conservative, not exhaustive.

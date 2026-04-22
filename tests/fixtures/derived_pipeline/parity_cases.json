@@ -1,14 +1,14 @@
 [
   {
     "fixture_id": "relationship_contradiction",
-    "description": "Ashley relationship signal includes affection plus unresolved contradiction.",
+    "description": "Riley relationship signal includes affection plus unresolved contradiction.",
     "sessions": [
       {
         "session_id": "relationship-contradiction-1",
         "messages": [
           {
             "role": "user",
-            "text": "Ashley and I are trying again, but I still feel the old tension. I want Sophie to hold both: hope and caution.",
+            "text": "Riley and I are trying again, but I still feel the old tension. I want Sophie to hold both: hope and caution.",
             "timestamp": "2026-04-01T10:00:00+00:00"
           }
         ]
@@ -18,28 +18,28 @@
         "messages": [
           {
             "role": "user",
-            "text": "I said I was committed to being steady with Ashley, but I also avoided the hard conversation again.",
+            "text": "I said I was committed to being steady with Riley, but I also avoided the hard conversation again.",
             "timestamp": "2026-04-05T10:00:00+00:00"
           }
         ]
       }
     ],
     "expected": {
-      "pass1_summary": "Ashley relationship carries both hope and unresolved tension.",
+      "pass1_summary": "Riley relationship carries both hope and unresolved tension.",
       "entities": [
-        "Ashley"
+        "Riley"
       ],
       "thread_titles": [
-        "Ashley relationship tension"
+        "Riley relationship tension"
       ],
       "identity_who": "Someone trying to repair relationship tension without losing honesty.",
       "identity_current_chapter": "A period of learning steadiness without pretending tension is gone.",
-      "living_current_focus": "Holding hope with Ashley while not flattening the unresolved tension.",
-      "living_primary_tension": "The user wants repair with Ashley but is still avoiding the hard conversation.",
-      "startbrief_signal": "Ashley",
-      "handover_thread": "Ashley relationship tension",
+      "living_current_focus": "Holding hope with Riley while not flattening the unresolved tension.",
+      "living_primary_tension": "The user wants repair with Riley but is still avoiding the hard conversation.",
+      "startbrief_signal": "Riley",
+      "handover_thread": "Riley relationship tension",
       "specific_terms": [
-        "Ashley",
+        "Riley",
         "hope",
         "tension"
       ],
@@ -51,14 +51,14 @@
   },
   {
     "fixture_id": "silence_entity_evolution",
-    "description": "Jasmine remains important through silence and reconnection intent.",
+    "description": "Jordan remains important through silence and reconnection intent.",
     "sessions": [
       {
         "session_id": "silence-entity-1",
         "messages": [
           {
             "role": "user",
-            "text": "I have not mentioned Jasmine for weeks, and that silence bothers me. I still want to reconnect with my daughter.",
+            "text": "I have not mentioned Jordan for weeks, and that silence bothers me. I still want to reconnect with my daughter.",
             "timestamp": "2026-04-07T10:00:00+00:00"
           }
         ]
@@ -68,28 +68,28 @@
         "messages": [
           {
             "role": "user",
-            "text": "Jasmine feels like an unfinished thread. I keep wanting to reach out and then I freeze.",
+            "text": "Jordan feels like an unfinished thread. I keep wanting to reach out and then I freeze.",
             "timestamp": "2026-04-10T10:00:00+00:00"
           }
         ]
       }
     ],
     "expected": {
-      "pass1_summary": "Jasmine remains emotionally present through silence and reconnection intent.",
+      "pass1_summary": "Jordan remains emotionally present through silence and reconnection intent.",
       "entities": [
-        "Jasmine"
+        "Jordan"
       ],
       "thread_titles": [
-        "Reconnecting with Jasmine"
+        "Reconnecting with Jordan"
       ],
       "identity_who": "Someone carrying a quiet but persistent desire to reconnect.",
       "identity_current_chapter": "A period of facing relational repair without forcing it.",
-      "living_current_focus": "Jasmine is present through both mention and silence.",
+      "living_current_focus": "Jordan is present through both mention and silence.",
       "living_primary_tension": "The user wants reconnection but freezes before acting.",
-      "startbrief_signal": "Jasmine",
-      "handover_thread": "Reconnecting with Jasmine",
+      "startbrief_signal": "Jordan",
+      "handover_thread": "Reconnecting with Jordan",
       "specific_terms": [
-        "Jasmine",
+        "Jordan",
         "silence",
         "reconnect"
       ],
@@ -337,7 +337,7 @@
       "thread_titles": [
         "Avoiding the HMRC letter"
       ],
-      "identity_who": "Someone who can turn fear into jokes and administrative displacement.",
+      "identity_who": "Observed pattern: turns fear into jokes and administrative displacement.",
       "identity_current_chapter": "A period where avoidance is clustering around the HMRC letter.",
       "living_current_focus": "The HMRC letter in the drawer is not just admin; it is an active avoidance pattern.",
       "living_primary_tension": "The user knows opening the letter matters but keeps converting fear into deflection.",

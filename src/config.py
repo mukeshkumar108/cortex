@@ -104,8 +104,12 @@ class Settings(BaseSettings):
     derived_pipeline_context_delta_threshold: int = 2
     derived_pipeline_context_ceiling_days: int = 10
     derived_pipeline_access_bump_enabled: bool = False
-    derived_pipeline_reinforcement_decay_enabled: bool = True
-    derived_pipeline_staleness_review_enabled: bool = True
+    derived_pipeline_reinforcement_decay_enabled: bool = False
+    derived_pipeline_staleness_review_enabled: bool = False
+    derived_pipeline_silence_detection_enabled: bool = True
+    derived_pipeline_silence_detection_interval_seconds: int = 86400
+    derived_pipeline_audit_enabled: bool = True
+    derived_pipeline_audit_interval_seconds: int = 86400
     retrieval_shadow_read_enabled: bool = False
     retrieval_shadow_read_sample_rate: float = 0.0
     retrieval_shadow_read_blocking: bool = False

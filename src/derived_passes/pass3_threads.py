@@ -36,18 +36,19 @@ NO_ACTION — thread still open, nothing new to add
 A thread is worth creating if it is:
 - A health issue, symptom, or medical situation
 - A relationship tension or unresolved situation
-- A commitment or intention the user stated
+- A commitment or intention the user stated that has real future follow-up value
 - A worry or fear the user expressed
 - Something in progress with no clear resolution
 - Something a good friend would ask about next time
 
 A thread is NOT worth creating if it is:
 - A passing comment with no ongoing significance
-- A resolved fact (Ashley is back together —
+- A resolved fact (Riley is back together —
   that's a memory_delta not a thread)
 - Technical work on Sophie's codebase
 - Generic emotional states without specific situation
 - Something the user clearly resolved in this same session
+- Casual one-off plans with no follow-up value
 
 CATEGORY options:
 health / relationship / goal / commitment /
@@ -74,13 +75,18 @@ RULES:
    Don't merge unrelated things into one thread.
 4. Don't create threads for things already resolved
    in the same session.
-5. If uncertain whether something is a thread —
-   lean toward creating it. Better to have a low-priority
-   thread than to miss something important.
+5. If uncertain whether something is a thread, use NO_ACTION
+   unless you can explain why it matters later.
 6. Resolution note should be specific:
    "User confirmed kidney stones resolved,
     just needs to drink more water"
    not just "resolved"
+7. For every CREATE/UPDATE/RESOLVE/SNOOZE include:
+   unresolvedness: open / resolved / unclear
+   follow_up_value: low / medium / high
+   evidence_strength: weak / medium / strong
+   why_this_matters_later: one concrete sentence, or empty
+   if the action is RESOLVE and no follow-up is needed
 
 Return JSON only — no preamble, no markdown:
 {{
@@ -91,7 +97,11 @@ Return JSON only — no preamble, no markdown:
       "detail": "User mentioned their leg had been painful.",
       "category": "health",
       "priority": "medium",
-      "related_entities": ["Ashley"],
+      "unresolvedness": "open",
+      "follow_up_value": "medium",
+      "evidence_strength": "medium",
+      "why_this_matters_later": "Pain may still affect the user's plans and is worth checking on.",
+      "related_entities": ["Riley"],
       "follow_up_after": "2026-04-14",
       "source_session_id": "session-id-here"
     }},
@@ -99,25 +109,33 @@ Return JSON only — no preamble, no markdown:
       "action": "UPDATE",
       "thread_id": "existing-thread-uuid",
       "detail": "User confirmed kidney stones resolved but needs hydration.",
+      "unresolvedness": "open",
+      "follow_up_value": "medium",
+      "evidence_strength": "strong",
+      "why_this_matters_later": "Hydration remains an active prevention goal.",
       "last_mentioned_at": "2026-04-09",
       "follow_up_after": "2026-04-16"
     }},
     {{
       "action": "RESOLVE",
       "thread_id": "existing-thread-uuid",
-      "resolution_note": "Ashley visited England, they reconciled."
+      "unresolvedness": "resolved",
+      "follow_up_value": "low",
+      "evidence_strength": "strong",
+      "why_this_matters_later": "",
+      "resolution_note": "Riley visited England, they reconciled."
     }}
   ]
 }}
 """
 
 
-THREAD_AUDIT_PROMPT = """You are auditing an open thread registry.
+THREAD_AUDIT_PROMPT = """You are conservatively auditing an open thread registry.
 
 Current open threads:
 {open_threads}
 
-YOUR PRIMARY JOB IS DEDUPLICATION.
+Your primary job is hygiene, not rewriting meaning.
 
 Read every thread carefully. For each group of threads
 that describe the same underlying situation, merge them
@@ -130,7 +148,8 @@ Two threads are the SAME situation if they describe:
 - The same worry about the same thing
 - The same frustration or recurring pattern
 
-MERGE aggressively. One rich thread beats three thin ones.
+Only propose MERGE when the duplicate is clear.
+Ambiguous actions must be FLAG_REVIEW, not forced.
 
 SPECIAL RULE — assistant_feedback category:
 Any thread about Sophie's failures, errors,
@@ -151,6 +170,9 @@ SNOOZE threads that are stale:
 - Not mentioned in last 30 days
 - No active signal of ongoing relevance
 
+FLAG_REVIEW anything that may be wrong but is not safe
+to mutate automatically.
+
 CRITICAL — do NOT merge:
 - Different health issues even if both are health
 - Different people even if both are relationship
@@ -167,23 +189,33 @@ Return JSON only:
       "merged_title": "clean title for merged thread",
       "merged_detail": "combined detail from all threads",
       "merged_category": "correct category",
-      "reason": "all describe same Sophie trust breakdown"
+      "reason": "all describe same Sophie trust breakdown",
+      "confidence": 0.92
     }},
     {{
       "action": "RESOLVE",
       "thread_id": "uuid",
-      "resolution_note": "specific reason"
+      "resolution_note": "specific reason",
+      "confidence": 0.95
     }},
     {{
       "action": "SNOOZE",
       "thread_id": "uuid",
-      "reason": "stale"
+      "reason": "stale",
+      "confidence": 0.9
     }},
     {{
       "action": "CATEGORY_FIX",
       "thread_id": "uuid",
       "new_category": "assistant_feedback",
-      "reason": "about Sophie behavior not user's life"
+      "reason": "about Sophie behavior not user's life",
+      "confidence": 0.95
+    }},
+    {{
+      "action": "FLAG_REVIEW",
+      "thread_id": "uuid",
+      "reason": "possible duplicate but not safe to merge",
+      "confidence": 0.6
     }}
   ]
 }}
@@ -225,4 +257,20 @@ async def extract_thread_actions(
     if not parsed:
         return None
     actions = parsed.get("actions") if isinstance(parsed.get("actions"), list) else []
+    return [a for a in actions if isinstance(a, dict)]
+
+
+async def audit_thread_registry(
+    *,
+    open_threads: List[Dict[str, Any]],
+    model: str,
+) -> Optional[List[Dict[str, Any]]]:
+    lines = []
+    for thread in open_threads:
+        lines.append(__import__("json").dumps(thread, ensure_ascii=False, default=str))
+    prompt = THREAD_AUDIT_PROMPT.format(open_threads="\n".join(lines) or "(none)")
+    parsed = await call_json_llm(prompt=prompt, model=model, max_tokens=2200, temperature=0.1)
+    if not parsed:
+        return None
+    actions = parsed.get("audit_actions") if isinstance(parsed.get("audit_actions"), list) else []
     return [a for a in actions if isinstance(a, dict)]

@@ -124,29 +124,29 @@ def _payload_for_text(text: str) -> dict:
             "run_threads_pass": True,
             "identity_relevant": True,
         }
-    if "ashley" in lowered:
+    if "riley" in lowered:
         return {
             "is_memory_worthy": True,
             "session_kind": "personal",
-            "memory_deltas": ["Ashley relationship carries both hope and unresolved tension."],
-            "entity_mentions": ["Ashley"],
-            "thread_signals": ["Ashley relationship tension"],
+            "memory_deltas": ["Riley relationship carries both hope and unresolved tension."],
+            "entity_mentions": ["Riley"],
+            "thread_signals": ["Riley relationship tension"],
             "identity_signals": ["User is trying to be steady without pretending tension is gone."],
             "emotional_weight": "medium",
             "emotional_note": "Hopeful but guarded.",
-            "tension_signal": "The user wants repair with Ashley but avoids the hard conversation.",
+            "tension_signal": "The user wants repair with Riley but avoids the hard conversation.",
             "context_relevant": True,
             "run_entity_pass": True,
             "run_threads_pass": True,
             "identity_relevant": True,
         }
-    if "jasmine" in lowered:
+    if "jordan" in lowered:
         return {
             "is_memory_worthy": True,
             "session_kind": "personal",
-            "memory_deltas": ["Jasmine remains emotionally present through silence and reconnection intent."],
-            "entity_mentions": ["Jasmine"],
-            "thread_signals": ["Reconnecting with Jasmine"],
+            "memory_deltas": ["Jordan remains emotionally present through silence and reconnection intent."],
+            "entity_mentions": ["Jordan"],
+            "thread_signals": ["Reconnecting with Jordan"],
             "identity_signals": ["User wants relational repair but freezes before acting."],
             "emotional_weight": "high",
             "emotional_note": "Tender and unfinished.",
@@ -194,7 +194,7 @@ def _identity_for_case(case_id: str) -> dict:
         who = "Someone trying to accept a relational rupture without softening it into a wobble."
     elif case_id == "repeated_deflection_avoidance":
         chapter = "A period where avoidance is clustering around the HMRC letter."
-        who = "Someone who can turn fear into jokes and administrative displacement."
+        who = "Observed pattern: turns fear into jokes and administrative displacement."
     elif case_id == "silence_reactivation":
         chapter = "A period of cautiously reactivating the gym after silence."
         who = "Someone who returned to embodied care while feeling embarrassed, without making it a performance."
@@ -217,10 +217,10 @@ def _identity_for_case(case_id: str) -> dict:
 
 def _living_for_case(case_id: str) -> dict:
     if case_id == "relationship_contradiction":
-        focus = "Holding hope with Ashley while not flattening the unresolved tension."
-        tension = "The user wants repair with Ashley but is still avoiding the hard conversation."
+        focus = "Holding hope with Riley while not flattening the unresolved tension."
+        tension = "The user wants repair with Riley but is still avoiding the hard conversation."
     elif case_id == "silence_entity_evolution":
-        focus = "Jasmine is present through both mention and silence."
+        focus = "Jordan is present through both mention and silence."
         tension = "The user wants reconnection but freezes before acting."
     elif case_id == "unresolved_goal_health":
         focus = "Rebuilding walking and hydration without turning it into productivity pressure."
