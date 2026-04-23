@@ -139,24 +139,31 @@ The retrospective worker is the system stepping back and asking:
 
 ### What V1 does now
 
-The current deterministic slice does these things:
+The current conservative V1 slice does these things:
 - finds users with enough new memory-worthy sessions
 - finds users with stale low-confidence items
 - finds users with old zombie threads
+- finds users with active contradictions
+- finds users with tentative entities or anchors needing reinforcement updates
+- reinterprets some weak uncertainty when a strong durable anchor now makes it explicit
+- reinforces durable relationship anchors with explicit metadata
+- promotes or prunes tentative entities conservatively
 - closes stale medium-confidence uncertainty
 - prunes stale weak low-value uncertainty
 - reuses thread audit to snooze zombie threads
+- processes retrospective work in an explicit priority order
+- blocks false certainty when a strong anchor exists but still does not explicitly resolve the uncertainty
 - writes retrospective run/checkpoint metadata
 
 ### What it does not do yet
 
 Not yet implemented:
-- reinterpret older weak state when later evidence shows we were wrong
-- reinforce durable anchors with explicit metadata
-- resolve contradictions through a dedicated retrospective pass
-- promote tentative entities through a dedicated retrospective pass
+- broad thread reinterpretation
+- broader contradiction and transition handling beyond explicit anchor-backed cases
+- richer ambiguous-case review output
+- deeper tentative-entity reinterpretation beyond conservative promote / prune
 
-That means the worker is real, but still in its first conservative slice.
+That means the worker is now meaningfully real, but still intentionally conservative.
 
 ## 6. Why This Is A Good Baseline
 

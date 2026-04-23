@@ -667,6 +667,10 @@ CREATE INDEX IF NOT EXISTS idx_memory_relationship_links_user_source
 ALTER TABLE entity_profiles
   ADD COLUMN IF NOT EXISTS distinct_session_count INT NOT NULL DEFAULT 0;
 
+ALTER TABLE entity_profiles
+  ADD COLUMN IF NOT EXISTS reinforcement_count INT NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_reinforced_at TIMESTAMPTZ;
+
 ALTER TABLE open_threads
   ADD COLUMN IF NOT EXISTS distinct_session_count INT NOT NULL DEFAULT 0;
 

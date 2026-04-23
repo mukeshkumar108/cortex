@@ -2092,6 +2092,215 @@ async def test_retrospective_worker_closes_and_prunes_stale_low_confidence_items
 
 
 @pytest.mark.asyncio
+async def test_retrospective_worker_reinterprets_low_confidence_item_from_explicit_anchor():
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.derived_pipeline_llm_enabled = False
+        user_id = _unique("retro-reinterpret-user")
+
+        await db.execute(
+            """
+            INSERT INTO entity_profiles (
+                user_id, canonical_name, canonical_name_normalized, type, aliases,
+                status, relationship_to_user, confidence, mention_count,
+                first_seen_at, last_seen_at, source_session_ids,
+                distinct_session_count, reinforcement_count
+            )
+            VALUES (
+                $1,'Jordan','jordan','person',$2::text[],'active','daughter',0.92,3,
+                NOW() - interval '20 days',NOW() - interval '1 day',$3::text[],
+                3,0
+            )
+            """,
+            user_id,
+            ["Jordan"],
+            ["session-a", "session-b", "session-c"],
+        )
+        await db.execute(
+            """
+            INSERT INTO low_confidence_items (
+                tenant_id, user_id, surface, statement_text, question_text, confidence,
+                source_session_ids, source_turn_refs, first_seen_at, last_seen_at, status, metadata
+            )
+            VALUES (
+                'default',$1,'entity_profile','Jordan might be a friend or other relation.',
+                'Family role is unclear: Jordan might be a friend or other relation.',0.3,
+                ARRAY['session-a']::text[],'[]'::jsonb,
+                NOW() - interval '10 days',NOW() - interval '1 day','open',
+                $2::jsonb
+            )
+            """,
+            user_id,
+            {"reason_code": "unclear_family_role"},
+        )
+
+        summary = await run_retrospective_worker_v1(
+            db=db,
+            tenant_id="default",
+            user_id=user_id,
+            settings=settings,
+        )
+        row = await db.fetchone(
+            """
+            SELECT status, metadata, resolved_at
+            FROM low_confidence_items
+            WHERE user_id=$1
+            ORDER BY item_id DESC
+            LIMIT 1
+            """,
+            user_id,
+        )
+        anchor = await db.fetchone(
+            """
+            SELECT reinforcement_count, last_reinforced_at
+            FROM entity_profiles
+            WHERE user_id=$1 AND canonical_name_normalized='jordan'
+            """,
+            user_id,
+        )
+
+        assert summary["processing_order"] == [
+            "contradictions",
+            "durable_anchors",
+            "threads",
+            "low_confidence",
+            "tentative_entities",
+        ]
+        assert summary["low_confidence_reinterpreted"] == 1
+        assert summary["anchors_reinforced"] == 1
+        assert row["status"] == "answered"
+        assert row["resolved_at"] is not None
+        assert row["metadata"]["retrospective_action"] == "REINTERPRET"
+        assert row["metadata"]["resolved_by_entity"] == "Jordan"
+        assert row["metadata"]["resolved_role"] == "daughter"
+        assert anchor["reinforcement_count"] >= 3
+        assert anchor["last_reinforced_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_retrospective_worker_blocks_false_certainty_without_explicit_anchor_match():
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.derived_pipeline_llm_enabled = False
+        user_id = _unique("retro-false-certainty-user")
+
+        await db.execute(
+            """
+            INSERT INTO entity_profiles (
+                user_id, canonical_name, canonical_name_normalized, type, aliases,
+                status, relationship_to_user, confidence, mention_count,
+                first_seen_at, last_seen_at, source_session_ids,
+                distinct_session_count
+            )
+            VALUES (
+                $1,'Jordan','jordan','person',$2::text[],'active','daughter',0.85,3,
+                NOW() - interval '20 days',NOW() - interval '1 day',$3::text[],
+                3
+            )
+            """,
+            user_id,
+            ["Jordan"],
+            ["session-a", "session-b", "session-c"],
+        )
+        await db.execute(
+            """
+            INSERT INTO low_confidence_items (
+                tenant_id, user_id, surface, statement_text, question_text, confidence,
+                source_session_ids, source_turn_refs, first_seen_at, last_seen_at, status, metadata
+            )
+            VALUES (
+                'default',$1,'entity_profile','Jordan might be a romantic relationship.',
+                'Relationship interpretation is uncertain: Jordan might be a romantic relationship.',0.3,
+                ARRAY['session-a']::text[],'[]'::jsonb,
+                NOW() - interval '10 days',NOW() - interval '1 day','open',
+                $2::jsonb
+            )
+            """,
+            user_id,
+            {"reason_code": "uncertain_relationship_interpretation"},
+        )
+
+        summary = await run_retrospective_worker_v1(
+            db=db,
+            tenant_id="default",
+            user_id=user_id,
+            settings=settings,
+        )
+        row = await db.fetchone(
+            """
+            SELECT status, metadata
+            FROM low_confidence_items
+            WHERE user_id=$1
+            ORDER BY item_id DESC
+            LIMIT 1
+            """,
+            user_id,
+        )
+
+        assert summary["low_confidence_reinterpreted"] == 0
+        assert summary["anti_false_certainty_blocked"] >= 1
+        assert row["status"] == "open"
+        assert "retrospective_action" not in (row["metadata"] or {})
+
+
+@pytest.mark.asyncio
+async def test_retrospective_worker_promotes_and_prunes_tentative_entities_conservatively():
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.derived_pipeline_llm_enabled = False
+        user_id = _unique("retro-tentative-user")
+
+        await db.execute(
+            """
+            INSERT INTO entity_profiles (
+                user_id, canonical_name, canonical_name_normalized, type, aliases,
+                status, relationship_to_user, confidence, mention_count,
+                first_seen_at, last_seen_at, source_session_ids,
+                distinct_session_count
+            )
+            VALUES
+            (
+                $1,'Jordan','jordan','person',$2::text[],'tentative','daughter',0.7,2,
+                NOW() - interval '20 days',NOW() - interval '1 day',$3::text[],
+                2
+            ),
+            (
+                $1,'Casey','casey','person',$4::text[],'tentative','other',0.3,1,
+                NOW() - interval '80 days',NOW() - interval '70 days',$5::text[],
+                1
+            )
+            """,
+            user_id,
+            ["Jordan"],
+            ["session-a", "session-b"],
+            ["Casey"],
+            ["session-old"],
+        )
+
+        summary = await run_retrospective_worker_v1(
+            db=db,
+            tenant_id="default",
+            user_id=user_id,
+            settings=settings,
+        )
+        rows = await db.fetch(
+            """
+            SELECT canonical_name_normalized, status
+            FROM entity_profiles
+            WHERE user_id=$1
+            ORDER BY canonical_name_normalized
+            """,
+            user_id,
+        )
+        by_name = {row["canonical_name_normalized"]: row["status"] for row in rows}
+
+        assert summary["tentative_entities_promoted"] == 1
+        assert summary["tentative_entities_pruned"] == 1
+        assert by_name["jordan"] == "active"
+        assert by_name["casey"] == "archived"
+
+
+@pytest.mark.asyncio
 async def test_conservative_memory_audits_include_retrospective_summary():
     async with app.router.lifespan_context(app):
         settings = get_settings()

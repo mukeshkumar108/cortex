@@ -25,17 +25,24 @@ Implemented now:
 - candidate selection after `3` new memory-worthy sessions
 - candidate selection from stale low-confidence items
 - candidate selection from zombie open threads
+- candidate selection from active contradictions
+- candidate selection from tentative entities / reinforcement-needed anchors
 - deterministic stale low-confidence close
 - deterministic low-confidence prune
 - deterministic zombie-thread cleanup through thread audit reuse
+- conservative low-confidence `REINTERPRET` from explicit durable anchors
+- conservative contradiction `REINTERPRET` from explicit durable anchors
+- tentative-entity promotion / prune review
+- durable-anchor reinforcement metadata writes
+- explicit priority-ordered processing
+- anti-false-certainty blocking when a strong anchor exists but does not explicitly resolve the uncertainty
 - integration into the existing conservative memory audit loop
 
 Designed here but not yet implemented:
-- `REINTERPRET` actions
-- durable-anchor reinforcement metadata writes
-- explicit priority-ordered packet processing
-- contradiction/transition reinterpretation and resolution
-- tentative-entity promotion/demotion reinterpretation pass
+- thread-level `REINTERPRET` actions
+- broader contradiction / transition resolution beyond anchor-backed cases
+- tentative-entity reinterpretation beyond conservative promote / prune
+- richer review-flag output for ambiguous cascades
 
 This matters because the worker now exists as a real bounded V1, but this document still describes the full conservative contract for the next slice.
 

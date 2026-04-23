@@ -256,12 +256,14 @@ What is already implemented:
 - [x] Integration into the conservative memory audit loop
 
 What remains before moving to proactive surfacing / queues:
-- [ ] `REINTERPRET` for weak corrected state
-- [ ] Durable-anchor reinforcement metadata writes
-- [ ] Priority-ordered retrospective processing
-- [ ] Anti-false-certainty enforcement in retrospective promotion flows
-- [ ] Tentative entity re-evaluation / reinterpretation
-- [ ] Contradiction and transition resolution / reinterpretation
+- [x] `REINTERPRET` for conservative anchor-backed weak corrected state
+- [x] Durable-anchor reinforcement metadata writes
+- [x] Priority-ordered retrospective processing
+- [x] Anti-false-certainty enforcement in retrospective reinterpretation flows
+- [x] Tentative entity promote / prune review
+- [ ] Broader tentative-entity reinterpretation
+- [ ] Broader contradiction and transition resolution / reinterpretation
+- [ ] Thread-level reinterpretation for weak mistaken premises
 
 Rule:
 - Do not jump into proactive surfacing / queues until the retrospective worker contract is documented simply enough to be understood by a human operator and the remaining conservative V1 extensions are explicitly queued.

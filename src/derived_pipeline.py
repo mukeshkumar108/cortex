@@ -58,6 +58,15 @@ SILENCE_THREAD_THRESHOLD_DAYS = 30
 RETROSPECTIVE_SESSION_THRESHOLD = 3
 RETROSPECTIVE_LOW_CONFIDENCE_CLOSE_DAYS = 21
 RETROSPECTIVE_LOW_CONFIDENCE_PRUNE_DAYS = 45
+RETROSPECTIVE_TENTATIVE_ENTITY_PRUNE_DAYS = 45
+
+RETROSPECTIVE_PROCESSING_ORDER = [
+    "contradictions",
+    "durable_anchors",
+    "threads",
+    "low_confidence",
+    "tentative_entities",
+]
 
 SILENCE_IMPORTANT_RELATIONSHIPS = {
     "partner",
@@ -178,6 +187,24 @@ STRONG_RELATIONSHIP_RANK = {
     "active_project": 35,
     "assistant": 30,
     "other": 10,
+}
+
+FAMILY_RELATIONSHIP_ROLES = {
+    "daughter",
+    "son",
+    "child",
+    "mother",
+    "father",
+    "parent",
+    "sister",
+    "brother",
+}
+
+PARTNER_RELATIONSHIP_ROLES = {
+    "girlfriend",
+    "boyfriend",
+    "partner",
+    "spouse",
 }
 
 
@@ -3248,6 +3275,44 @@ async def _retrospective_candidate_users(
         clean = normalize_text(row.get("user_id"))
         if clean and clean not in candidates:
             candidates.append(clean)
+    contradiction_rows = await db.fetch(
+        """
+        SELECT DISTINCT user_id
+        FROM memory_contradictions
+        WHERE tenant_id=$1
+          AND status='active'
+        LIMIT 500
+        """,
+        tenant_id,
+    )
+    for row in contradiction_rows or []:
+        clean = normalize_text(row.get("user_id"))
+        if clean and clean not in candidates:
+            candidates.append(clean)
+    tentative_or_reinforcement_rows = await db.fetch(
+        """
+        SELECT DISTINCT user_id
+        FROM entity_profiles
+        WHERE status='tentative'
+           OR (
+             status='active'
+             AND replace(lower(COALESCE(relationship_to_user, '')), ' ', '_') = ANY($1::text[])
+             AND COALESCE(distinct_session_count, 0) >= 2
+             AND (
+               last_reinforced_at IS NULL
+               OR last_seen_at IS NULL
+               OR last_reinforced_at < last_seen_at
+               OR COALESCE(reinforcement_count, 0) < COALESCE(distinct_session_count, 0)
+             )
+           )
+        LIMIT 500
+        """,
+        list(FAMILY_RELATIONSHIP_ROLES | PARTNER_RELATIONSHIP_ROLES),
+    )
+    for row in tentative_or_reinforcement_rows or []:
+        clean = normalize_text(row.get("user_id"))
+        if clean and clean not in candidates:
+            candidates.append(clean)
     return candidates
 
 
@@ -3287,6 +3352,314 @@ def _with_packet_reason(row: Dict[str, Any], *, why: str) -> Dict[str, Any]:
     out["importance_score"] = max(float(out.get("importance_score") or 0.0), _packet_importance(out))
     out["evidence_refs"] = out.get("evidence_turn_refs") or out.get("source_turn_refs") or out.get("source_session_ids") or []
     return out
+
+
+def _entity_name_candidates(row: Dict[str, Any]) -> List[str]:
+    names = [normalize_text(row.get("canonical_name"))]
+    names.extend(_text_list(row.get("aliases"), limit=12))
+    out: List[str] = []
+    for name in names:
+        clean = normalize_text(name)
+        if clean and clean not in out:
+            out.append(clean)
+    return out
+
+
+def _text_mentions_name(text: Any, name: Any) -> bool:
+    haystack = normalize_text(text)
+    needle = normalize_text(name)
+    if not haystack or not needle:
+        return False
+    try:
+        return re.search(rf"(^|[^a-z0-9]){re.escape(needle)}([^a-z0-9]|$)", haystack) is not None
+    except Exception:
+        return needle in haystack
+
+
+def _row_mentions_anchor(row: Dict[str, Any], anchor: Dict[str, Any]) -> bool:
+    blob = " ".join(
+        [
+            normalize_text(row.get("topic"), casefold=False),
+            normalize_text(row.get("statement_text"), casefold=False),
+            normalize_text(row.get("question_text"), casefold=False),
+            normalize_text(row.get("earlier_view"), casefold=False),
+            normalize_text(row.get("recent_view"), casefold=False),
+        ]
+    )
+    return any(_text_mentions_name(blob, candidate) for candidate in _entity_name_candidates(anchor))
+
+
+def _anchor_reason_explicitly_resolves(reason_code: Optional[str], relationship_to_user: Any) -> bool:
+    role = normalize_text(relationship_to_user).replace(" ", "_")
+    if reason_code == "unclear_family_role":
+        return role in FAMILY_RELATIONSHIP_ROLES and _relationship_rank(role) >= 85
+    if reason_code == "uncertain_relationship_interpretation":
+        return role in PARTNER_RELATIONSHIP_ROLES and _relationship_rank(role) >= 95
+    return False
+
+
+async def _load_reinforceable_anchor_entities(
+    *,
+    db: Database,
+    user_id: str,
+) -> List[Dict[str, Any]]:
+    rows = await db.fetch(
+        """
+        SELECT canonical_name, canonical_name_normalized, aliases, relationship_to_user,
+               status, confidence, mention_count, distinct_session_count,
+               source_session_ids, last_seen_at, reinforcement_count, last_reinforced_at
+        FROM entity_profiles
+        WHERE user_id=$1
+          AND status IN ('active','tentative')
+          AND replace(lower(COALESCE(relationship_to_user, '')), ' ', '_') = ANY($2::text[])
+        ORDER BY distinct_session_count DESC NULLS LAST,
+                 mention_count DESC NULLS LAST,
+                 confidence DESC NULLS LAST,
+                 last_seen_at DESC NULLS LAST
+        """,
+        user_id,
+        list(FAMILY_RELATIONSHIP_ROLES | PARTNER_RELATIONSHIP_ROLES),
+    )
+    return [dict(row) for row in rows]
+
+
+async def _resolve_retrospective_contradictions(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+    anchors: Sequence[Dict[str, Any]],
+) -> Dict[str, int]:
+    rows = await db.fetch(
+        """
+        SELECT contradiction_id, topic, earlier_view, recent_view, metadata
+        FROM memory_contradictions
+        WHERE tenant_id=$1
+          AND user_id=$2
+          AND status='active'
+        ORDER BY last_seen_at DESC NULLS LAST, contradiction_id DESC
+        LIMIT 50
+        """,
+        tenant_id,
+        user_id,
+    )
+    summary = {"reinterpreted": 0, "blocked": 0}
+    for row in rows:
+        reason_code = _low_confidence_reason(
+            " ".join(
+                [
+                    normalize_text(row.get("topic"), casefold=False),
+                    normalize_text(row.get("earlier_view"), casefold=False),
+                    normalize_text(row.get("recent_view"), casefold=False),
+                ]
+            ),
+            "contradiction",
+        )
+        matched_anchor = next((anchor for anchor in anchors if _row_mentions_anchor(dict(row), anchor)), None)
+        if not matched_anchor:
+            continue
+        if not _anchor_reason_explicitly_resolves(reason_code, matched_anchor.get("relationship_to_user")):
+            summary["blocked"] += 1
+            continue
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        await db.execute(
+            """
+            UPDATE memory_contradictions
+            SET status='resolved',
+                resolved_at=NOW(),
+                metadata=$3::jsonb
+            WHERE tenant_id=$1 AND contradiction_id=$2
+            """,
+            tenant_id,
+            int(row["contradiction_id"]),
+            {
+                **metadata,
+                "retrospective_action": "REINTERPRET",
+                "retrospective_rule": "explicit_anchor_resolution",
+                "resolved_by_entity": matched_anchor.get("canonical_name"),
+                "resolved_role": normalize_text(matched_anchor.get("relationship_to_user")) or None,
+            },
+        )
+        summary["reinterpreted"] += 1
+    return summary
+
+
+async def _reinforce_durable_anchors(
+    *,
+    db: Database,
+    user_id: str,
+    anchors: Sequence[Dict[str, Any]],
+) -> Dict[str, int]:
+    summary = {"reinforced": 0}
+    for anchor in anchors:
+        if normalize_text(anchor.get("status")) != "active":
+            continue
+        distinct_sessions = max(
+            int(anchor.get("distinct_session_count") or 0),
+            len(set(_text_list(anchor.get("source_session_ids"), limit=32))),
+        )
+        if distinct_sessions < 2:
+            continue
+        current_reinforcement = int(anchor.get("reinforcement_count") or 0)
+        last_seen = anchor.get("last_seen_at")
+        last_reinforced = anchor.get("last_reinforced_at")
+        if current_reinforcement >= distinct_sessions and last_reinforced and last_seen and last_reinforced >= last_seen:
+            continue
+        await db.execute(
+            """
+            UPDATE entity_profiles
+            SET reinforcement_count=GREATEST(
+                  COALESCE(reinforcement_count, 0),
+                  $3
+                ),
+                last_reinforced_at=COALESCE($4, NOW()),
+                last_updated_at=NOW()
+            WHERE user_id=$1 AND canonical_name_normalized=$2
+            """,
+            user_id,
+            normalize_text(anchor.get("canonical_name_normalized")),
+            distinct_sessions,
+            last_seen,
+        )
+        summary["reinforced"] += 1
+    return summary
+
+
+async def _reconcile_low_confidence_items(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+    anchors: Sequence[Dict[str, Any]],
+) -> Dict[str, int]:
+    reinterpret_summary = {"reinterpreted": 0, "blocked": 0}
+    rows = await db.fetch(
+        """
+        SELECT item_id, statement_text, question_text, metadata
+        FROM low_confidence_items
+        WHERE tenant_id=$1
+          AND user_id=$2
+          AND status='open'
+        ORDER BY confidence ASC NULLS FIRST, last_seen_at DESC NULLS LAST, item_id DESC
+        LIMIT 100
+        """,
+        tenant_id,
+        user_id,
+    )
+    for row in rows:
+        reason_code = None
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if metadata.get("reason_code"):
+            reason_code = normalize_text(metadata.get("reason_code"))
+        if not reason_code:
+            reason_code = _low_confidence_reason(
+                " ".join(
+                    [
+                        normalize_text(row.get("statement_text"), casefold=False),
+                        normalize_text(row.get("question_text"), casefold=False),
+                    ]
+                )
+            )
+        matched_anchor = next((anchor for anchor in anchors if _row_mentions_anchor(dict(row), anchor)), None)
+        if not matched_anchor:
+            continue
+        if not _anchor_reason_explicitly_resolves(reason_code, matched_anchor.get("relationship_to_user")):
+            reinterpret_summary["blocked"] += 1
+            continue
+        await db.execute(
+            """
+            UPDATE low_confidence_items
+            SET status='answered',
+                resolved_at=NOW(),
+                metadata=$4::jsonb
+            WHERE tenant_id=$1 AND user_id=$2 AND item_id=$3
+            """,
+            tenant_id,
+            user_id,
+            int(row["item_id"]),
+            {
+                **metadata,
+                "retrospective_action": "REINTERPRET",
+                "retrospective_rule": "explicit_anchor_resolution",
+                "resolved_by_entity": matched_anchor.get("canonical_name"),
+                "resolved_role": normalize_text(matched_anchor.get("relationship_to_user")) or None,
+            },
+        )
+        reinterpret_summary["reinterpreted"] += 1
+    stale_summary = await _close_stale_low_confidence_items(db=db, tenant_id=tenant_id, user_id=user_id)
+    return {
+        "reinterpreted": reinterpret_summary["reinterpreted"],
+        "blocked": reinterpret_summary["blocked"],
+        "closed": stale_summary["closed"],
+        "pruned": stale_summary["pruned"],
+    }
+
+
+async def _review_tentative_entities(
+    *,
+    db: Database,
+    user_id: str,
+) -> Dict[str, int]:
+    rows = await db.fetch(
+        """
+        SELECT canonical_name_normalized, relationship_to_user, confidence, mention_count,
+               distinct_session_count, last_seen_at, profile_text, key_facts, open_questions
+        FROM entity_profiles
+        WHERE user_id=$1
+          AND status='tentative'
+        ORDER BY distinct_session_count DESC NULLS LAST,
+                 mention_count DESC NULLS LAST,
+                 last_seen_at DESC NULLS LAST
+        LIMIT 100
+        """,
+        user_id,
+    )
+    summary = {"promoted": 0, "pruned": 0}
+    for row in rows:
+        candidate = dict(row)
+        relationship = normalize_text(candidate.get("relationship_to_user")).replace(" ", "_")
+        distinct_sessions = int(candidate.get("distinct_session_count") or 0)
+        mention_count = int(candidate.get("mention_count") or 0)
+        confidence = _confidence_float(candidate.get("confidence"), default=0.0)
+        if (
+            _relationship_rank(relationship) >= 85
+            and distinct_sessions >= 2
+            and (confidence >= 0.55 or mention_count >= 2)
+        ):
+            await db.execute(
+                """
+                UPDATE entity_profiles
+                SET status='active',
+                    last_updated_at=NOW()
+                WHERE user_id=$1 AND canonical_name_normalized=$2
+                """,
+                user_id,
+                normalize_text(candidate.get("canonical_name_normalized")),
+            )
+            summary["promoted"] += 1
+            continue
+        if (
+            _relationship_rank(relationship) < 50
+            and distinct_sessions <= 1
+            and confidence <= 0.45
+            and not _has_entity_serving_content(candidate)
+        ):
+            result = await db.execute(
+                """
+                UPDATE entity_profiles
+                SET status='archived',
+                    last_updated_at=NOW()
+                WHERE user_id=$1
+                  AND canonical_name_normalized=$2
+                  AND last_seen_at < NOW() - ($3::text || ' days')::interval
+                """,
+                user_id,
+                normalize_text(candidate.get("canonical_name_normalized")),
+                str(RETROSPECTIVE_TENTATIVE_ENTITY_PRUNE_DAYS),
+            )
+            if str(result).endswith("1"):
+                summary["pruned"] += 1
+    return summary
 
 
 async def build_pass4_identity_packet(
@@ -4389,12 +4762,19 @@ async def run_retrospective_worker_v1(
     summary: Dict[str, Any] = {
         "users_considered": len(users),
         "users_processed": 0,
+        "processing_order": list(RETROSPECTIVE_PROCESSING_ORDER),
+        "contradictions_reinterpreted": 0,
+        "anchors_reinforced": 0,
+        "low_confidence_reinterpreted": 0,
         "low_confidence_closed": 0,
         "low_confidence_pruned": 0,
+        "tentative_entities_promoted": 0,
+        "tentative_entities_pruned": 0,
         "threads_merged": 0,
         "threads_resolved": 0,
         "threads_snoozed": 0,
         "threads_flagged": 0,
+        "anti_false_certainty_blocked": 0,
     }
     for uid in users:
         latest_session = await db.fetchone(
@@ -4431,11 +4811,36 @@ async def run_retrospective_worker_v1(
             summary["users_processed"] += 1
             continue
         try:
-            low_conf_summary = await _close_stale_low_confidence_items(db=db, tenant_id=tenant_id, user_id=uid)
+            anchors = await _load_reinforceable_anchor_entities(db=db, user_id=uid)
+            contradiction_summary = await _resolve_retrospective_contradictions(
+                db=db,
+                tenant_id=tenant_id,
+                user_id=uid,
+                anchors=anchors,
+            )
+            anchor_summary = await _reinforce_durable_anchors(
+                db=db,
+                user_id=uid,
+                anchors=anchors,
+            )
             thread_summary = await run_thread_audit(db=db, tenant_id=tenant_id, user_id=uid, settings=s)
+            low_conf_summary = await _reconcile_low_confidence_items(
+                db=db,
+                tenant_id=tenant_id,
+                user_id=uid,
+                anchors=anchors,
+            )
+            tentative_summary = await _review_tentative_entities(
+                db=db,
+                user_id=uid,
+            )
             output = {
+                "processing_order": list(RETROSPECTIVE_PROCESSING_ORDER),
+                "contradictions": contradiction_summary,
+                "durable_anchors": anchor_summary,
                 "low_confidence": low_conf_summary,
                 "threads": thread_summary,
+                "tentative_entities": tentative_summary,
             }
             output_hash = stable_short_hash(output, length=24)
             await _complete_run(db, run_id, output_hash)
@@ -4449,12 +4854,20 @@ async def run_retrospective_worker_v1(
                 output_hash=output_hash,
             )
             summary["users_processed"] += 1
+            summary["contradictions_reinterpreted"] += int(contradiction_summary.get("reinterpreted") or 0)
+            summary["anchors_reinforced"] += int(anchor_summary.get("reinforced") or 0)
+            summary["low_confidence_reinterpreted"] += int(low_conf_summary.get("reinterpreted") or 0)
             summary["low_confidence_closed"] += int(low_conf_summary.get("closed") or 0)
             summary["low_confidence_pruned"] += int(low_conf_summary.get("pruned") or 0)
+            summary["tentative_entities_promoted"] += int(tentative_summary.get("promoted") or 0)
+            summary["tentative_entities_pruned"] += int(tentative_summary.get("pruned") or 0)
             summary["threads_merged"] += int(thread_summary.get("merged") or 0)
             summary["threads_resolved"] += int(thread_summary.get("resolved") or 0)
             summary["threads_snoozed"] += int(thread_summary.get("snoozed") or 0)
             summary["threads_flagged"] += int(thread_summary.get("flagged") or 0)
+            summary["anti_false_certainty_blocked"] += int(
+                (low_conf_summary.get("blocked") or 0) + (contradiction_summary.get("blocked") or 0)
+            )
         except Exception as exc:
             await _fail_run(db, run_id, "retrospective_v1_failed", str(exc))
             raise
