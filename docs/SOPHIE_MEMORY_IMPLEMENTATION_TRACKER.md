@@ -1,8 +1,19 @@
 # Sophie Memory Implementation Tracker
 
-Version: 2026-04-22  
+Version: 2026-04-23  
 Scope: Phase 1 hardening and Phase 2 packet quality only  
-Status: Working tracker
+Status: Benchmark closed; retrospective V1 started
+
+Follow-on design after this tracker:
+- `docs/SOPHIE_RETROSPECTIVE_WORKER_SPEC.md`
+- `docs/SOPHIE_MEMORY_SYSTEM_SIMPLE.md`
+
+That document defines the next bounded cross-time worker layer. It is intentionally separate from this tracker so the hardening/packet benchmark stays closed and the next build step has a clean contract.
+
+Current state:
+- The hardening and packet-quality benchmark is complete enough to freeze as a baseline.
+- The first deterministic retrospective slice now exists in code.
+- The remaining retrospective extensions are intentionally conservative and should be built before proactive surfacing / queues.
 
 This document is the implementation checklist for restoring premium, meaning-first memory quality without redesigning the system.
 
@@ -227,6 +238,33 @@ Exit criteria:
 - Duplicate topic threads are merged, superseded, or flagged.
 
 Do not proceed to Step 3 if thread explosion remains.
+
+## Follow-On: Retrospective Worker V1
+
+This tracker is no longer the place to design the retrospective worker in detail.
+That contract now lives in:
+- `docs/SOPHIE_RETROSPECTIVE_WORKER_SPEC.md`
+
+What is already implemented:
+- [x] Retrospective run/checkpoint metadata
+- [x] Candidate selection after `3` new memory-worthy sessions
+- [x] Candidate selection from stale low-confidence items
+- [x] Candidate selection from zombie open threads
+- [x] Deterministic stale low-confidence close
+- [x] Deterministic low-confidence prune
+- [x] Deterministic zombie-thread cleanup through thread audit reuse
+- [x] Integration into the conservative memory audit loop
+
+What remains before moving to proactive surfacing / queues:
+- [ ] `REINTERPRET` for weak corrected state
+- [ ] Durable-anchor reinforcement metadata writes
+- [ ] Priority-ordered retrospective processing
+- [ ] Anti-false-certainty enforcement in retrospective promotion flows
+- [ ] Tentative entity re-evaluation / reinterpretation
+- [ ] Contradiction and transition resolution / reinterpretation
+
+Rule:
+- Do not jump into proactive surfacing / queues until the retrospective worker contract is documented simply enough to be understood by a human operator and the remaining conservative V1 extensions are explicitly queued.
 
 ## Step 3: Lightweight Temporal Reinforcement
 
