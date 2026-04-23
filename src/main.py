@@ -524,7 +524,7 @@ async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
         )
     contradiction_items = _dedupe_contradictions(contradiction_items, limit=3)
     source_provenance = {
-        "projection_version": "t9a.handover_reanchor.v1",
+        "projection_version": "derived.handover.v1",
         "canonical_claims_considered": 0,
         "canonical_entities_considered": 0,
         "canonical_watermarks": [],
@@ -13451,7 +13451,7 @@ async def session_startbrief(
                 "daily_analysis_date_used": None,
                 "freshness": ingest_freshness,
                 "canonical_provenance": _canonical_provenance_payload(
-                    projection_version="t9a.startbrief_reanchor.v1",
+                    projection_version="derived.startbrief.v1",
                     signal_rows={"claims": [], "entities": [], "watermarks": []},
                 ),
             },

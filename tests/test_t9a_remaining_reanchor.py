@@ -1,201 +1,124 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from uuid import uuid4
 
 import pytest
 
-from src import loops as loops_module
-from src.main import (
-    _pg_get_entity_role_hint,
-    _pg_search_nodes,
-    _generate_startbrief_bridge_llm,
-    _get_session_ingest_freshness,
-    _log_startbrief_history,
-    graphiti_client,
-    session_startbrief,
-)
+from src.main import _build_handover_packet, app, db, session_startbrief
 
 
 @pytest.mark.asyncio
-async def test_t9a_role_hint_falls_back_to_canonical_when_derived_missing(monkeypatch):
-    async def _stub_fetchone(query, *args, **kwargs):
-        if "FROM entity_profiles" in query:
-            return None
-        if "FROM entities" in query:
-            return {"entity_id": "2ea8c5b7-c6d0-4f56-8f3e-8fe62f69f65e", "canonical_name": "Ashley", "entity_type": "person"}
-        if "FROM claims" in query:
-            return {"predicate": "relationship.role", "object_payload": {"value": "partner"}, "truth_confidence": 0.84}
-        return None
-
-    monkeypatch.setattr("src.main.db.fetchone", _stub_fetchone, raising=False)
-
-    hint = await _pg_get_entity_role_hint(
-        tenant_id="default",
-        user_id="u1",
-        name="Ashley",
-        entity_id=None,
-    )
-
-    assert hint["entity_name"] == "Ashley"
-    assert hint["role"] == "partner"
-    assert hint["source"] == "canonical_entities_claims"
-    assert hint["derived"] is False
-    assert hint["evidence_backed"] is True
-
-
-@pytest.mark.asyncio
-async def test_t9a_search_nodes_includes_canonical_fallback(monkeypatch):
+async def test_startbrief_safety_gate_stays_derived_only(monkeypatch):
+    user_id = f"derived-only-startbrief-user-{uuid4().hex}"
+    session_id = f"derived-only-startbrief-session-{uuid4().hex}"
     now = datetime.now(timezone.utc)
+    async with app.router.lifespan_context(app):
+        await db.execute(
+            """
+            INSERT INTO session_transcript (tenant_id, session_id, user_id, messages, created_at, updated_at)
+            VALUES ('default',$1,$2,$3::jsonb,NOW(),NOW())
+            ON CONFLICT (tenant_id, session_id) DO NOTHING
+            """,
+            session_id,
+            user_id,
+            [{"role": "user", "text": "Remember Riley and the walking goal.", "timestamp": now.isoformat()}],
+        )
+        await db.execute(
+            """
+            INSERT INTO session_classifications (
+                session_id, user_id, session_date, is_memory_worthy, session_kind,
+                one_line_summary, entity_mentions, run_entity_pass, run_threads_pass,
+                identity_relevant, emotional_weight, processed_at, model_used,
+                raw_triage_output, context_relevant
+            ) VALUES (
+                $1,$2,NOW(),true,'personal','derived only',$3::text[],true,true,true,
+                'medium',NOW(),'fixture',$4::jsonb,true
+            )
+            ON CONFLICT (session_id) DO UPDATE SET processed_at=EXCLUDED.processed_at
+            """,
+            session_id,
+            user_id,
+            ["Riley"],
+            {"memory_deltas": ["User is trying to become more consistent."]},
+        )
+        await db.execute(
+            """
+            INSERT INTO entity_profiles (
+                user_id, canonical_name, canonical_name_normalized, type, aliases,
+                status, relationship_to_user, profile_text, confidence, mention_count,
+                first_seen_at, last_seen_at, source_session_ids, importance_score, salience_score
+            ) VALUES (
+                $1,'Riley','riley','person',$2::text[],'active','partner',
+                'Riley is relationally important.',0.9,3,NOW(),NOW(),$3::text[],0.9,0.9
+            )
+            ON CONFLICT (user_id, canonical_name_normalized) DO UPDATE SET last_seen_at=NOW()
+            """,
+            user_id,
+            ["Riley"],
+            [session_id],
+        )
+        async def _unexpected(*_args, **_kwargs):
+            raise AssertionError("startbrief touched canonical fallback helper")
 
-    async def _stub_fetch(query, *args, **kwargs):
-        if "FROM entity_profiles" in query:
-            return []
-        if "FROM open_threads" in query:
-            return []
-        if "FROM session_classifications" in query:
-            return []
-        if "FROM entities" in query and "canonical_name_normalized" in query:
-            return [
-                {
-                    "tenant_id": "default",
-                    "entity_id": "2ea8c5b7-c6d0-4f56-8f3e-8fe62f69f65e",
-                    "canonical_name": "Ashley",
-                    "entity_type": "person",
-                    "created_at": now,
-                    "updated_at": now,
-                }
-            ]
-        if "FROM claims c" in query and "claim_event_key" in query:
-            return [
-                {
-                    "claim_event_key": "cek_v1_test",
-                    "predicate": "relationship.status",
-                    "object_payload": {"value": "dating"},
-                    "truth_confidence": 0.9,
-                    "updated_at": now,
-                    "subject_text": "Ashley",
-                    "subject_name": "Ashley",
-                    "evidence_count": 1,
-                }
-            ]
-        return []
+        monkeypatch.setattr("src.main._fetch_canonical_signal_rows", _unexpected, raising=True)
+        monkeypatch.setattr("src.main._pg_get_entity_role_hint", _unexpected, raising=True)
+        monkeypatch.setattr("src.main._pg_get_entity_continuity_facts", _unexpected, raising=True)
+        monkeypatch.setattr("src.main._pg_search_nodes", _unexpected, raising=True)
+        monkeypatch.setattr("src.main._pg_search_continuity_facts", _unexpected, raising=True)
 
-    monkeypatch.setattr("src.main.db.fetch", _stub_fetch, raising=False)
+        response = await session_startbrief(
+            tenantId="default",
+            userId=user_id,
+            now=now.isoformat(),
+            sessionId=session_id,
+            timezone="UTC",
+        )
+        payload = response.model_dump()
 
-    rows = await _pg_search_nodes(
-        tenant_id="default",
-        user_id="u1",
-        query="ashley dating",
-        limit=10,
-        reference_time=now,
-    )
-
-    sources = {((row.get("attributes") or {}).get("source")) for row in rows}
-    assert "canonical_entities" in sources
-    assert "canonical_claims" in sources
+        provenance = ((payload.get("evidence") or {}).get("canonical_provenance") or {})
+        assert provenance.get("projection_version") == "derived.startbrief.v1"
+        assert provenance.get("canonical_claims_considered") == 0
+        assert provenance.get("canonical_entities_considered") == 0
 
 
 @pytest.mark.asyncio
-async def test_t9a_startbrief_emits_canonical_provenance(monkeypatch):
-    now_dt = datetime(2026, 2, 6, 10, 15, tzinfo=timezone.utc)
-    now = now_dt.isoformat().replace("+00:00", "Z")
+async def test_handover_safety_gate_stays_derived_only(monkeypatch):
+    user_id = f"derived-only-handover-user-{uuid4().hex}"
+    async with app.router.lifespan_context(app):
+        await db.execute(
+            """
+            INSERT INTO living_context (
+                user_id, current_focus, primary_tension, unspoken_goal, emotional_texture, relationship_pulse
+            )
+            VALUES ($1, 'derived focus', 'derived tension', 'derived goal', 'derived texture', 'derived pulse')
+            ON CONFLICT (user_id)
+            DO UPDATE SET current_focus=EXCLUDED.current_focus
+            """,
+            user_id,
+        )
+        await db.execute(
+            """
+            INSERT INTO identity_profile (
+                user_id, current_chapter, core_values, persistent_goals, what_they_want
+            )
+            VALUES ($1, 'derived chapter', '[{"value":"family"}]'::jsonb, '[{"goal":"stability"}]'::jsonb, 'derived want')
+            ON CONFLICT (user_id)
+            DO UPDATE SET current_chapter=EXCLUDED.current_chapter
+            """,
+            user_id,
+        )
+        async def _unexpected(*_args, **_kwargs):
+            raise AssertionError("handover touched canonical fallback helper")
 
-    async def _stub_latest_summary_node(*_args, **_kwargs):
-        return None
+        monkeypatch.setattr("src.main._fetch_canonical_signal_rows", _unexpected, raising=True)
+        monkeypatch.setattr("src.main._pg_get_entity_role_hint", _unexpected, raising=True)
+        monkeypatch.setattr("src.main._pg_get_entity_continuity_facts", _unexpected, raising=True)
+        monkeypatch.setattr("src.main._pg_search_nodes", _unexpected, raising=True)
+        monkeypatch.setattr("src.main._pg_search_continuity_facts", _unexpected, raising=True)
 
-    async def _stub_recent_session_summary_nodes(*_args, **_kwargs):
-        return []
+        packet = await _build_handover_packet(user_id)
 
-    async def _stub_recent_episode_summaries(*_args, **_kwargs):
-        return []
-
-    async def _stub_get_top_loops(*_args, **_kwargs):
-        return []
-
-    async def _stub_db_fetchone(query, *_args, **_kwargs):
-        if "FROM session_transcript" in query:
-            return {"messages": [{"role": "user", "text": "last", "timestamp": (now_dt).isoformat()}]}
-        if "count(*) AS sessions_today" in query:
-            return {"sessions_today": 0}
-        if "FROM daily_analysis" in query:
-            return None
-        if "FROM user_model" in query:
-            return None
-        return None
-
-    async def _stub_db_fetch(query, *_args, **_kwargs):
-        if "FROM user_model" in query:
-            return []
-        if "FROM claims c" in query and "COUNT(ce.claim_evidence_id)::int AS evidence_count" in query:
-            return [
-                {
-                    "tenant_id": "default",
-                    "claim_event_key": "cek_v1_startbrief",
-                    "predicate": "project.focus",
-                    "subject_entity_id": "2ea8c5b7-c6d0-4f56-8f3e-8fe62f69f65e",
-                    "subject_text": "Onboarding Launch",
-                    "object_payload": {"value": "ship this week"},
-                    "truth_confidence": 0.93,
-                    "updated_at": now_dt,
-                    "created_at": now_dt,
-                    "subject_name": "Onboarding Launch",
-                    "entity_type": "project",
-                    "evidence_count": 1,
-                }
-            ]
-        if "FROM entities" in query and "canonical_name_normalized" in query:
-            return [
-                {
-                    "tenant_id": "default",
-                    "entity_id": "2ea8c5b7-c6d0-4f56-8f3e-8fe62f69f65e",
-                    "canonical_name": "Onboarding Launch",
-                    "canonical_name_normalized": "onboarding launch",
-                    "entity_type": "project",
-                    "status": "active",
-                    "created_at": now_dt,
-                    "updated_at": now_dt,
-                }
-            ]
-        if "FROM canonical_tenant_watermarks" in query:
-            return [{"tenant_id": "default", "last_sequence": 22, "updated_at": now_dt}]
-        return []
-
-    async def _stub_bridge_llm(*_args, **_kwargs):
-        return "The user is continuing the same core thread."
-
-    async def _stub_ingest_freshness(*_args, **_kwargs):
-        return {}
-
-    async def _stub_log_history(*_args, **_kwargs):
-        return None
-
-    async def _stub_build_entity_candidates(*_args, **_kwargs):
-        return []
-
-    graphiti_client.get_latest_session_summary_node = _stub_latest_summary_node
-    graphiti_client.get_recent_session_summary_nodes = _stub_recent_session_summary_nodes
-    graphiti_client.get_recent_episode_summaries = _stub_recent_episode_summaries
-    monkeypatch.setattr(loops_module, "get_top_loops_for_startbrief", _stub_get_top_loops, raising=True)
-    monkeypatch.setattr("src.main.db.fetchone", _stub_db_fetchone, raising=False)
-    monkeypatch.setattr("src.main.db.fetch", _stub_db_fetch, raising=False)
-    monkeypatch.setattr("src.main._generate_startbrief_bridge_llm", _stub_bridge_llm, raising=True)
-    monkeypatch.setattr("src.main._get_session_ingest_freshness", _stub_ingest_freshness, raising=True)
-    monkeypatch.setattr("src.main._log_startbrief_history", _stub_log_history, raising=True)
-    monkeypatch.setattr("src.main._build_entity_candidates", _stub_build_entity_candidates, raising=True)
-
-    response = await session_startbrief(
-        tenantId="default",
-        userId="u1",
-        now=now,
-        sessionId="session-test",
-        personaId=None,
-        timezone="UTC",
-    )
-    payload = response.model_dump()
-
-    provenance = ((payload.get("evidence") or {}).get("canonical_provenance") or {})
-    assert provenance.get("projection_version") == "t9a.startbrief_reanchor.v1"
-    assert int(provenance.get("canonical_claims_considered") or 0) >= 1
-    assert int(provenance.get("canonical_entities_considered") or 0) >= 1
-    watermarks = provenance.get("canonical_watermarks") or []
-    assert watermarks and int(watermarks[0].get("last_sequence") or 0) == 22
+        assert packet["provenance"]["projection_version"] == "derived.handover.v1"
+        assert packet["provenance"]["canonical_claims_considered"] == 0
+        assert packet["provenance"]["canonical_entities_considered"] == 0

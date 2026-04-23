@@ -15,7 +15,12 @@ The main improvements completed in this work period:
 - A lightweight last-mile synthesis validator removes unsupported dramatic phrasing while preserving output shape.
 - Seeded live-window review copies durable derived state before replay, so reviews test update-on-memory behavior instead of rediscovery from scratch.
 - Pass 3 thread creation now rejects weak one-off threads, requires evidence, and can update existing semantic threads instead of creating duplicates.
+- Pass 3 now reactivates matching resolved threads instead of creating sibling duplicates when the same topic returns.
+- Resolved relationship-state writes can now close older conflict threads instead of leaving stale relational tension active.
+- Thread audit now snoozes low-salience zombie threads rather than leaving static unresolved items active forever.
 - Thread title/detail entity conflicts are detected, quarantined, or conservatively repaired when the conflicting name is unsupported.
+- Conservative entity audit now sanitizes strongly supported legacy profile prose that still contains interpretive or motive-inferential language.
+- Endpoint safety-gate tests now verify `startbrief` and `handover` stay derived-only without canonical or Graphiti fallback helpers in the serving path.
 
 ## Verified Health
 
@@ -63,28 +68,18 @@ These areas are now good enough to stop treating as the main blocker:
 
 ## Remaining High-Leverage Work
 
-### 1. Thread Lifecycle Cleanup
+### 1. Conservative Profile Regeneration / Audit
 
-Finish the remaining Step 2 tracker items:
+Stored legacy profile text can still contain older interpretive phrasing outside the newly audited high-support cases.
 
-- Resolved relationship state resolves or supersedes old conflict thread.
-- Reactivation updates an existing thread instead of creating a duplicate.
-- Static zombie thread is degraded, snoozed, or flagged.
+The remaining work is:
 
-This is higher leverage than more prose filtering because stale or overlapping threads directly poison Pass 5.
-
-### 2. Conservative Profile Regeneration / Audit
-
-Stored legacy profile text can still contain older interpretive phrasing.
-
-The serving layer now sanitizes some of this, but the better fix is:
-
-- audit old profiles,
-- clear or regenerate contaminated profile text,
+- run the conservative audit against real stored profiles,
+- clear or regenerate only clearly contaminated high-signal rows,
 - keep evidence-backed facts,
-- avoid changing schemas or serving contracts.
+- avoid mutating ambiguous low-support cases automatically.
 
-### 3. Commit Hygiene Before Push
+### 2. Commit Hygiene Before Push
 
 Before pushing to GitHub:
 
@@ -103,7 +98,7 @@ These are useful but not urgent:
 - User-facing memory correction UI.
 - More review report formatting.
 
-These should come after lifecycle cleanup and profile audit hygiene.
+These should come after the profile audit pass on real stored data.
 
 ## Commit Recommendation
 

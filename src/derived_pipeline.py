@@ -23,6 +23,7 @@ from .derived_passes.pass15_entities import build_entity_profile, resolve_entity
 from .derived_passes.pass3_threads import audit_thread_registry, extract_thread_actions, VALID_CATEGORIES, VALID_PRIORITIES
 from .derived_passes.pass4_identity import normalize_identity_output, synthesize_identity_profile
 from .derived_passes.pass5_living_context import normalize_living_context_output, synthesize_living_context
+from .derived_passes.synthesis_quality import conservative_rewrite_text, has_synthesis_quality_issue
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,37 @@ SYSTEM_ENTITY_TYPES = {
     "repo",
     "repository",
     "other",
+}
+
+RELATIONSHIP_RESOLUTION_TERMS = {
+    "stable",
+    "steady",
+    "good terms",
+    "in a good place",
+    "reconnected",
+    "reconnecting",
+    "reconcile",
+    "reconciled",
+    "repair happened",
+    "partner again",
+    "together again",
+    "dating again",
+}
+
+RELATIONSHIP_CONFLICT_TERMS = {
+    "unresolved",
+    "tension",
+    "strained",
+    "distance",
+    "silent",
+    "silence",
+    "repair",
+    "breakup",
+    "broke up",
+    "conflict",
+    "unclear",
+    "not talking",
+    "no contact",
 }
 
 PROJECT_ENTITY_RELATIONSHIPS = {
@@ -1951,6 +1983,8 @@ def _thread_topic_key(*, title: Any, detail: Any, category: Any, related_entitie
     cat = normalize_text(category)
     if any(term in text for term in ("kidney stone", "kidney stones", "hydration", "electrolyte", "lemon water")):
         return "health:kidney_hydration"
+    if "gym" in text and any(term in text for term in ("routine", "workout", "training", "exercise")):
+        return "goal:gym_routine"
     if any(term in text for term in ("sophie", "assistant")) and any(
         term in text for term in ("memory", "reliability", "hallucinat", "gaslight", "repeat")
     ):
@@ -1983,6 +2017,92 @@ def _thread_topic_key(*, title: Any, detail: Any, category: Any, related_entitie
     return f"{cat or 'other'}:" + " ".join(sorted(set(words))[:8])
 
 
+def _text_has_any_term(value: Any, terms: set[str]) -> bool:
+    text = normalize_text(value).casefold()
+    return bool(text and any(term in text for term in terms))
+
+
+def _is_relationship_resolution_action(action: Dict[str, Any], *, category: str) -> bool:
+    if category != "relationship":
+        return False
+    if _unresolvedness(action.get("unresolvedness"), default="open") == "resolved":
+        return True
+    if _resolution_strength(action.get("evidence_strength")) == "weak":
+        return False
+    text = " ".join(
+        [
+            normalize_text(action.get("title")),
+            normalize_text(action.get("detail")),
+            normalize_text(action.get("why_this_matters_later")),
+        ]
+    )
+    return _text_has_any_term(text, RELATIONSHIP_RESOLUTION_TERMS)
+
+
+def _is_relationship_conflict_thread(row: Dict[str, Any]) -> bool:
+    if normalize_text(row.get("category")) != "relationship":
+        return False
+    text = " ".join(
+        [
+            normalize_text(row.get("title")),
+            normalize_text(row.get("detail")),
+            normalize_text(row.get("resolution_note")),
+        ]
+    )
+    return _text_has_any_term(text, RELATIONSHIP_CONFLICT_TERMS)
+
+
+def _thread_related_entity_set(row: Dict[str, Any]) -> set[str]:
+    entities = {
+        _canonical_name_norm(item)
+        for item in _text_list(row.get("related_entities"), limit=8)
+        if _canonical_name_norm(item)
+    }
+    return {item for item in entities if item}
+
+
+def _profile_supports_conservative_rewrite(row: Dict[str, Any]) -> bool:
+    try:
+        confidence = float(row.get("confidence") or 0.0)
+    except Exception:
+        confidence = 0.0
+    try:
+        salience = float(row.get("salience_score") or 0.0)
+    except Exception:
+        salience = 0.0
+    try:
+        importance = float(row.get("importance_score") or 0.0)
+    except Exception:
+        importance = 0.0
+    mention_count = int(row.get("mention_count") or 0)
+    distinct_sessions = int(row.get("distinct_session_count") or 0)
+    return (
+        confidence >= 0.85
+        or salience >= 0.8
+        or importance >= 0.8
+        or mention_count >= 3
+        or distinct_sessions >= 2
+    )
+
+
+def _is_static_zombie_thread(row: Dict[str, Any]) -> bool:
+    if normalize_text(row.get("status")) != "open":
+        return False
+    if normalize_text(row.get("thread_type")) == "persistent_goal":
+        return False
+    if normalize_text(row.get("lifecycle_state")) not in {"", "active"}:
+        return False
+    last_seen = row.get("last_mentioned_at") or row.get("last_updated_at") or row.get("first_seen_at")
+    if not isinstance(last_seen, datetime):
+        return False
+    if (_utcnow() - last_seen.astimezone(timezone.utc)) < timedelta(days=45):
+        return False
+    follow_up_after = row.get("follow_up_after")
+    if isinstance(follow_up_after, datetime) and follow_up_after.astimezone(timezone.utc) >= _utcnow():
+        return False
+    return True
+
+
 async def _find_existing_thread_for_topic(
     *,
     db: Database,
@@ -1991,6 +2111,7 @@ async def _find_existing_thread_for_topic(
     detail: Any,
     category: Any,
     related_entities: Any = None,
+    include_resolved: bool = False,
 ) -> Optional[Dict[str, Any]]:
     incoming_key = _thread_topic_key(
         title=title,
@@ -2006,7 +2127,10 @@ async def _find_existing_thread_for_topic(
                source_session_ids
         FROM open_threads
         WHERE user_id=$1
-          AND status IN ('open','snoozed')
+          AND (
+            status IN ('open','snoozed')
+            OR ($2 AND status='resolved')
+          )
         ORDER BY
           CASE status WHEN 'open' THEN 0 ELSE 1 END,
           last_mentioned_at DESC NULLS LAST,
@@ -2014,6 +2138,7 @@ async def _find_existing_thread_for_topic(
         LIMIT 80
         """,
         user_id,
+        include_resolved,
     )
     for row in rows:
         existing_key = _thread_topic_key(
@@ -2474,6 +2599,70 @@ async def run_pass3_threads(
                 for signal in thread_signals
             ]
 
+        async def _resolve_prior_relationship_threads(
+            *,
+            action: Dict[str, Any],
+            keep_thread_id: Optional[str] = None,
+        ) -> int:
+            related_entities = _thread_related_entity_set(action)
+            title_text = normalize_text(action.get("title"))
+            detail_text = normalize_text(action.get("detail"))
+            rows = await db.fetch(
+                """
+                SELECT thread_id, title, detail, category, status, lifecycle_state,
+                       related_entities, priority
+                FROM open_threads
+                WHERE user_id=$1
+                  AND status='open'
+                  AND category='relationship'
+                ORDER BY last_updated_at DESC NULLS LAST, created_at DESC
+                LIMIT 30
+                """,
+                user_id,
+            )
+            resolved_ids: List[str] = []
+            for row in rows:
+                thread_id = normalize_text(row.get("thread_id"))
+                if not thread_id or thread_id == normalize_text(keep_thread_id):
+                    continue
+                candidate_entities = _thread_related_entity_set(dict(row))
+                shares_entity = bool(related_entities and candidate_entities and related_entities & candidate_entities)
+                same_topic = _thread_topic_key(
+                    title=row.get("title"),
+                    detail=row.get("detail"),
+                    category=row.get("category"),
+                    related_entities=row.get("related_entities"),
+                ) == _thread_topic_key(
+                    title=title_text,
+                    detail=detail_text,
+                    category="relationship",
+                    related_entities=list(related_entities),
+                )
+                if not shares_entity and not same_topic:
+                    continue
+                if not _is_relationship_conflict_thread(dict(row)):
+                    continue
+                resolved_ids.append(thread_id)
+            if not resolved_ids:
+                return 0
+            await db.execute(
+                """
+                UPDATE open_threads
+                SET status='resolved',
+                    lifecycle_state=CASE WHEN $3::text IS NULL THEN 'resolved' ELSE 'superseded' END,
+                    superseded_by_thread_id=$3,
+                    resolution_note=COALESCE(NULLIF($4,''), 'Resolved by newer relationship state.'),
+                    resolved_at=NOW(),
+                    last_updated_at=NOW()
+                WHERE user_id=$1 AND thread_id = ANY($2::text[])
+                """,
+                user_id,
+                resolved_ids,
+                normalize_text(keep_thread_id) or None,
+                normalize_text(action.get("resolution_note") or action.get("why_this_matters_later") or action.get("detail")),
+            )
+            return len(resolved_ids)
+
         for action in actions:
             kind = normalize_text(action.get("action")).upper()
             if kind in {"NO_ACTION", ""}:
@@ -2531,6 +2720,8 @@ async def run_pass3_threads(
                         thread_id_existing,
                         normalize_text(action.get("resolution_note")) or "Resolved from latest context.",
                     )
+                    if _is_relationship_resolution_action(action, category=action_category):
+                        await _resolve_prior_relationship_threads(action=action, keep_thread_id=thread_id_existing)
                     continue
                 if kind == "SNOOZE":
                     await db.execute(
@@ -2624,6 +2815,11 @@ async def run_pass3_threads(
             priority = normalize_text(action.get("priority")) or "medium"
             if priority not in VALID_PRIORITIES:
                 priority = "medium"
+            related_entities = _text_list(action.get("related_entities"), limit=6)
+            if _is_relationship_resolution_action(action, category=category):
+                resolved_count = await _resolve_prior_relationship_threads(action=action)
+                if resolved_count > 0:
+                    continue
             if not _thread_action_allowed(action, kind=kind or "CREATE", category=category, priority=priority):
                 continue
             memory_layer, retention_floor = _memory_layer_and_floor(category)
@@ -2640,7 +2836,6 @@ async def run_pass3_threads(
                     run_id=run_id,
                 )
                 continue
-            related_entities = _text_list(action.get("related_entities"), limit=6)
             mismatch = await _thread_entity_mismatch(
                 db=db,
                 user_id=user_id,
@@ -2737,6 +2932,82 @@ async def run_pass3_threads(
                     confidence_extraction=0.7,
                     confidence_validity=0.58,
                     metadata={"thread_id": existing_topic_thread["thread_id"], "deduped_create": True},
+                )
+                continue
+            resolved_topic_thread = await _find_existing_thread_for_topic(
+                db=db,
+                user_id=user_id,
+                title=title,
+                detail=signal,
+                category=category,
+                related_entities=related_entities,
+                include_resolved=True,
+            )
+            if resolved_topic_thread and normalize_text(resolved_topic_thread.get("status")) == "resolved":
+                await db.execute(
+                    """
+                    UPDATE open_threads
+                    SET title=COALESCE(NULLIF($3,''), title),
+                        detail=COALESCE($4, detail),
+                        status='open',
+                        lifecycle_state='active',
+                        superseded_by_thread_id=NULL,
+                        resolution_note=NULL,
+                        resolved_at=NULL,
+                        source_session_ids=(
+                            SELECT ARRAY(
+                              SELECT DISTINCT x
+                              FROM unnest(COALESCE(source_session_ids, '{}') || $5::text[]) AS x
+                              WHERE x IS NOT NULL AND x <> ''
+                            )
+                        ),
+                        related_entities=(
+                            SELECT ARRAY(
+                              SELECT DISTINCT x
+                              FROM unnest(COALESCE(related_entities, '{}') || $6::text[]) AS x
+                              WHERE x IS NOT NULL AND x <> ''
+                            )
+                        ),
+                        evidence_turn_refs=COALESCE(evidence_turn_refs, '[]'::jsonb) || $7::jsonb,
+                        last_updated_at=NOW(),
+                        last_mentioned_at=NOW()
+                    WHERE user_id=$1 AND thread_id=$2
+                    """,
+                    user_id,
+                    resolved_topic_thread["thread_id"],
+                    title,
+                    signal or None,
+                    [session_id],
+                    related_entities,
+                    evidence_refs,
+                )
+                await db.execute(
+                    """
+                    UPDATE open_threads
+                    SET distinct_session_count=GREATEST(
+                        COALESCE(distinct_session_count, 0),
+                        COALESCE(cardinality(source_session_ids), 0)
+                    )
+                    WHERE user_id=$1 AND thread_id=$2
+                    """,
+                    user_id,
+                    resolved_topic_thread["thread_id"],
+                )
+                await _write_assertion(
+                    db=db,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    pass_name=PASS3_THREADS,
+                    surface="thread_update",
+                    statement_text=signal,
+                    run_id=run_id,
+                    source_session_ids=[session_id],
+                    source_turn_refs=evidence_refs,
+                    salience=0.68,
+                    importance=0.68,
+                    confidence_extraction=0.72,
+                    confidence_validity=0.6,
+                    metadata={"thread_id": resolved_topic_thread["thread_id"], "reactivated": True},
                 )
                 continue
             thread_id = stable_short_hash({"user_id": user_id, "thread": normalize_text(title)}, length=20)
@@ -3740,6 +4011,33 @@ async def run_thread_audit(
         )
         if not rows:
             continue
+        for row in rows:
+            if not _is_static_zombie_thread(dict(row)):
+                continue
+            priority = normalize_text(row.get("priority"))
+            try:
+                salience = float(row.get("salience_score") or 0.0)
+            except Exception:
+                salience = 0.0
+            try:
+                importance = float(row.get("importance_score") or 0.0)
+            except Exception:
+                importance = 0.0
+            if priority == "high" or max(salience, importance) >= 0.75:
+                summary["flagged"] += 1
+                continue
+            await db.execute(
+                """
+                UPDATE open_threads
+                SET status='snoozed',
+                    lifecycle_state='snoozed',
+                    last_updated_at=NOW()
+                WHERE user_id=$1 AND thread_id=$2
+                """,
+                uid,
+                row["thread_id"],
+            )
+            summary["snoozed"] += 1
         actions: List[Dict[str, Any]] = []
         if bool(s.derived_pipeline_llm_enabled):
             actions = await audit_thread_registry(
@@ -3859,20 +4157,24 @@ async def run_entity_audit(
     rows = await db.fetch(
         f"""
         SELECT user_id, canonical_name_normalized, canonical_name, type, relationship_to_user,
-               profile_text, key_facts, open_questions
+               profile_text, key_facts, open_questions, last_known_status,
+               confidence, mention_count, distinct_session_count,
+               salience_score, importance_score
         FROM entity_profiles
         WHERE 1=1 {user_filter}
         LIMIT 1000
         """,
         *args,
     )
-    summary = {"cleared": 0, "demoted": 0, "corrected": 0, "flagged": 0}
+    summary = {"cleared": 0, "demoted": 0, "corrected": 0, "sanitized_profiles": 0, "flagged": 0}
     for row in rows:
         canonical = normalize_text(row.get("canonical_name"))
         canonical_norm = normalize_text(row.get("canonical_name_normalized"))
         entity_type = normalize_text(row.get("type"))
         relationship = normalize_text(row.get("relationship_to_user"))
         relationship_key = relationship.replace(" ", "_")
+        profile_text = normalize_text(row.get("profile_text"), casefold=False)
+        status_text = normalize_text(row.get("last_known_status"), casefold=False)
         if _is_reserved_assistant_entity(canonical) and (entity_type != "assistant" or relationship != "assistant" or normalize_text(row.get("profile_text"))):
             await db.execute(
                 """
@@ -3903,6 +4205,26 @@ async def run_entity_audit(
                 canonical_norm,
             )
             summary["corrected"] += 1
+            continue
+        contaminated_profile = has_synthesis_quality_issue(profile_text) or has_synthesis_quality_issue(status_text)
+        if contaminated_profile:
+            if _profile_supports_conservative_rewrite(row):
+                await db.execute(
+                    """
+                    UPDATE entity_profiles
+                    SET profile_text=$3,
+                        last_known_status=$4,
+                        last_updated_at=NOW()
+                    WHERE user_id=$1 AND canonical_name_normalized=$2
+                    """,
+                    row["user_id"],
+                    canonical_norm,
+                    conservative_rewrite_text(profile_text, fallback=None),
+                    conservative_rewrite_text(status_text, fallback=None),
+                )
+                summary["sanitized_profiles"] += 1
+            else:
+                summary["flagged"] += 1
             continue
         if not _has_entity_serving_content(dict(row)):
             await db.execute(

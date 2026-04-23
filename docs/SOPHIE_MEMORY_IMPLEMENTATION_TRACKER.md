@@ -214,12 +214,12 @@ Implementation tasks:
 Tests required:
 - [x] Weak one-off plan is skipped.
 - [x] Real unresolved relationship tension creates or updates a thread.
-- [ ] Resolved relationship state resolves or supersedes old conflict thread.
-- [ ] Reactivation updates existing thread instead of creating duplicate.
+- [x] Resolved relationship state resolves or supersedes old conflict thread.
+- [x] Reactivation updates existing thread instead of creating duplicate.
 - [x] Invalid lifecycle transition writes quarantine.
 - [x] Thread without evidence is excluded from packet.
 - [x] Contaminated title/detail entity mismatch is excluded from Pass 5 packet and flagged in review.
-- [ ] Static zombie thread is degraded, snoozed, or flagged.
+- [x] Static zombie thread is degraded, snoozed, or flagged.
 
 Exit criteria:
 - Threads are fewer, evidence-backed, and future-relevant.
@@ -435,15 +435,15 @@ Exit criteria:
 
 These must remain true after every step.
 
-- [ ] `startbrief` remains derived-only.
-- [ ] `handover` remains derived-only.
-- [ ] No canonical factual lane leaks into serving authority.
-- [ ] No Graphiti authority path reappears.
-- [ ] No empty/null entity surfaces.
-- [ ] No assistant/system entity appears as a person.
-- [ ] No duplicate contradictions render.
-- [ ] No filler threads dominate packets.
-- [ ] Serving response shape is unchanged.
+- [x] `startbrief` remains derived-only.
+- [x] `handover` remains derived-only.
+- [x] No canonical factual lane leaks into serving authority.
+- [x] No Graphiti authority path reappears.
+- [x] No empty/null entity surfaces.
+- [x] No assistant/system entity appears as a person.
+- [x] No duplicate contradictions render.
+- [x] No filler threads dominate packets.
+- [x] Serving response shape is unchanged.
 
 ## Regression Commands
 
@@ -489,10 +489,10 @@ The work is not done until all are true:
 - [ ] Entity pollution is blocked.
 - [ ] Thread explosion is blocked.
 - [ ] Temporal reinforcement prevents one-off overfitting.
-- [ ] Conservative audits are active and safe.
+- [x] Conservative audits are active and safe.
 - [ ] Pass 4/5 packets are curated and inspectable.
 - [ ] Real 30-session review is materially better than the bad regression output.
 - [ ] Output is closer to the old good manual handover in specificity and groundedness.
 - [ ] Deterministic tests pass.
-- [ ] Serving shape is unchanged.
+- [x] Serving shape is unchanged.
 - [ ] No sensitive review output is committed.

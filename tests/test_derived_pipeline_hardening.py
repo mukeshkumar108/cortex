@@ -1499,6 +1499,186 @@ async def test_pass3_dedupes_semantic_hydration_create_into_existing_thread(monk
 
 
 @pytest.mark.asyncio
+async def test_pass3_reactivates_matching_resolved_thread_instead_of_creating_sibling(monkeypatch):
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.derived_pipeline_llm_enabled = True
+        tenant_id = "default"
+        user_id = _unique("thread-reactivate-user")
+        old_session_id = _unique("old-reactivate-session")
+        session_id = _unique("new-reactivate-session")
+        thread_id = _unique("reactivate-thread")
+        text = "I am back to working on the gym routine after letting it go quiet for months."
+        messages = [{"role": "user", "text": text, "timestamp": "2026-04-21T10:00:00Z"}]
+        await db.execute(
+            """
+            INSERT INTO session_classifications (
+                session_id, user_id, session_date, is_memory_worthy, session_kind,
+                one_line_summary, entity_mentions, run_entity_pass, run_threads_pass,
+                identity_relevant, emotional_weight, processed_at, model_used,
+                raw_triage_output, context_relevant
+            )
+            VALUES ($1,$2,NOW(),true,'personal','reactivate thread','{}'::text[],false,true,false,
+                    'medium',NOW(),'fixture',$3::jsonb,true)
+            """,
+            session_id,
+            user_id,
+            {"thread_signals": [text]},
+        )
+        await db.execute(
+            """
+            INSERT INTO open_threads (
+                thread_id, user_id, title, detail, status, priority, category,
+                source_session_ids, evidence_turn_refs, distinct_session_count,
+                lifecycle_state, created_at, last_updated_at, last_mentioned_at, resolved_at
+            )
+            VALUES (
+                $1,$2,'Gym routine restart','User had stopped going to the gym.','resolved','medium','goal',
+                $3::text[],$4::jsonb,1,'resolved',
+                NOW() - interval '60 days',NOW() - interval '45 days',NOW() - interval '45 days',NOW() - interval '45 days'
+            )
+            """,
+            thread_id,
+            user_id,
+            [old_session_id],
+            [{"session_id": old_session_id, "turn_index": 0, "text": "The gym routine had dropped off."}],
+        )
+
+        async def _actions_stub(**_kwargs):
+            return [
+                {
+                    "action": "CREATE",
+                    "title": "Gym routine restart",
+                    "detail": text,
+                    "category": "goal",
+                    "priority": "medium",
+                    "unresolvedness": "open",
+                    "follow_up_value": "medium",
+                    "evidence_strength": "strong",
+                    "why_this_matters_later": "The user explicitly says the routine is back in motion.",
+                }
+            ]
+
+        monkeypatch.setattr(derived_pipeline, "extract_thread_actions", _actions_stub, raising=True)
+
+        await run_pass3_threads(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            messages=messages,
+            settings=settings,
+        )
+
+        rows = await db.fetch(
+            """
+            SELECT thread_id, status, lifecycle_state, detail, source_session_ids, distinct_session_count
+            FROM open_threads
+            WHERE user_id=$1
+            """,
+            user_id,
+        )
+        assert len(rows) == 1
+        assert rows[0]["thread_id"] == thread_id
+        assert rows[0]["status"] == "open"
+        assert rows[0]["lifecycle_state"] == "active"
+        assert "back to working on the gym routine" in rows[0]["detail"]
+        assert set(rows[0]["source_session_ids"]) == {old_session_id, session_id}
+        assert rows[0]["distinct_session_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_pass3_relationship_resolution_supersedes_old_conflict_thread(monkeypatch):
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.derived_pipeline_llm_enabled = True
+        tenant_id = "default"
+        user_id = _unique("thread-resolution-user")
+        session_id = _unique("thread-resolution-session")
+        old_thread_id = _unique("old-relationship-thread")
+        text = "Things with Riley feel stable again and we are back on good terms."
+        messages = [{"role": "user", "text": text, "timestamp": "2026-04-21T10:00:00Z"}]
+        await db.execute(
+            """
+            INSERT INTO session_classifications (
+                session_id, user_id, session_date, is_memory_worthy, session_kind,
+                one_line_summary, entity_mentions, run_entity_pass, run_threads_pass,
+                identity_relevant, emotional_weight, processed_at, model_used,
+                raw_triage_output, context_relevant
+            )
+            VALUES ($1,$2,NOW(),true,'personal','relationship resolution',$3::text[],false,true,false,
+                    'high',NOW(),'fixture',$4::jsonb,true)
+            """,
+            session_id,
+            user_id,
+            ["Riley"],
+            {"thread_signals": [text]},
+        )
+        await db.execute(
+            """
+            INSERT INTO open_threads (
+                thread_id, user_id, title, detail, status, priority, category,
+                related_entities, source_session_ids, evidence_turn_refs,
+                lifecycle_state, created_at, last_updated_at, last_mentioned_at
+            )
+            VALUES (
+                $1,$2,'Relationship tension with Riley','The relationship with Riley still feels unresolved and strained.',
+                'open','high','relationship',$3::text[],$4::text[],$5::jsonb,
+                'active',NOW() - interval '20 days',NOW() - interval '5 days',NOW() - interval '5 days'
+            )
+            """,
+            old_thread_id,
+            user_id,
+            ["Riley"],
+            ["old-session"],
+            [{"session_id": "old-session", "turn_index": 0}],
+        )
+
+        async def _actions_stub(**_kwargs):
+            return [
+                {
+                    "action": "CREATE",
+                    "title": "Relationship with Riley is stable again",
+                    "detail": text,
+                    "category": "relationship",
+                    "priority": "high",
+                    "related_entities": ["Riley"],
+                    "unresolvedness": "resolved",
+                    "follow_up_value": "high",
+                    "evidence_strength": "strong",
+                    "why_this_matters_later": "The user explicitly says things are stable again.",
+                }
+            ]
+
+        monkeypatch.setattr(derived_pipeline, "extract_thread_actions", _actions_stub, raising=True)
+
+        await run_pass3_threads(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            messages=messages,
+            settings=settings,
+        )
+
+        rows = await db.fetch(
+            """
+            SELECT thread_id, status, lifecycle_state, superseded_by_thread_id, resolution_note
+            FROM open_threads
+            WHERE user_id=$1
+            ORDER BY created_at
+            """,
+            user_id,
+        )
+        assert len(rows) == 1
+        assert rows[0]["thread_id"] == old_thread_id
+        assert rows[0]["status"] == "resolved"
+        assert rows[0]["lifecycle_state"] == "resolved"
+        assert rows[0]["superseded_by_thread_id"] is None
+        assert "stable again" in (rows[0]["resolution_note"] or "").lower()
+
+
+@pytest.mark.asyncio
 async def test_pass3_quarantines_explicit_conflicting_thread_entity_create(monkeypatch):
     async with app.router.lifespan_context(app):
         settings = get_settings()
@@ -1762,6 +1942,42 @@ async def test_thread_audit_ambiguous_merge_flags_without_mutation(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_thread_audit_snoozes_static_zombie_thread_without_followup(monkeypatch):
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.derived_pipeline_llm_enabled = False
+        user_id = _unique("zombie-audit-user")
+        thread_id = _unique("zombie-thread")
+        await db.execute(
+            """
+            INSERT INTO open_threads (
+                thread_id, user_id, title, detail, status, priority, category,
+                thread_type, lifecycle_state, source_session_ids, evidence_turn_refs,
+                salience_score, importance_score,
+                created_at, last_updated_at, last_mentioned_at
+            )
+            VALUES (
+                $1,$2,'Old logistics thread','A thread that has gone nowhere for months.',
+                'open','medium','other','situational','active',$3::text[],$4::jsonb,
+                0.4,0.45,
+                NOW() - interval '90 days',NOW() - interval '70 days',NOW() - interval '70 days'
+            )
+            """,
+            thread_id,
+            user_id,
+            ["session-a"],
+            [{"session_id": "session-a", "turn_index": 0}],
+        )
+
+        summary = await run_thread_audit(db=db, tenant_id="default", user_id=user_id, settings=settings)
+        row = await db.fetchone("SELECT status, lifecycle_state FROM open_threads WHERE thread_id=$1", thread_id)
+
+        assert summary["snoozed"] == 1
+        assert row["status"] == "snoozed"
+        assert row["lifecycle_state"] == "snoozed"
+
+
+@pytest.mark.asyncio
 async def test_entity_audit_clears_assistant_contaminated_profile():
     async with app.router.lifespan_context(app):
         user_id = _unique("entity-audit-user")
@@ -1835,6 +2051,82 @@ async def test_entity_audit_corrects_project_typed_as_person():
         assert summary["corrected"] == 1
         assert row["type"] == "project"
         assert row["relationship_to_user"] == "active_project"
+
+
+@pytest.mark.asyncio
+async def test_entity_audit_sanitizes_strongly_supported_interpretive_profile_text():
+    async with app.router.lifespan_context(app):
+        user_id = _unique("entity-audit-sanitize-user")
+        await db.execute(
+            """
+            INSERT INTO entity_profiles (
+                user_id, canonical_name, canonical_name_normalized, type, aliases,
+                status, relationship_to_user, profile_text, key_facts, open_questions,
+                last_known_status, confidence, mention_count, distinct_session_count,
+                first_seen_at, last_seen_at, source_session_ids, salience_score, importance_score
+            ) VALUES (
+                $1,'Riley','riley','person',$2::text[],'active','partner',
+                'Riley is someone who seeks deep complexity and is trying to prove their love. Riley lives in Berlin.',
+                $3::jsonb,'[]'::jsonb,'The vibe is intense.',0.95,4,3,
+                NOW(),NOW(),$4::text[],0.9,0.9
+            )
+            """,
+            user_id,
+            ["Riley"],
+            [{"fact": "Riley lives in Berlin."}],
+            ["session-a", "session-b", "session-c"],
+        )
+
+        summary = await run_entity_audit(db=db, tenant_id="default", user_id=user_id)
+        row = await db.fetchone(
+            """
+            SELECT profile_text, last_known_status, key_facts
+            FROM entity_profiles
+            WHERE user_id=$1 AND canonical_name_normalized='riley'
+            """,
+            user_id,
+        )
+
+        assert summary["sanitized_profiles"] == 1
+        assert row["profile_text"] == "Riley lives in Berlin."
+        assert row["last_known_status"] is None
+        assert row["key_facts"] == [{"fact": "Riley lives in Berlin."}]
+
+
+@pytest.mark.asyncio
+async def test_entity_audit_flags_low_support_interpretive_profile_without_mutation():
+    async with app.router.lifespan_context(app):
+        user_id = _unique("entity-audit-flag-user")
+        await db.execute(
+            """
+            INSERT INTO entity_profiles (
+                user_id, canonical_name, canonical_name_normalized, type, aliases,
+                status, relationship_to_user, profile_text, key_facts, open_questions,
+                confidence, mention_count, distinct_session_count,
+                first_seen_at, last_seen_at, source_session_ids, salience_score, importance_score
+            ) VALUES (
+                $1,'Casey','casey','person',$2::text[],'active','friend',
+                'Casey is someone who seeks deep complexity.', '[]'::jsonb,'[]'::jsonb,
+                0.45,1,1,NOW(),NOW(),$3::text[],0.3,0.3
+            )
+            """,
+            user_id,
+            ["Casey"],
+            ["session-a"],
+        )
+
+        summary = await run_entity_audit(db=db, tenant_id="default", user_id=user_id)
+        row = await db.fetchone(
+            """
+            SELECT profile_text
+            FROM entity_profiles
+            WHERE user_id=$1 AND canonical_name_normalized='casey'
+            """,
+            user_id,
+        )
+
+        assert summary["flagged"] == 1
+        assert row["profile_text"] == "Casey is someone who seeks deep complexity."
 
 
 @pytest.mark.asyncio
