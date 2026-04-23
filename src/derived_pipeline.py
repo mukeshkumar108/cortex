@@ -32,6 +32,7 @@ PASS1_5_ENTITIES = "pass1_5_entities"
 PASS3_THREADS = "pass3_threads"
 PASS4_IDENTITY = "pass4_identity"
 PASS5_LIVING_CONTEXT = "pass5_living_context"
+PASS_RETROSPECTIVE_V1 = "retrospective_worker_v1"
 
 QUARANTINE_PARSE_FAILURE = "parse_failure"
 QUARANTINE_MISSING_EVIDENCE_REFS = "missing_evidence_refs"
@@ -54,6 +55,9 @@ EXCLUSIVE_SLOTS = {
 
 SILENCE_ENTITY_THRESHOLD_DAYS = 30
 SILENCE_THREAD_THRESHOLD_DAYS = 30
+RETROSPECTIVE_SESSION_THRESHOLD = 3
+RETROSPECTIVE_LOW_CONFIDENCE_CLOSE_DAYS = 21
+RETROSPECTIVE_LOW_CONFIDENCE_PRUNE_DAYS = 45
 
 SILENCE_IMPORTANT_RELATIONSHIPS = {
     "partner",
@@ -3177,6 +3181,76 @@ async def _living_context_session_window(db: Database, *, user_id: str) -> List[
     return rows[:30]
 
 
+async def _retrospective_candidate_users(
+    *,
+    db: Database,
+    tenant_id: str = "default",
+    user_id: Optional[str] = None,
+) -> List[str]:
+    if user_id:
+        return [user_id]
+    candidates: List[str] = []
+    retrospective_rows = await db.fetch(
+        """
+        SELECT DISTINCT sc.user_id
+        FROM session_classifications sc
+        LEFT JOIN pipeline_checkpoints pc
+          ON pc.user_id = sc.user_id
+         AND pc.pipeline_name = $2
+        WHERE sc.is_memory_worthy IS TRUE
+          AND (
+            pc.last_processed IS NULL
+            OR sc.processed_at > pc.last_processed
+            OR sc.session_date > pc.last_processed
+          )
+        GROUP BY sc.user_id
+        HAVING COUNT(*) >= $1
+        LIMIT 500
+        """,
+        int(RETROSPECTIVE_SESSION_THRESHOLD),
+        PASS_RETROSPECTIVE_V1,
+    )
+    for row in retrospective_rows or []:
+        clean = normalize_text(row.get("user_id"))
+        if clean and clean not in candidates:
+            candidates.append(clean)
+    stale_low_conf_rows = await db.fetch(
+        """
+        SELECT DISTINCT user_id
+        FROM low_confidence_items
+        WHERE tenant_id=$1
+          AND status='open'
+          AND (
+            last_seen_at < NOW() - ($2::text || ' days')::interval
+            OR first_seen_at < NOW() - ($3::text || ' days')::interval
+          )
+        LIMIT 500
+        """,
+        tenant_id,
+        str(RETROSPECTIVE_LOW_CONFIDENCE_CLOSE_DAYS),
+        str(RETROSPECTIVE_LOW_CONFIDENCE_PRUNE_DAYS),
+    )
+    for row in stale_low_conf_rows or []:
+        clean = normalize_text(row.get("user_id"))
+        if clean and clean not in candidates:
+            candidates.append(clean)
+    zombie_thread_rows = await db.fetch(
+        """
+        SELECT DISTINCT user_id
+        FROM open_threads
+        WHERE status='open'
+          AND last_mentioned_at IS NOT NULL
+          AND last_mentioned_at < NOW() - interval '45 days'
+        LIMIT 500
+        """
+    )
+    for row in zombie_thread_rows or []:
+        clean = normalize_text(row.get("user_id"))
+        if clean and clean not in candidates:
+            candidates.append(clean)
+    return candidates
+
+
 def _packet_evidence_strength(source_session_ids: Any, distinct_session_count: Any = None) -> str:
     try:
         count = int(distinct_session_count or 0)
@@ -4252,6 +4326,141 @@ async def run_entity_audit(
     return summary
 
 
+async def _close_stale_low_confidence_items(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+) -> Dict[str, int]:
+    close_result = await db.execute(
+        """
+        UPDATE low_confidence_items
+        SET status='expired',
+            resolved_at=NOW()
+        WHERE tenant_id=$1
+          AND user_id=$2
+          AND status='open'
+          AND COALESCE(confidence, 0.0) > 0.35
+          AND COALESCE(confidence, 1.0) <= 0.55
+          AND COALESCE(cardinality(source_session_ids), 0) <= 1
+          AND last_seen_at < NOW() - ($3::text || ' days')::interval
+        """,
+        tenant_id,
+        user_id,
+        str(RETROSPECTIVE_LOW_CONFIDENCE_CLOSE_DAYS),
+    )
+    prune_result = await db.execute(
+        """
+        UPDATE low_confidence_items
+        SET status='dismissed',
+            resolved_at=NOW()
+        WHERE tenant_id=$1
+          AND user_id=$2
+          AND status='open'
+          AND COALESCE(confidence, 0.0) <= 0.35
+          AND COALESCE(cardinality(source_session_ids), 0) <= 1
+          AND first_seen_at < NOW() - ($3::text || ' days')::interval
+        """,
+        tenant_id,
+        user_id,
+        str(RETROSPECTIVE_LOW_CONFIDENCE_PRUNE_DAYS),
+    )
+    summary = {"closed": 0, "pruned": 0}
+    try:
+        summary["closed"] = int((close_result or "").split()[-1])
+    except Exception:
+        summary["closed"] = 0
+    try:
+        summary["pruned"] = int((prune_result or "").split()[-1])
+    except Exception:
+        summary["pruned"] = 0
+    return summary
+
+
+async def run_retrospective_worker_v1(
+    *,
+    db: Database,
+    tenant_id: str = "default",
+    user_id: Optional[str] = None,
+    settings: Optional[Settings] = None,
+) -> Dict[str, Any]:
+    s = settings or get_settings()
+    users = await _retrospective_candidate_users(db=db, tenant_id=tenant_id, user_id=user_id)
+    summary: Dict[str, Any] = {
+        "users_considered": len(users),
+        "users_processed": 0,
+        "low_confidence_closed": 0,
+        "low_confidence_pruned": 0,
+        "threads_merged": 0,
+        "threads_resolved": 0,
+        "threads_snoozed": 0,
+        "threads_flagged": 0,
+    }
+    for uid in users:
+        latest_session = await db.fetchone(
+            """
+            SELECT session_id
+            FROM session_classifications
+            WHERE user_id=$1 AND is_memory_worthy IS TRUE
+            ORDER BY processed_at DESC NULLS LAST, session_date DESC NULLS LAST
+            LIMIT 1
+            """,
+            uid,
+        )
+        latest_session_id = normalize_text((latest_session or {}).get("session_id")) or None
+        input_hash = _input_hash(
+            tenant_id=tenant_id,
+            user_id=uid,
+            session_id=latest_session_id,
+            pass_name=PASS_RETROSPECTIVE_V1,
+            extra={"latest_session_id": latest_session_id},
+            settings=s,
+        )
+        run_id = await _start_run(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=uid,
+            session_id=latest_session_id,
+            pass_name=PASS_RETROSPECTIVE_V1,
+            input_hash=input_hash,
+            input_watermark=latest_session_id,
+            settings=s,
+        )
+        existing = await _succeeded_run(db, run_id)
+        if existing:
+            summary["users_processed"] += 1
+            continue
+        try:
+            low_conf_summary = await _close_stale_low_confidence_items(db=db, tenant_id=tenant_id, user_id=uid)
+            thread_summary = await run_thread_audit(db=db, tenant_id=tenant_id, user_id=uid, settings=s)
+            output = {
+                "low_confidence": low_conf_summary,
+                "threads": thread_summary,
+            }
+            output_hash = stable_short_hash(output, length=24)
+            await _complete_run(db, run_id, output_hash)
+            await _update_checkpoint(
+                db=db,
+                tenant_id=tenant_id,
+                user_id=uid,
+                pipeline_name=PASS_RETROSPECTIVE_V1,
+                run_id=run_id,
+                input_watermark=latest_session_id,
+                output_hash=output_hash,
+            )
+            summary["users_processed"] += 1
+            summary["low_confidence_closed"] += int(low_conf_summary.get("closed") or 0)
+            summary["low_confidence_pruned"] += int(low_conf_summary.get("pruned") or 0)
+            summary["threads_merged"] += int(thread_summary.get("merged") or 0)
+            summary["threads_resolved"] += int(thread_summary.get("resolved") or 0)
+            summary["threads_snoozed"] += int(thread_summary.get("snoozed") or 0)
+            summary["threads_flagged"] += int(thread_summary.get("flagged") or 0)
+        except Exception as exc:
+            await _fail_run(db, run_id, "retrospective_v1_failed", str(exc))
+            raise
+    return summary
+
+
 async def run_conservative_memory_audits(
     *,
     db: Database,
@@ -4260,7 +4469,16 @@ async def run_conservative_memory_audits(
 ) -> Dict[str, Dict[str, int]]:
     thread_summary = await run_thread_audit(db=db, tenant_id=tenant_id, settings=settings)
     entity_summary = await run_entity_audit(db=db, tenant_id=tenant_id)
-    return {"threads": thread_summary, "entities": entity_summary}
+    retrospective_summary = await run_retrospective_worker_v1(
+        db=db,
+        tenant_id=tenant_id,
+        settings=settings,
+    )
+    return {
+        "threads": thread_summary,
+        "entities": entity_summary,
+        "retrospective": retrospective_summary,
+    }
 
 
 async def run_reinforcement_decay(*, db: Database, tenant_id: str = "default") -> int:

@@ -13,6 +13,7 @@ from src.derived_pipeline import (
     PASS3_THREADS,
     PASS4_IDENTITY,
     PASS5_LIVING_CONTEXT,
+    PASS_RETROSPECTIVE_V1,
     build_pass4_identity_packet,
     build_pass5_living_packet,
     run_pass1_5_entities,
@@ -20,9 +21,11 @@ from src.derived_pipeline import (
     run_pass3_threads,
     run_pass4_identity,
     run_pass5_living_context,
+    run_retrospective_worker_v1,
     run_entity_audit,
     run_silence_detection,
     run_thread_audit,
+    run_conservative_memory_audits,
 )
 import src.derived_pipeline as derived_pipeline
 from src.derived_passes.pass4_identity import IDENTITY_SYNTHESIS_PROMPT, normalize_identity_output
@@ -1989,6 +1992,136 @@ async def test_thread_audit_snoozes_static_zombie_thread_without_followup(monkey
         assert summary["snoozed"] == 1
         assert row["status"] == "snoozed"
         assert row["lifecycle_state"] == "snoozed"
+
+
+@pytest.mark.asyncio
+async def test_retrospective_worker_runs_after_three_new_memory_worthy_sessions_and_writes_checkpoint():
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.derived_pipeline_llm_enabled = False
+        user_id = _unique("retro-user")
+
+        for idx in range(3):
+            await db.execute(
+                """
+                INSERT INTO session_classifications (
+                    session_id, user_id, session_date, is_memory_worthy, session_kind,
+                    one_line_summary, run_entity_pass, run_threads_pass,
+                    identity_relevant, emotional_weight, processed_at, model_used, context_relevant
+                )
+                VALUES (
+                    $1,$2,NOW() - ($3::text || ' days')::interval,true,'personal',
+                    'retrospective candidate',false,false,false,
+                    'low',NOW() - ($3::text || ' days')::interval,'fixture',false
+                )
+                """,
+                _unique(f"retro-session-{idx}"),
+                user_id,
+                str(3 - idx),
+            )
+
+        first = await run_retrospective_worker_v1(
+            db=db,
+            tenant_id="default",
+            settings=settings,
+        )
+        checkpoint = await db.fetchone(
+            """
+            SELECT pipeline_name, last_success_run_id, last_output_hash
+            FROM pipeline_checkpoints
+            WHERE user_id=$1 AND pipeline_name=$2
+            """,
+            user_id,
+            PASS_RETROSPECTIVE_V1,
+        )
+        assert first["users_considered"] >= 1
+        assert first["users_processed"] >= 1
+        assert checkpoint
+        assert checkpoint["pipeline_name"] == PASS_RETROSPECTIVE_V1
+        assert checkpoint["last_success_run_id"] is not None
+        assert checkpoint["last_output_hash"]
+
+
+@pytest.mark.asyncio
+async def test_retrospective_worker_closes_and_prunes_stale_low_confidence_items():
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.derived_pipeline_llm_enabled = False
+        user_id = _unique("retro-low-conf-user")
+
+        await db.execute(
+            """
+            INSERT INTO low_confidence_items (
+                tenant_id, user_id, surface, statement_text, question_text, confidence,
+                source_session_ids, source_turn_refs, first_seen_at, last_seen_at, status
+            )
+            VALUES
+            (
+                'default',$1,'memory_delta','Relationship status is unclear.','Is the relationship still current?',0.45,
+                ARRAY['session-close']::text[],'[]'::jsonb,
+                NOW() - interval '30 days',NOW() - interval '30 days','open'
+            ),
+            (
+                'default',$1,'entity_profile','A weak maybe-fact.','Did this ever matter?',0.2,
+                ARRAY['session-prune']::text[],'[]'::jsonb,
+                NOW() - interval '60 days',NOW() - interval '50 days','open'
+            )
+            """,
+            user_id,
+        )
+
+        summary = await run_retrospective_worker_v1(
+            db=db,
+            tenant_id="default",
+            settings=settings,
+        )
+        rows = await db.fetch(
+            """
+            SELECT statement_text, status, resolved_at
+            FROM low_confidence_items
+            WHERE user_id=$1
+            ORDER BY item_id
+            """,
+            user_id,
+        )
+
+        assert summary["low_confidence_closed"] >= 1
+        assert summary["low_confidence_pruned"] >= 1
+        assert [row["status"] for row in rows] == ["expired", "dismissed"]
+        assert all(row["resolved_at"] is not None for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_conservative_memory_audits_include_retrospective_summary():
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.derived_pipeline_llm_enabled = False
+        user_id = _unique("retro-audit-loop-user")
+
+        await db.execute(
+            """
+            INSERT INTO low_confidence_items (
+                tenant_id, user_id, surface, statement_text, question_text, confidence,
+                source_session_ids, source_turn_refs, first_seen_at, last_seen_at, status
+            )
+            VALUES (
+                'default',$1,'memory_delta','Old ambiguous note.','Does this still matter?',0.45,
+                ARRAY['session-retro']::text[],'[]'::jsonb,
+                NOW() - interval '30 days',NOW() - interval '30 days','open'
+            )
+            """,
+            user_id,
+        )
+
+        summary = await run_conservative_memory_audits(
+            db=db,
+            tenant_id="default",
+            settings=settings,
+        )
+
+        assert set(summary.keys()) == {"threads", "entities", "retrospective"}
+        assert summary["retrospective"]["users_considered"] >= 1
+        assert summary["retrospective"]["low_confidence_closed"] >= 1
 
 
 @pytest.mark.asyncio
