@@ -4150,94 +4150,105 @@ async def run_entity_audit(
     db: Database,
     tenant_id: str = "default",
     user_id: Optional[str] = None,
+    batch_size: int = 1000,
 ) -> Dict[str, int]:
     del tenant_id  # entity_profiles is currently user-scoped.
     user_filter = "AND user_id=$1" if user_id else ""
-    args: List[Any] = [user_id] if user_id else []
-    rows = await db.fetch(
-        f"""
-        SELECT user_id, canonical_name_normalized, canonical_name, type, relationship_to_user,
-               profile_text, key_facts, open_questions, last_known_status,
-               confidence, mention_count, distinct_session_count,
-               salience_score, importance_score
-        FROM entity_profiles
-        WHERE 1=1 {user_filter}
-        LIMIT 1000
-        """,
-        *args,
-    )
     summary = {"cleared": 0, "demoted": 0, "corrected": 0, "sanitized_profiles": 0, "flagged": 0}
-    for row in rows:
-        canonical = normalize_text(row.get("canonical_name"))
-        canonical_norm = normalize_text(row.get("canonical_name_normalized"))
-        entity_type = normalize_text(row.get("type"))
-        relationship = normalize_text(row.get("relationship_to_user"))
-        relationship_key = relationship.replace(" ", "_")
-        profile_text = normalize_text(row.get("profile_text"), casefold=False)
-        status_text = normalize_text(row.get("last_known_status"), casefold=False)
-        if _is_reserved_assistant_entity(canonical) and (entity_type != "assistant" or relationship != "assistant" or normalize_text(row.get("profile_text"))):
-            await db.execute(
-                """
-                UPDATE entity_profiles
-                SET type='assistant',
-                    relationship_to_user='assistant',
-                    profile_text=NULL,
-                    key_facts='[]'::jsonb,
-                    open_questions='[]'::jsonb,
-                    last_known_status=NULL,
-                    last_updated_at=NOW()
-                WHERE user_id=$1 AND canonical_name_normalized=$2
-                """,
-                row["user_id"],
-                canonical_norm,
-            )
-            summary["cleared"] += 1
-            continue
-        if relationship_key in PROJECT_ENTITY_RELATIONSHIPS and entity_type == "person":
-            await db.execute(
-                """
-                UPDATE entity_profiles
-                SET type='project',
-                    last_updated_at=NOW()
-                WHERE user_id=$1 AND canonical_name_normalized=$2
-                """,
-                row["user_id"],
-                canonical_norm,
-            )
-            summary["corrected"] += 1
-            continue
-        contaminated_profile = has_synthesis_quality_issue(profile_text) or has_synthesis_quality_issue(status_text)
-        if contaminated_profile:
-            if _profile_supports_conservative_rewrite(row):
+    offset = 0
+    safe_batch_size = max(1, int(batch_size or 1000))
+    while True:
+        args: List[Any] = [user_id] if user_id else []
+        args.extend([safe_batch_size, offset])
+        rows = await db.fetch(
+            f"""
+            SELECT user_id, canonical_name_normalized, canonical_name, type, relationship_to_user,
+                   profile_text, key_facts, open_questions, last_known_status,
+                   confidence, mention_count, distinct_session_count,
+                   salience_score, importance_score
+            FROM entity_profiles
+            WHERE 1=1 {user_filter}
+            ORDER BY user_id, canonical_name_normalized
+            LIMIT ${2 if user_id else 1} OFFSET ${3 if user_id else 2}
+            """,
+            *args,
+        )
+        if not rows:
+            break
+        for row in rows:
+            canonical = normalize_text(row.get("canonical_name"))
+            canonical_norm = normalize_text(row.get("canonical_name_normalized"))
+            entity_type = normalize_text(row.get("type"))
+            relationship = normalize_text(row.get("relationship_to_user"))
+            relationship_key = relationship.replace(" ", "_")
+            profile_text = normalize_text(row.get("profile_text"), casefold=False)
+            status_text = normalize_text(row.get("last_known_status"), casefold=False)
+            if _is_reserved_assistant_entity(canonical) and (entity_type != "assistant" or relationship != "assistant" or normalize_text(row.get("profile_text"))):
                 await db.execute(
                     """
                     UPDATE entity_profiles
-                    SET profile_text=$3,
-                        last_known_status=$4,
+                    SET type='assistant',
+                        relationship_to_user='assistant',
+                        profile_text=NULL,
+                        key_facts='[]'::jsonb,
+                        open_questions='[]'::jsonb,
+                        last_known_status=NULL,
                         last_updated_at=NOW()
                     WHERE user_id=$1 AND canonical_name_normalized=$2
                     """,
                     row["user_id"],
                     canonical_norm,
-                    conservative_rewrite_text(profile_text, fallback=None),
-                    conservative_rewrite_text(status_text, fallback=None),
                 )
-                summary["sanitized_profiles"] += 1
-            else:
-                summary["flagged"] += 1
-            continue
-        if not _has_entity_serving_content(dict(row)):
-            await db.execute(
-                """
-                UPDATE entity_profiles
-                SET status='tentative',
-                    last_updated_at=NOW()
-                WHERE user_id=$1 AND canonical_name_normalized=$2 AND status='active'
-                """,
-                row["user_id"],
-                canonical_norm,
-            )
-            summary["demoted"] += 1
+                summary["cleared"] += 1
+                continue
+            if relationship_key in PROJECT_ENTITY_RELATIONSHIPS and entity_type == "person":
+                await db.execute(
+                    """
+                    UPDATE entity_profiles
+                    SET type='project',
+                        last_updated_at=NOW()
+                    WHERE user_id=$1 AND canonical_name_normalized=$2
+                    """,
+                    row["user_id"],
+                    canonical_norm,
+                )
+                summary["corrected"] += 1
+                continue
+            contaminated_profile = has_synthesis_quality_issue(profile_text) or has_synthesis_quality_issue(status_text)
+            if contaminated_profile:
+                if _profile_supports_conservative_rewrite(row):
+                    await db.execute(
+                        """
+                        UPDATE entity_profiles
+                        SET profile_text=$3,
+                            last_known_status=$4,
+                            last_updated_at=NOW()
+                        WHERE user_id=$1 AND canonical_name_normalized=$2
+                        """,
+                        row["user_id"],
+                        canonical_norm,
+                        conservative_rewrite_text(profile_text, fallback=None),
+                        conservative_rewrite_text(status_text, fallback=None),
+                    )
+                    summary["sanitized_profiles"] += 1
+                else:
+                    summary["flagged"] += 1
+                continue
+            if not _has_entity_serving_content(dict(row)):
+                await db.execute(
+                    """
+                    UPDATE entity_profiles
+                    SET status='tentative',
+                        last_updated_at=NOW()
+                    WHERE user_id=$1 AND canonical_name_normalized=$2 AND status='active'
+                    """,
+                    row["user_id"],
+                    canonical_norm,
+                )
+                summary["demoted"] += 1
+        if len(rows) < safe_batch_size:
+            break
+        offset += safe_batch_size
     return summary
 
 

@@ -54,6 +54,7 @@ _MOTIVE_RE = re.compile(
 )
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_CLAUSE_SPLIT_RE = re.compile(r"\s*[;:]\s*")
 
 
 def synthesis_quality_flags(value: Any) -> List[str]:
@@ -83,11 +84,18 @@ def conservative_rewrite_text(value: Any, *, fallback: str | None = None) -> str
     if not has_synthesis_quality_issue(text):
         return text
 
-    kept = [
-        sentence.strip()
-        for sentence in _SENTENCE_SPLIT_RE.split(text)
-        if sentence.strip() and not has_synthesis_quality_issue(sentence)
-    ]
+    kept: List[str] = []
+    for sentence in _SENTENCE_SPLIT_RE.split(text):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if not has_synthesis_quality_issue(sentence):
+            kept.append(sentence)
+            continue
+        clauses = [clause.strip(" ,") for clause in _CLAUSE_SPLIT_RE.split(sentence) if clause.strip(" ,")]
+        safe_clauses = [clause for clause in clauses if clause and not has_synthesis_quality_issue(clause)]
+        if safe_clauses:
+            kept.append("; ".join(safe_clauses).strip())
     rewritten = " ".join(kept).strip()
     if rewritten:
         return rewritten

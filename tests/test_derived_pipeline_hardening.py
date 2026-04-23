@@ -188,6 +188,20 @@ def test_synthesis_quality_rewrites_entity_profile_overreach_without_shape_chang
     )
 
 
+def test_synthesis_quality_rewrites_mixed_clause_sentence_and_keeps_factual_tail():
+    profile = (
+        "Ashley is the user's long-term, long-distance girlfriend. "
+        "Their relationship has been quite a rollercoaster lately; they went through a difficult breakup in late February."
+    )
+
+    rewritten = conservative_rewrite_text(profile)
+
+    assert rewritten == (
+        "Ashley is the user's long-term, long-distance girlfriend. "
+        "they went through a difficult breakup in late February."
+    )
+
+
 @pytest.mark.asyncio
 async def test_pass1_writes_traceable_assertions_and_is_idempotent():
     async with app.router.lifespan_context(app):
@@ -2127,6 +2141,47 @@ async def test_entity_audit_flags_low_support_interpretive_profile_without_mutat
 
         assert summary["flagged"] == 1
         assert row["profile_text"] == "Casey is someone who seeks deep complexity."
+
+
+@pytest.mark.asyncio
+async def test_entity_audit_scans_beyond_first_batch():
+    async with app.router.lifespan_context(app):
+        user_id = _unique("entity-audit-batch-user")
+        for idx, name in enumerate(["Riley", "Jordan", "Ashley"], start=1):
+            await db.execute(
+                """
+                INSERT INTO entity_profiles (
+                    user_id, canonical_name, canonical_name_normalized, type, aliases,
+                    status, relationship_to_user, profile_text, key_facts, open_questions,
+                    confidence, mention_count, distinct_session_count,
+                    first_seen_at, last_seen_at, source_session_ids, salience_score, importance_score
+                ) VALUES (
+                    $1,$2,$3,'person',$4::text[],'active','partner',
+                    'This relationship has been quite a rollercoaster lately; they reconciled after a difficult breakup.',
+                    '[]'::jsonb,'[]'::jsonb,
+                    0.95,4,3,NOW(),NOW(),$5::text[],0.9,0.9
+                )
+                """,
+                user_id,
+                name,
+                name.lower(),
+                [name],
+                [f"session-{idx}"],
+            )
+
+        summary = await run_entity_audit(db=db, tenant_id="default", user_id=user_id, batch_size=2)
+        rows = await db.fetch(
+            """
+            SELECT canonical_name, profile_text
+            FROM entity_profiles
+            WHERE user_id=$1
+            ORDER BY canonical_name
+            """,
+            user_id,
+        )
+
+        assert summary["sanitized_profiles"] == 3
+        assert all("rollercoaster" not in (row["profile_text"] or "").lower() for row in rows)
 
 
 @pytest.mark.asyncio
