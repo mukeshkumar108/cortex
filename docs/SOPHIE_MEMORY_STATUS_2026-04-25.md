@@ -75,6 +75,22 @@ As of 2026-04-25:
 - Added:
   - `docs/SOPHIE_ALWAYS_ON_MEMORY_PACKET_SPEC.md`
 
+### 9) Proactive shadow queue scaffolding (2026-04-25 evening update)
+
+- Added shadow candidate storage tables and migration:
+  - `migrations/050_proactive_shadow_candidates.sql`
+  - `follow_up_candidates`
+  - `clarification_candidates`
+  - `recent_change_candidates`
+- Added candidate compilation worker in derived pipeline:
+  - `run_proactive_shadow_candidates(...)`
+- Added background loop in API runtime (shadow mode only, no user delivery path):
+  - `proactive_shadow_candidates_loop(...)`
+- Added debug endpoints:
+  - `POST /internal/debug/proactive-shadow/rebuild`
+  - `GET /internal/debug/proactive-shadow/candidates`
+- Added integration test coverage for shadow queue population.
+
 ## Validation Notes
 
 Recent targeted validations passed after final fixes:
@@ -83,7 +99,8 @@ Recent targeted validations passed after final fixes:
 - targeted hardening tests for:
   - packet compiler behavior,
   - always-on packet filters/shape,
-  - pass1.5 tiered relationship promotion/scoring.
+  - pass1.5 tiered relationship promotion/scoring,
+  - proactive shadow candidate population across all three queues.
 
 Also fixed a test bug in `tests/test_derived_pipeline_hardening.py` (`tenant_id` NameError in packet compiler test setup).
 

@@ -22,6 +22,7 @@ from src.derived_pipeline import (
     run_pass3_threads,
     run_pass4_identity,
     run_pass5_living_context,
+    run_proactive_shadow_candidates,
     run_retrospective_worker_v1,
     run_entity_audit,
     run_silence_detection,
@@ -3048,6 +3049,125 @@ async def test_entity_audit_scans_beyond_first_batch():
 
         assert summary["sanitized_profiles"] == 3
         assert all("rollercoaster" not in (row["profile_text"] or "").lower() for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_proactive_shadow_candidates_populate_all_three_queues():
+    async with app.router.lifespan_context(app):
+        tenant_id = "default"
+        user_id = _unique("proactive-shadow-user")
+        session_id = _unique("proactive-shadow-session")
+        run_row = await db.fetchone(
+            """
+            INSERT INTO pipeline_runs (
+                tenant_id, user_id, session_id, pass_name, model_version, prompt_version,
+                policy_version, input_hash, status, started_at, completed_at
+            ) VALUES (
+                $1,$2,$3,$4,'fixture','fixture','derived.v1','hash-fixture','succeeded',NOW(),NOW()
+            )
+            RETURNING run_id
+            """,
+            tenant_id,
+            user_id,
+            session_id,
+            PASS5_LIVING_CONTEXT,
+        )
+        run_id = int((run_row or {}).get("run_id") or 0)
+        assert run_id > 0
+
+        await db.execute(
+            """
+            INSERT INTO open_threads (
+                thread_id, user_id, title, detail, status, priority, category,
+                source_session_ids, evidence_turn_refs, distinct_session_count,
+                salience_score, importance_score, follow_up_after,
+                lifecycle_state, created_at, last_updated_at, last_mentioned_at
+            ) VALUES (
+                $1,$2,'Client call follow-up',
+                'User had a difficult client call and wanted to revisit the outcome.',
+                'open','high','project',$3::text[],$4::jsonb,2,0.84,0.88,
+                NOW() + interval '2 hours','active',NOW(),NOW(),NOW()
+            )
+            """,
+            _unique("proactive-thread"),
+            user_id,
+            ["s1", "s2"],
+            [{"session_id": "s2", "turn_index": 0}],
+        )
+
+        await db.execute(
+            """
+            INSERT INTO low_confidence_items (
+                tenant_id, user_id, surface, statement_text, question_text, confidence,
+                status, source_session_ids, source_turn_refs, run_id, first_seen_at, last_seen_at
+            ) VALUES (
+                $1,$2,'living_context.statement',
+                'User mentioned changing travel plans but details were unclear.',
+                'You mentioned changing travel plans — is that still active?',
+                0.31,'open',$3::text[],$4::jsonb,$5,NOW(),NOW()
+            )
+            """,
+            tenant_id,
+            user_id,
+            ["s2"],
+            [{"session_id": "s2", "turn_index": 1}],
+            run_id,
+        )
+
+        await db.execute(
+            """
+            INSERT INTO derived_assertions (
+                tenant_id, user_id, pass_name, surface, statement_text, lifecycle_state,
+                salience, importance, confidence_extraction, confidence_validity,
+                source_session_ids, source_turn_refs, run_id, metadata, created_at, updated_at
+            ) VALUES (
+                $1,$2,$3,'memory_delta',
+                'User is shifting focus toward calmer daily structure.',
+                'active',0.78,0.81,0.72,0.76,$4::text[],$5::jsonb,$6,'{}'::jsonb,NOW(),NOW()
+            )
+            """,
+            tenant_id,
+            user_id,
+            PASS5_LIVING_CONTEXT,
+            ["s2"],
+            [{"session_id": "s2", "turn_index": 2}],
+            run_id,
+        )
+
+        summary = await run_proactive_shadow_candidates(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            max_users=10,
+        )
+
+        assert summary["users_processed"] == 1
+        assert summary["follow_up_candidates_active"] >= 1
+        assert summary["clarification_candidates_active"] >= 1
+        assert summary["recent_change_candidates_active"] >= 1
+
+        follow_up = await db.fetch(
+            "SELECT candidate_key, status FROM follow_up_candidates WHERE tenant_id=$1 AND user_id=$2",
+            tenant_id,
+            user_id,
+        )
+        clarification = await db.fetch(
+            "SELECT candidate_key, status FROM clarification_candidates WHERE tenant_id=$1 AND user_id=$2",
+            tenant_id,
+            user_id,
+        )
+        recent_change = await db.fetch(
+            "SELECT candidate_key, status FROM recent_change_candidates WHERE tenant_id=$1 AND user_id=$2",
+            tenant_id,
+            user_id,
+        )
+
+        assert any(str(row.get("candidate_key", "")).startswith("thread:") for row in follow_up)
+        assert any((row.get("status") or "") == "shadow_open" for row in follow_up)
+        assert any(str(row.get("candidate_key", "")).startswith("low_conf:") for row in clarification)
+        assert any((row.get("status") or "") == "shadow_open" for row in clarification)
+        assert any(str(row.get("candidate_key", "")).startswith("assertion:") for row in recent_change)
+        assert any((row.get("status") or "") == "shadow_open" for row in recent_change)
 
 
 @pytest.mark.asyncio
