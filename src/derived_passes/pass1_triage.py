@@ -6,9 +6,14 @@ from .common import call_json_llm, clean_text, format_user_turns, text_list
 
 PASS1_PROMPT = """You are the first-pass memory triage layer for a personal AI assistant.
 
-Your job is NOT to write a nice summary.
-Your job is to decide whether this session contains durable memory value,
-and if so, what kind.
+Your job is NOT to write a nice summary and NOT to explain what the session means.
+Your job is triage and routing:
+- decide whether this session contains durable memory value
+- identify what kind of follow-on processing it may need
+- extract only concrete, user-stated updates worth routing forward
+
+Pass 1 is not the place for personality reading, emotional interpretation,
+or deeper synthesis. Later passes will go back to the raw transcript.
 
 Return JSON only in this exact shape:
 
@@ -59,22 +64,42 @@ Definitions:
   - "Riley and the user are back together."
   - "Riley visited England and spent two weeks with the user."
   - "User sent Jordan an holiday message without expecting a reply."
+  Do NOT explain what these facts reveal about the user's psychology.
 
 - entity_mentions:
   only include people, projects, places, or named things that matter to durable memory.
   Do NOT include generic nouns or low-value transient mentions.
 
 - identity_signals:
-  only include signals about who the user is at a deeper level:
-  values, beliefs, enduring patterns, important biography, meaningful worldview,
-  recurring ways of relating, or self-understanding.
+  only include concrete, evidence-grade observations from USER turns that may be useful
+  for later identity review:
+  values explicitly stated, beliefs explicitly stated, major biographical facts,
+  durable roles, or repeated standards/preferences stated plainly.
+  Keep them close to the user's wording.
+  Good:
+  - "User asked to be called out for approval-seeking behavior."
+  - "User said integrity matters more than validation."
+  - "User said Jasmine is his daughter."
+  Bad:
+  - "User struggles with focus and feels overwhelmed by unfinished projects."
+  - "User is trying to prove his worth through work."
+  - "User tends to overthink social interactions."
   Do NOT include generic mood or filler.
   If none, return [].
 
 - thread_signals:
-  unresolved things a caring assistant should remember or follow up on later:
-  health issues, relationship tensions, active hopes, commitments, worries,
-  unfinished decisions, emotionally loaded situations.
+  unresolved situations a caring assistant should remember or follow up on later:
+  health issues, relationship states, active commitments, unfinished decisions,
+  waiting-for-reply situations, concrete worries with future relevance.
+  If the user expresses a feeling about a situation, name the situation,
+  not the feeling.
+  Good:
+  - "User needs reminders to stay hydrated after kidney stones."
+  - "User has not heard back from Jasmine after sending a birthday message."
+  - "User and his mother are currently not speaking."
+  Bad:
+  - "User is carrying deep grief about estrangement."
+  - "User is navigating guilt and shame about Jasmine."
   Do NOT create a thread for every mention.
   If none, return [].
 
@@ -118,6 +143,10 @@ Rules:
 8. If the session contains corrections to prior memory, treat those as high-value memory_deltas.
 9. If a topic is interesting but not relevant to the user's ongoing world, do not elevate it into durable memory by default.
 10. Only extract facts stated or confirmed by the USER. Ignore assistant turns for fact extraction. The assistant may be wrong. The user is the source of truth.
+11. Do not infer motives, inner states, coping strategies, attachment patterns, or personality traits.
+12. If you are tempted to write "user is/struggles/tends/tries/wants to prove", you are probably doing later-pass work too early.
+13. For thread_signals, prefer the external situation, state change, or follow-up need.
+    Internal emotion by itself is not a thread.
 
 Transcript:
 {{transcript}}

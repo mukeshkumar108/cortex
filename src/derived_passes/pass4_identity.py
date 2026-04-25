@@ -8,10 +8,14 @@ from .synthesis_quality import conservative_rewrite_text, sanitize_list_of_dicts
 IDENTITY_SYNTHESIS_PROMPT = """You are synthesizing an identity profile for the user
 of a personal AI assistant named Sophie.
 
-This is NOT a status report and NOT a character study.
-Capture only stable, useful memory that helps Sophie
-respond better: durable anchors, repeated patterns,
-explicit preferences, known constraints, and uncertainty.
+Your job is to identify this person, not interpret them.
+
+This is NOT a status report, NOT a therapy note, NOT a character study,
+and NOT a worldview synthesis.
+Capture only stable, useful memory that helps Sophie respond better:
+durable roles, what they are building, explicit commitments, important
+people, plain stated aims, repeated preferences, known constraints,
+and uncertainty.
 
 OBSERVER EFFECT WARNING:
 If an existing profile is shown below, treat it as
@@ -22,26 +26,72 @@ Do not just reword the existing profile.
 EXISTING PROFILE (hypothesis only, may be outdated):
 {existing_profile}
 
-IDENTITY-RELEVANT SESSIONS — memory deltas and signals,
-chronological order:
+DECLARED PROFILE TRUTH (highest authority; use when present):
+{declared_profile_truth}
+
+DURABLE PROFILE FACTS (structured facts with provenance and confidence):
+{durable_profile_facts}
+
+IDENTITY-RELEVANT SESSION EVIDENCE — chronological order:
 {session_evidence}
 
 PERSISTENT GOALS (stated repeatedly as core):
 {persistent_goals}
 
-Synthesize a complete identity profile.
+Answer these questions only:
+- What are their durable roles? (founder, parent, writer, believer, operator, builder)
+- What are they building or working on?
+- What beliefs or commitments are explicitly and repeatedly stated?
+- Who matters to them and why?
+- What do they want, stated plainly and not inferred?
+- What is active in the current chapter, kept clearly separate from enduring identity?
 
-For each section, ground your answer in specific
-evidence from the sessions. Note uncertainty where
-the evidence is thin. Do not invent or psychologize
+For each section, ground your answer in specific evidence from the raw user excerpts.
+Routing hints may appear alongside excerpts, but they are only hints for where to look.
+If a routing hint is more interpretive than the raw excerpt supports, ignore the hint.
+Authority order:
+1. declared profile truth
+2. repeated explicit session facts
+3. durable derived facts
+4. prose synthesis
+Higher-authority facts fill and constrain the profile.
+Do not let lower-authority synthesis overwrite higher-authority facts.
+Note uncertainty where the evidence is thin. Do not invent or psychologize
 beyond what is clearly present.
 
 QUALITY CONSTRAINTS:
+- Do not synthesize a worldview.
+- Do not produce a philosophy.
+- Do not explain what their work means about them.
+- Do not explain what their relationships mean about them.
+- Do not produce a polished personal brand statement.
+- Preserve concrete relationship-state terms exactly when they are
+  explicit in the source or declared truth.
+- Do not soften, euphemize, or editorially improve relationship
+  descriptions.
+- "Estranged" means estranged. "Long distance" means long distance.
+- The runtime model needs accurate relationship facts, not diplomatic
+  summaries.
+- If declared profile truth gives a clear, concrete description
+  of a role, project, public work, or health consideration,
+  preserve that concrete meaning instead of abstracting it into
+  a broader category.
+- Prefer the concrete project phrasing over generic labels.
+  Example: if the declared truth says "Bluum — neuroplasticity wellness app",
+  do not rewrite it as "wellness application".
+- If the user uses internal shorthand that is not broadly clear,
+  translate it into plain language. But if the declared truth already
+  uses plain, concrete wording, keep it close to that wording.
+- Do not use the user's own internal jargon or slogans when plain descriptive
+  language would be clearer.
+- Translate jargon into plain language a stranger could understand.
 - Do not write a personality essay.
 - Do not write personality verdicts, global character claims,
   or phrases like "the user is someone who...".
 - Do not dramatize the user or frame them as a tragic,
   heroic, broken, complex, or literary character.
+- Do not narrate an inner emotional landscape unless the user
+  explicitly and repeatedly makes it part of their durable identity.
 - Do not use generic literary phrases like "deep complexity",
   "navigating a life shaped by", "beneath it all", "trying to prove",
   "driven by", "weight of", "defined by", "rollercoaster", or similar.
@@ -54,26 +104,35 @@ QUALITY CONSTRAINTS:
 - Prefer concrete stable patterns, durable anchors,
   explicit preferences, known constraints, and uncertainty.
 - Frame stable patterns as observed behavior, not identity essence.
+- Prefer roles, commitments, beliefs, projects, repeated choices,
+  and stated standards over inferred feelings.
+- If the user is a builder, writer, parent, believer, operator,
+  founder, or caretaker, say that only when strongly supported.
+- Intellectual, work, or creative specificity is valuable when it is
+  strongly evidenced and helps Sophie identify the person plainly.
 - If support is thin, use uncertainty language or leave the field sparse.
 - Every identity claim must help Sophie respond better.
   If it is merely clever, flattering, dramatic, or poetic,
   leave it out.
 
-INWARD-FACING SECTIONS ARE CRITICAL:
-Most AI systems only capture what a person is doing.
-Your job is to capture only inward-facing signals that
-are useful and evidenced: explicit hopes, repeated
-concerns, recurring interaction preferences, durable
-constraints, and uncertainties Sophie should hold.
-If a section has weak evidence, say that plainly or
-leave it sparse.
+CRITICAL DISTINCTION:
+- enduring identity = who this person is across time
+- current chapter = what is active right now
+
+Do not let the current chapter overwrite the enduring person.
+Do not freeze a hard season into identity.
+
+When in doubt:
+- choose plain identification over synthesis
+- choose concrete roles and commitments over inner-state narration
+- choose omission over overreach
 
 Return JSON only — no preamble, no markdown:
 {{
-  "who_they_are": "synthesized prose — values, beliefs,
-                   worldview, how they see themselves.
-                   Warm, specific, grounded in evidence.
-                   2-3 paragraphs.",
+  "who_they_are": "compact prose — enduring identity only.
+                   Identify the person plainly: durable roles,
+                   what they build or do, explicit commitments,
+                   and who they are across time. 1 short paragraph.",
   "core_values": [
     {{
       "value": "integrity",
@@ -89,9 +148,9 @@ Return JSON only — no preamble, no markdown:
       "frequency": "high"
     }}
   ],
-  "family_history": "prose — key biographical facts",
-  "faith_and_beliefs": "prose — spiritual/philosophical worldview",
-  "what_they_want": "prose — deeper aspirations",
+  "family_history": "prose — key biographical facts only if durable and useful",
+  "faith_and_beliefs": "prose — explicit faith or belief commitments only if clearly stated or strongly durable",
+  "what_they_want": "prose — plain stated aims and durable wants, not hidden motives",
   "recurring_fears": [
     {{
       "fear": "fear",
@@ -99,8 +158,8 @@ Return JSON only — no preamble, no markdown:
       "confidence": 0.8
     }}
   ],
-  "what_they_avoid": "prose — avoidance patterns",
-  "how_they_relate": "prose — relational patterns",
+  "what_they_avoid": "prose — only explicit or repeatedly evidenced avoidance patterns",
+  "how_they_relate": "prose — optional plain note on important people or relationship stance only when clearly supported",
   "persistent_goals": [
     {{
       "goal": "daily morning walks",
@@ -109,7 +168,7 @@ Return JSON only — no preamble, no markdown:
       "evidence": "repeatedly stated evidence"
     }}
   ],
-  "current_chapter": "one paragraph describing current life season"
+  "current_chapter": "one short paragraph describing what is active now in plain, operational terms without turning it into identity"
 }}
 """
 
@@ -125,6 +184,9 @@ async def synthesize_identity_profile(
     existing_profile: Dict[str, Any] | None,
     session_rows: List[Dict[str, Any]],
     persistent_goals: List[Dict[str, Any]],
+    declared_profile_truth: Dict[str, Any],
+    declared_truth_facts: List[Dict[str, Any]],
+    durable_profile_facts: List[Dict[str, Any]],
     model: str,
 ) -> Optional[Dict[str, Any]]:
     existing_profile_text = "None — first synthesis" if not existing_profile else __import__('json').dumps(existing_profile, ensure_ascii=False, default=str)
@@ -134,13 +196,16 @@ async def synthesize_identity_profile(
         session_lines.append(__import__('json').dumps({
             "session_id": row.get("session_id"),
             "session_date": row.get("session_date"),
-            "memory_deltas": as_list(raw.get("memory_deltas")),
-            "identity_signals": as_list(raw.get("identity_signals")),
-            "emotional_note": row.get("emotional_note"),
-            "tension_signal": row.get("tension_signal"),
+            "user_excerpt": row.get("user_excerpt"),
+            "routing_hints": row.get("routing_hints") or {
+                "memory_deltas": as_list(raw.get("memory_deltas")),
+                "identity_signals": as_list(raw.get("identity_signals")),
+            },
         }, ensure_ascii=False, default=str))
     prompt = IDENTITY_SYNTHESIS_PROMPT.format(
         existing_profile=existing_profile_text,
+        declared_profile_truth=__import__('json').dumps(declared_profile_truth or {}, ensure_ascii=False, default=str),
+        durable_profile_facts=_json_lines([*(declared_truth_facts or []), *(durable_profile_facts or [])]),
         session_evidence="\n".join(session_lines),
         persistent_goals=_json_lines(persistent_goals),
     )

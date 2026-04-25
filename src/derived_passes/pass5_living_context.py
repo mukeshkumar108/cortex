@@ -12,10 +12,9 @@ from .synthesis_quality import (
 LIVING_CONTEXT_PROMPT = """You are synthesizing the current living context for
 the user of a personal AI assistant named Sophie.
 
-This is NOT a status report and NOT a therapy note.
-This is a compact operating context: what matters now,
-what changed, what is uncertain, and what Sophie should
-hold without over-interpreting.
+This is NOT a status report, NOT a therapy note, and NOT a mood summary.
+This is a compact operating context: what matters now, what changed,
+what remains unresolved, and what Sophie should hold without over-interpreting.
 
 ═══════════════════════════════════════════
 OBSERVER EFFECT WARNING — READ THIS FIRST
@@ -37,7 +36,7 @@ EXISTING LIVING CONTEXT (challenge this, don't preserve it):
 WHO THIS PERSON IS (identity grounding):
 {identity_grounding}
 
-RECENT SESSIONS — oldest first:
+RECENT SESSION EVIDENCE — oldest first:
 {recent_sessions}
 
 CURRENT OPEN THREADS (high salience):
@@ -51,12 +50,12 @@ YOUR TASK:
 Write a living context that tells Sophie what she
 needs to know to show up well for this person TODAY.
 
-SURFACE LAYER — what's actually happening:
+CURRENT OPERATING CONTEXT — what's actually happening:
 - What is this person focused on right now?
 - What has happened in the last 2 weeks that matters?
-- How are their key relationships feeling right now?
-- What is the minimal evidence-bound emotional texture?
-  Do not use "vibe" language.
+- What key relationships, projects, commitments, health issues,
+  or decisions are currently active?
+- What important upcoming items or active obligations should Sophie know?
 
 TENSION MAP — unresolved current friction:
 - What is the main unresolved friction right now?
@@ -81,12 +80,13 @@ SOPHIE DIRECTIVES — behavioral instructions:
 
 RULES:
 1. Ground every statement in specific evidence.
-   Do not psychologize beyond what the sessions show.
+   Do not psychologize beyond what the raw user excerpts show.
+   Routing hints may appear alongside excerpts, but they are not authority.
+   If a routing hint is more interpretive than the raw excerpt supports, ignore it.
 2. Be honest about uncertainty.
    "Possibly" and "appears to" are fine.
-3. Do not be clinical. Write as a caring, attentive
-   friend describing someone they know well.
-4. The tension map sections are the most important.
+3. Use direct operational language, not literary or therapeutic language.
+4. The current operating context and tension map are the most important.
    Do not skip them or make them vague.
 5. Contradictions must show BOTH views — earlier AND
    recent. Never just overwrite the earlier one.
@@ -108,23 +108,26 @@ RULES:
     in the next conversation, omit it.
 12. Field-specific constraints:
     - primary_tension must be observable and concrete.
-    - relationship_pulse must describe current relationship state,
-      not a dramatic emotional story.
-    - emotional_texture must be minimal and evidence-bound.
+    - relationship_pulse must describe current relationship state
+      or interaction stance, not how the relationship "feels."
+    - emotional_texture should usually be null. Use it only for
+      minimal observable state that is explicit and useful right now.
     - unspoken_goal should be null unless strongly supported across
       multiple sessions.
     - active_contradictions require evidence for both views.
+13. Do not describe inferred feelings as facts.
+    Sophie needs current operating context, not emotional weather.
 
 Return JSON only — no preamble, no markdown:
 {{
   "current_focus": "prose",
-  "recent_narrative": "prose",
-  "relationship_pulse": "prose",
-  "emotional_texture": "prose",
-  "primary_tension": "prose",
-  "what_theyre_avoiding": "prose",
-  "unspoken_goal": "prose",
-  "why_it_matters": "prose",
+  "recent_narrative": "prose — concrete changes in the last 2 weeks",
+  "relationship_pulse": "prose — current relationship state only if useful",
+  "emotional_texture": "prose or null — minimal explicit state only if truly useful",
+  "primary_tension": "prose — observable current friction",
+  "what_theyre_avoiding": "prose or null — only if explicit or repeatedly evidenced",
+  "unspoken_goal": "prose or null — only if strongly supported",
+  "why_it_matters": "prose — concrete consequence, not dramatic meaning",
   "active_contradictions": [
     {{
       "topic": "topic",
@@ -169,10 +172,11 @@ async def synthesize_living_context(
         session_payload.append({
             "session_id": row.get("session_id"),
             "session_date": row.get("session_date"),
-            "memory_deltas": as_list(raw.get("memory_deltas")),
-            "thread_signals": as_list(raw.get("thread_signals")),
-            "emotional_note": row.get("emotional_note"),
-            "tension_signal": row.get("tension_signal"),
+            "user_excerpt": row.get("user_excerpt"),
+            "routing_hints": row.get("routing_hints") or {
+                "memory_deltas": as_list(raw.get("memory_deltas")),
+                "thread_signals": as_list(raw.get("thread_signals")),
+            },
         })
     prompt = LIVING_CONTEXT_PROMPT.format(
         existing_living_context=json.dumps(existing_context, ensure_ascii=False, default=str) if existing_context else "None — first synthesis",

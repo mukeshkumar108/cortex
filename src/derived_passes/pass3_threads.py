@@ -7,14 +7,14 @@ from .common import as_list, call_json_llm, clean_text, format_user_turns, safe_
 THREAD_EXTRACTION_PROMPT = """You are maintaining an open thread registry for a
 personal AI assistant named Sophie.
 
-Open threads are unresolved things a caring attentive
+Open threads are unresolved situations a caring attentive
 friend would remember and follow up on later.
 
 TODAY'S SESSION:
 Date: {session_date}
 Emotional weight: {emotional_weight}
 Emotional note: {emotional_note}
-Thread signals from triage: {thread_signals}
+Thread routing hints from triage (routing only, not authority): {thread_signals}
 
 USER TURNS FROM THIS SESSION (assistant turns removed):
 {transcript_text}
@@ -37,7 +37,7 @@ A thread is worth creating if it is:
 - A health issue, symptom, or medical situation
 - A relationship tension or unresolved situation
 - A commitment or intention the user stated that has real future follow-up value
-- A worry or fear the user expressed
+- A concrete worry, risk, or waiting situation with future follow-up value
 - Something in progress with no clear resolution
 - Something a good friend would ask about next time
 
@@ -71,17 +71,39 @@ RULES:
    Ignore assistant turns completely.
 2. Be specific. "User's leg was hurting" not
    "User mentioned a health issue."
-3. One thread per distinct situation.
+3. Keep detail concrete and situational.
+   Do not add emotional narration, motive inference,
+   psychologizing, or "deeper meaning."
+   Name the underlying situation, not the user's emotional reaction to it.
+   Bad:
+   - "User is carrying intense grief and shame..."
+   - "User is using work to avoid the pain..."
+   Good:
+   - "User has not spoken to Jasmine for six years and is sending low-pressure messages."
+   - "User wants hydration reminders after a kidney stone issue."
+   Better title/detail pairs:
+   - title: "Reconnecting with Jasmine"
+     detail: "User sent Jasmine a birthday message and has not heard back yet."
+   - title: "Relationship with mother is currently severed"
+     detail: "User said he and his mother are not speaking right now."
+4. One thread per distinct situation.
    Don't merge unrelated things into one thread.
-4. Don't create threads for things already resolved
+5. Don't create threads for things already resolved
    in the same session.
-5. If uncertain whether something is a thread, use NO_ACTION
+6. If uncertain whether something is a thread, use NO_ACTION
    unless you can explain why it matters later.
-6. Resolution note should be specific:
+7. Resolution note should be specific:
    "User confirmed kidney stones resolved,
     just needs to drink more water"
    not just "resolved"
-7. For every CREATE/UPDATE/RESOLVE/SNOOZE include:
+8. Treat triage thread hints as routing hints only.
+   If a hint is not directly supported by USER turns,
+   do not use it.
+9. Relationship threads should usually be about the relationship situation
+   with a specific person, not about the user's grief, shame, anger, or fear
+   about that relationship.
+10. Thread titles should be neutral situation labels, not character or emotion summaries.
+11. For every CREATE/UPDATE/RESOLVE/SNOOZE include:
    unresolvedness: open / resolved / unclear
    follow_up_value: low / medium / high
    evidence_strength: weak / medium / strong
