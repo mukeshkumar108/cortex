@@ -7,6 +7,7 @@ Status: Benchmark closed; retrospective V1 started
 Follow-on design after this tracker:
 - `docs/SOPHIE_RETROSPECTIVE_WORKER_SPEC.md`
 - `docs/SOPHIE_MEMORY_SYSTEM_SIMPLE.md`
+- `docs/SOPHIE_ALWAYS_ON_MEMORY_PACKET_SPEC.md`
 
 That document defines the next bounded cross-time worker layer. It is intentionally separate from this tracker so the hardening/packet benchmark stays closed and the next build step has a clean contract.
 

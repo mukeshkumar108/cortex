@@ -9,6 +9,10 @@ It is written for human understanding, not implementation detail.
 
 If the detailed docs explain the ambition, this document explains the actual flow.
 
+Related next-step design:
+- `docs/SOPHIE_ALWAYS_ON_MEMORY_PACKET_SPEC.md`
+- the always-on packet should orient runtime by enduring identity, important people, work/building, then the current chapter
+
 ## 1. The Big Picture
 
 Sophie memory now has two layers:
