@@ -31,6 +31,12 @@ from .models import (
     SessionStartBriefItem,
     SessionStartBriefEntityProfile,
     SessionStartBriefEntityHint,
+    AlwaysOnMemoryPacketResponse,
+    DeclaredProfileTruthPatchRequest,
+    DeclaredProfileTruthResponse,
+    DeclaredProfileTruthHistoryResponse,
+    DeclaredProfileTruth,
+    DeclaredProfileTruthHistoryItem,
     SessionCloseRequest,
     SessionIngestRequest,
     SessionIngestResponse,
@@ -43,6 +49,12 @@ from .models import (
     DailyAnalysisResponse,
     HabitDailyLogUpsertRequest,
     HabitDailyLogUpsertResponse,
+)
+from .declared_profile_truth import (
+    build_declared_profile_truth_change_summary,
+    extract_declared_profile_truth,
+    merge_declared_profile_truth,
+    normalize_declared_profile_truth,
 )
 from .utils import extract_location
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -99,6 +111,7 @@ from .derived_pipeline import (
     run_silence_detection,
 )
 from .derived_passes.synthesis_quality import conservative_rewrite_text
+from .relationship_tiers import always_on_people_allowed, entity_relationship_tier, relationship_tier_rank
 from .retrieval_shadow import build_shadow_diff, persist_shadow_diff, persist_shadow_error
 from .invariants import InvariantManager
 from .rollout import RolloutController, ROUTE_LEGACY, ROUTE_SHADOW, ROUTE_V2
@@ -182,6 +195,96 @@ def _entity_has_serving_content(row: Dict[str, Any]) -> bool:
     if isinstance(open_questions, list) and any(_normalize_text(item) for item in open_questions):
         return True
     return _relationship_anchor_rank(row.get("relationship_to_user")) >= 85
+
+
+def _entity_fact_texts(value: Any, *, limit: int = 12) -> List[str]:
+    out: List[str] = []
+    items = value if isinstance(value, list) else []
+    for item in items:
+        if isinstance(item, dict):
+            text = item.get("fact") or item.get("text") or item.get("statement") or item.get("value")
+        else:
+            text = item
+        clean = _normalize_text(text)
+        if clean and clean not in out:
+            out.append(clean)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _shorten_sentence(text: Optional[str], *, limit: int = 220) -> Optional[str]:
+    clean = _truth_text(text)
+    if not clean:
+        return None
+    first = re.split(r"(?<=[.!?])\s+", clean, maxsplit=1)[0].strip()
+    candidate = first or clean
+    if len(candidate) <= limit:
+        return candidate
+    trimmed = candidate[: limit - 1].rsplit(" ", 1)[0].strip()
+    return (trimmed or candidate[: limit - 1]).rstrip(" ,;:") + "…"
+
+
+def _strip_leading_subject(text: Optional[str], *, subject: Optional[str] = None) -> Optional[str]:
+    clean = _truth_text(text)
+    if not clean:
+        return None
+    out = clean
+    if subject:
+        escaped = re.escape(subject)
+        out = re.sub(rf"^{escaped}\s+is\s+", "", out, flags=re.IGNORECASE)
+        out = re.sub(rf"^{escaped}\s+", "", out, flags=re.IGNORECASE)
+        out = re.sub(rf"^{escaped}'s\s+", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"^(?:they|he|she)\s+have\s+been\s+", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"^(?:they|he|she)\s+is\s+", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"^(?:the user and [A-Za-z' -]+ have been)\s+", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"^(?:the user and [A-Za-z' -]+ are)\s+", "", out, flags=re.IGNORECASE)
+    return out[:1].lower() + out[1:] if out else None
+
+
+def _compress_relationship_status(text: Optional[str], *, subject: Optional[str] = None) -> Optional[str]:
+    clean = _truth_text(text)
+    if not clean:
+        return None
+    compact = _strip_leading_subject(_shorten_sentence(clean, limit=140), subject=subject)
+    if not compact:
+        return None
+    compact = compact.rstrip(".")
+    compact = compact.replace("a period marked by the user's silence while he dealt with personal losses", "")
+    compact = compact.replace("However, they have since reconciled", "reconciled")
+    compact = re.sub(r"\s{2,}", " ", compact)
+    compact = re.sub(r"\s+[,;]\s*", "; ", compact)
+    compact = re.sub(r";\s*;", "; ", compact)
+    compact = compact.strip(" ;,")
+    return compact or None
+
+
+def _compose_person_context(person: Dict[str, Any]) -> Optional[str]:
+    durable_facts = _entity_fact_texts(person.get("key_facts"), limit=4)
+    name = _truth_text(person.get("name"))
+    profile = _compress_relationship_status(person.get("profile"), subject=name)
+    current_status = _compress_relationship_status(person.get("current_status"), subject=name)
+    parts: List[str] = []
+    parts.extend(durable_facts[:1])
+    if profile:
+        parts.append(profile)
+    if current_status:
+        parts.append(current_status)
+    deduped: List[str] = []
+    for part in parts:
+        clean = _truth_text(part)
+        if clean and clean not in deduped:
+            deduped.append(clean)
+    if not deduped:
+        return None
+    return "; ".join(deduped[:3])
+
+
+def _is_systemish_packet_thread(title: Optional[str]) -> bool:
+    clean = _truth_text(title).lower()
+    if not clean:
+        return False
+    return clean.startswith("user's intention to ") or clean.startswith("user is ")
 
 
 PROJECT_ENTITY_RELATIONSHIPS = {
@@ -385,8 +488,9 @@ async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
     )
     identity = await db.fetchone(
         """
-        SELECT current_chapter, core_values,
+        SELECT who_they_are, current_chapter, core_values,
                persistent_goals, recurring_fears,
+               faith_and_beliefs, how_they_relate,
                what_they_want
         FROM identity_profile
         WHERE user_id = $1
@@ -480,10 +584,20 @@ async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
             "key_facts": p.get("key_facts") if isinstance(p.get("key_facts"), list) else [],
             "open_questions": p.get("open_questions") if isinstance(p.get("open_questions"), list) else [],
             "salience": float(p.get("salience_score") or 0.0),
+            "importance": float(p.get("importance_score") or 0.0),
+            "relationship_tier": entity_relationship_tier(dict(p)),
         }
         for p in people
-        if _entity_has_serving_content(dict(p)) and _entity_is_human_person(dict(p))
+        if _entity_has_serving_content(dict(p)) and _entity_is_human_person(dict(p)) and always_on_people_allowed(dict(p))
     ]
+    effective_people.sort(
+        key=lambda p: (
+            relationship_tier_rank(p.get("relationship_tier")),
+            float(p.get("importance") or 0.0),
+            float(p.get("salience") or 0.0),
+        ),
+        reverse=True,
+    )
     effective_projects = _cluster_projects(projects)
     directive_items = living.get("sophie_directives") if isinstance(living.get("sophie_directives"), list) else []
     directive_items = list(directive_items)
@@ -568,9 +682,12 @@ async def _build_handover_packet(user_id: str) -> Dict[str, Any]:
         "projects": effective_projects,
         "episodic_recall": episodic_recall,
         "identity": {
+            "who_they_are": conservative_rewrite_text(identity.get("who_they_are")) or None,
             "current_chapter": conservative_rewrite_text(identity.get("current_chapter")) or None,
             "core_values": (identity.get("core_values") if isinstance(identity.get("core_values"), list) else [])[:3],
             "persistent_goals": identity.get("persistent_goals") if isinstance(identity.get("persistent_goals"), list) else [],
+            "faith_and_beliefs": conservative_rewrite_text(identity.get("faith_and_beliefs")) or None,
+            "how_they_relate": conservative_rewrite_text(identity.get("how_they_relate")) or None,
             "what_they_want": conservative_rewrite_text(identity.get("what_they_want")) or None,
         },
         "provenance": source_provenance,
@@ -4580,6 +4697,600 @@ def _compose_structured_handover_text(
         if top_entities:
             parts.append(f"Key entities in view: {top_entities}.")
     return _compress_handover_text(" ".join([p for p in parts if p]).strip(), depth_label) or " ".join([p for p in parts if p]).strip()
+
+
+def _truth_text(value: Any) -> Optional[str]:
+    text = _normalize_text(value)
+    return text or None
+
+
+def _extract_json_text_object(raw: Optional[str]) -> Optional[Dict[str, Any]]:
+    text = raw.strip() if isinstance(raw, str) else _normalize_text(raw)
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        parsed = json.loads(text[start:end + 1])
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def _truth_list(value: Any, *, limit: int = 6) -> List[str]:
+    out: List[str] = []
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, tuple):
+        items = list(value)
+    else:
+        items = [value]
+    for item in items:
+        if isinstance(item, dict):
+            text = _truth_text(
+                item.get("text")
+                or item.get("value")
+                or item.get("fact")
+                or item.get("goal")
+                or item.get("directive")
+                or item.get("topic")
+                or item.get("name")
+            )
+        else:
+            text = _truth_text(item)
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def _load_explicit_profile_truth(tenant_id: str, user_id: str) -> Dict[str, Any]:
+    identity_row = await db.fetchone(
+        """
+        SELECT data
+        FROM user_identity
+        WHERE tenant_id=$1 AND user_id=$2
+        LIMIT 1
+        """,
+        tenant_id,
+        user_id,
+    )
+    identity_cache_row = await db.fetchone(
+        """
+        SELECT preferred_name, timezone, facts
+        FROM identity_cache
+        WHERE tenant_id=$1 AND user_id=$2
+        LIMIT 1
+        """,
+        tenant_id,
+        user_id,
+    )
+    data = identity_row.get("data") if isinstance(identity_row, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    cache = identity_cache_row or {}
+    truth = extract_declared_profile_truth(data, cache)
+    preferences = data.get("preferences") if isinstance(data.get("preferences"), dict) else {}
+    if preferences:
+        truth["preferences"] = preferences
+    return truth
+
+
+async def _get_declared_profile_truth_state(
+    tenant_id: str,
+    user_id: str,
+) -> Dict[str, Any]:
+    row = await db.fetchone(
+        """
+        SELECT data, created_at, updated_at
+        FROM user_identity
+        WHERE tenant_id=$1 AND user_id=$2
+        LIMIT 1
+        """,
+        tenant_id,
+        user_id,
+    )
+    data = row.get("data") if isinstance(row, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    truth = extract_declared_profile_truth(data, None)
+    audit_meta = await db.fetchone(
+        """
+        SELECT COUNT(*)::int AS audit_count, MAX(created_at) AS last_edit_at
+        FROM declared_profile_truth_events
+        WHERE tenant_id=$1 AND user_id=$2
+        """,
+        tenant_id,
+        user_id,
+    )
+    return {
+        "truth": truth,
+        "row": row or {},
+        "audit_count": int((audit_meta or {}).get("audit_count") or 0),
+        "last_edit_at": (audit_meta or {}).get("last_edit_at"),
+    }
+
+
+async def _write_declared_profile_truth(
+    *,
+    tenant_id: str,
+    user_id: str,
+    profile_patch: Dict[str, Any],
+    source_surface: Optional[str],
+    updated_by: Optional[str],
+    reason: Optional[str],
+    replace: bool,
+) -> Dict[str, Any]:
+    state = await _get_declared_profile_truth_state(tenant_id, user_id)
+    current_truth = state["truth"] if isinstance(state.get("truth"), dict) else {}
+    row = state["row"] if isinstance(state.get("row"), dict) else {}
+    current_data = row.get("data") if isinstance(row.get("data"), dict) else {}
+    if not isinstance(current_data, dict):
+        current_data = {}
+
+    merged_truth = merge_declared_profile_truth(current_truth, profile_patch, replace=replace)
+    if merged_truth == current_truth:
+        return {
+            "truth": merged_truth,
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+            "audit_count": int(state.get("audit_count") or 0),
+            "last_edit_at": state.get("last_edit_at"),
+        }
+
+    new_data = deepcopy(current_data)
+    if merged_truth:
+        new_data["declared_profile_truth"] = merged_truth
+    else:
+        new_data.pop("declared_profile_truth", None)
+
+    stored = await db.fetchone(
+        """
+        INSERT INTO user_identity (tenant_id, user_id, data, updated_at)
+        VALUES ($1,$2,$3::jsonb,NOW())
+        ON CONFLICT (tenant_id, user_id)
+        DO UPDATE SET
+            data = EXCLUDED.data,
+            updated_at = NOW()
+        RETURNING created_at, updated_at
+        """,
+        tenant_id,
+        user_id,
+        new_data,
+    )
+    change_summary = build_declared_profile_truth_change_summary(current_truth, merged_truth)
+    await db.execute(
+        """
+        INSERT INTO declared_profile_truth_events (
+            tenant_id, user_id, source_surface, updated_by, reason,
+            change_summary, previous_data, new_data, created_at
+        ) VALUES (
+            $1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb,NOW()
+        )
+        """,
+        tenant_id,
+        user_id,
+        _normalize_text(source_surface) or "unknown",
+        _normalize_text(updated_by) or "user",
+        _normalize_text(reason),
+        change_summary,
+        current_truth,
+        merged_truth,
+    )
+    return {
+        "truth": merged_truth,
+        "created_at": stored.get("created_at") if isinstance(stored, dict) else row.get("created_at"),
+        "updated_at": stored.get("updated_at") if isinstance(stored, dict) else row.get("updated_at"),
+        "audit_count": int(state.get("audit_count") or 0) + 1,
+        "last_edit_at": stored.get("updated_at") if isinstance(stored, dict) else datetime.utcnow().replace(tzinfo=dt_timezone.utc),
+    }
+
+
+def _append_section_line(sections: Dict[str, List[str]], key: str, text: Optional[str], *, limit: int) -> None:
+    clean = _truth_text(text)
+    if not clean:
+        return
+    bucket = sections.setdefault(key, [])
+    if clean in bucket:
+        return
+    if len(bucket) >= limit:
+        return
+    bucket.append(clean)
+
+
+def _join_compact_list(items: List[str]) -> Optional[str]:
+    clean_items = [_truth_text(item) for item in items if _truth_text(item)]
+    if not clean_items:
+        return None
+    if len(clean_items) == 1:
+        return clean_items[0]
+    if len(clean_items) == 2:
+        return f"{clean_items[0]} and {clean_items[1]}"
+    return f"{', '.join(clean_items[:-1])}, and {clean_items[-1]}"
+
+
+def _packet_line_allowed(section_key: str, text: Optional[str]) -> bool:
+    clean = _truth_text(text)
+    if not clean:
+        return False
+    lower = clean.lower()
+    banned_by_section = {
+        "enduring_identity": (
+            "emotional volatility",
+            "emotionally",
+            "strained",
+            "fragile",
+            "therapy",
+            "adversarial",
+            "anger",
+            "distrustful",
+        ),
+        "current_chapter": (
+            "emotional volatility",
+            "therapy",
+        ),
+    }
+    for banned in banned_by_section.get(section_key, ()):
+        if banned in lower:
+            return False
+    return True
+
+
+def _append_packet_line(sections: Dict[str, List[str]], key: str, text: Optional[str], *, limit: int) -> None:
+    if not _packet_line_allowed(key, text):
+        return
+    _append_section_line(sections, key, text, limit=limit)
+
+
+def _work_identity_key(text: Optional[str]) -> Optional[str]:
+    clean = _truth_text(text)
+    if not clean:
+        return None
+    left = clean.split(":", 1)[0].split("—", 1)[0].strip()
+    left_norm = _normalize_text(left)
+    return left_norm or _normalize_text(clean)
+
+
+def _person_identity_key(text: Optional[str]) -> Optional[str]:
+    clean = _truth_text(text)
+    if not clean:
+        return None
+    left = clean.split("(", 1)[0].split(":", 1)[0].strip()
+    return _normalize_text(left) or _normalize_text(clean)
+
+
+def _build_always_on_packet_sections(
+    *,
+    explicit_truth: Dict[str, Any],
+    handover: Dict[str, Any],
+) -> Dict[str, List[str]]:
+    sections: Dict[str, List[str]] = {
+        "enduring_identity": [],
+        "important_people": [],
+        "work_and_building": [],
+        "current_chapter": [],
+        "handle_carefully": [],
+        "open_questions": [],
+    }
+    identity = handover.get("identity") if isinstance(handover.get("identity"), dict) else {}
+    living = handover.get("living_context") if isinstance(handover.get("living_context"), dict) else {}
+    projects = handover.get("projects") if isinstance(handover.get("projects"), list) else []
+    people = handover.get("people") if isinstance(handover.get("people"), list) else []
+    threads = handover.get("open_threads") if isinstance(handover.get("open_threads"), list) else []
+    contradictions = handover.get("active_contradictions") if isinstance(handover.get("active_contradictions"), list) else []
+    directives = handover.get("sophie_directives") if isinstance(handover.get("sophie_directives"), list) else []
+
+    preferred_name = explicit_truth.get("preferred_name")
+    location = explicit_truth.get("location")
+    faith = explicit_truth.get("faith")
+    age = explicit_truth.get("age")
+    if preferred_name:
+        _append_packet_line(sections, "enduring_identity", f"Name: {preferred_name}.", limit=5)
+    if location:
+        _append_packet_line(sections, "enduring_identity", f"Based in {location}.", limit=5)
+    if age:
+        _append_packet_line(sections, "enduring_identity", f"Age: {age}.", limit=5)
+    if faith:
+        _append_packet_line(sections, "enduring_identity", f"Faith / worldview: {faith}.", limit=5)
+
+    enduring_identity = _truth_text(identity.get("who_they_are"))
+    if enduring_identity:
+        _append_packet_line(sections, "enduring_identity", enduring_identity, limit=5)
+
+    durable_beliefs = _truth_text(identity.get("faith_and_beliefs"))
+    if durable_beliefs and durable_beliefs != enduring_identity and not faith:
+        _append_packet_line(sections, "enduring_identity", durable_beliefs, limit=5)
+
+    core_values = _truth_list(identity.get("core_values"), limit=4)
+    if core_values and not explicit_truth.get("notes_for_sophie"):
+        joined_values = _join_compact_list(core_values)
+        _append_packet_line(sections, "enduring_identity", f"Core commitments: {joined_values}.", limit=5)
+
+    persistent_goals = _truth_list(identity.get("persistent_goals"), limit=3)
+    if persistent_goals and not explicit_truth.get("health_considerations"):
+        joined_goals = _join_compact_list(persistent_goals)
+        _append_packet_line(sections, "enduring_identity", f"Long-term aims: {joined_goals}.", limit=5)
+
+    desired_future = _truth_text(identity.get("what_they_want"))
+    if desired_future and not explicit_truth.get("projects"):
+        _append_packet_line(sections, "enduring_identity", f"What matters most: {desired_future}", limit=5)
+
+    seen_work_keys = set()
+    for work_item in _truth_list(explicit_truth.get("projects") or explicit_truth.get("work"), limit=3):
+        key = _work_identity_key(work_item)
+        if key:
+            seen_work_keys.add(key)
+        _append_packet_line(sections, "work_and_building", work_item, limit=5)
+    seen_people_keys = set()
+    for person in explicit_truth.get("important_people") or []:
+        if not isinstance(person, dict):
+            continue
+        name = _truth_text(person.get("name"))
+        relationship = _truth_text(person.get("relationship"))
+        note = _truth_text(person.get("note"))
+        situation = _truth_text(person.get("situation"))
+        contact = _truth_text(person.get("contact"))
+        context = _truth_text(person.get("context"))
+        location = _truth_text(person.get("location"))
+        faith = _truth_text(person.get("faith"))
+        detail_parts = [part for part in (note, situation, contact, context, location, faith) if part]
+        if name and relationship and detail_parts:
+            line = f"{name} ({relationship}): {'; '.join(detail_parts[:3])}"
+        elif name and relationship:
+            line = f"{name} ({relationship})"
+        elif name and detail_parts:
+            line = f"{name}: {'; '.join(detail_parts[:3])}"
+        elif name:
+            line = name
+        else:
+            continue
+        key = _person_identity_key(line)
+        if key:
+            seen_people_keys.add(key)
+        _append_packet_line(sections, "important_people", line, limit=5)
+        directive = _truth_text(person.get("directive"))
+        if name and directive:
+            _append_packet_line(sections, "handle_carefully", f"{name}: {directive}", limit=4)
+    for project in projects[:3]:
+        name = _truth_text(project.get("cluster_name")) or _truth_text(project.get("components")[0] if isinstance(project.get("components"), list) and project.get("components") else None)
+        status = _truth_text(project.get("current_status"))
+        profile = _truth_text(project.get("primary_profile"))
+        if name and status:
+            line = f"{name}: {status}"
+        elif name and profile:
+            line = f"{name}: {profile}"
+        elif name:
+            line = name
+        else:
+            line = None
+        key = _work_identity_key(line)
+        if line and (not key or key not in seen_work_keys):
+            if key:
+                seen_work_keys.add(key)
+            _append_packet_line(sections, "work_and_building", line, limit=5)
+
+    for person in people[:4]:
+        name = _truth_text(person.get("name"))
+        relationship = _truth_text(person.get("relationship"))
+        person_context = _compose_person_context(person)
+        if name and relationship and person_context:
+            line = f"{name} ({relationship}): {person_context}"
+        elif name and relationship:
+            line = f"{name} ({relationship})"
+        elif name and person_context:
+            line = f"{name}: {person_context}"
+        else:
+            line = None
+        key = _person_identity_key(line)
+        if line and (not key or key not in seen_people_keys):
+            if key:
+                seen_people_keys.add(key)
+            _append_packet_line(sections, "important_people", line, limit=5)
+
+    _append_packet_line(sections, "current_chapter", identity.get("current_chapter"), limit=5)
+    _append_packet_line(sections, "current_chapter", living.get("current_focus"), limit=5)
+    for thread in threads[:2]:
+        title = _truth_text(thread.get("title"))
+        detail = _truth_text(thread.get("detail"))
+        if _is_systemish_packet_thread(title):
+            continue
+        if title and detail and detail.lower() not in title.lower():
+            _append_packet_line(sections, "current_chapter", f"{title}: {detail}", limit=5)
+        else:
+            _append_packet_line(sections, "current_chapter", title or detail, limit=5)
+
+    for contradiction in contradictions[:2]:
+        topic = _truth_text(contradiction.get("topic"))
+        recent_view = _truth_text(contradiction.get("recent_view"))
+        if not topic or not recent_view:
+            continue
+        if _normalize_text(topic) in {"relationship with ashley", "jasmine", "reconnecting with jasmine sophia kumar"}:
+            _append_packet_line(sections, "handle_carefully", f"{topic}: {recent_view}", limit=3)
+    _append_packet_line(sections, "handle_carefully", explicit_truth.get("notes_for_sophie"), limit=4)
+    return sections
+
+
+def _deterministic_always_on_packet_text(sections: Dict[str, List[str]]) -> str:
+    labels = {
+        "enduring_identity": "Enduring identity",
+        "important_people": "Important people",
+        "work_and_building": "Work and building",
+        "current_chapter": "Current chapter",
+        "handle_carefully": "Handle carefully",
+        "open_questions": "Open questions",
+    }
+    parts: List[str] = []
+    for key in ("enduring_identity", "important_people", "work_and_building", "current_chapter", "handle_carefully"):
+        items = [_truth_text(item) for item in sections.get(key, [])]
+        items = [item for item in items if item]
+        if not items:
+            continue
+        joined = " ".join(
+            item if item.endswith((".", "!", "?")) else f"{item}."
+            for item in items
+        )
+        parts.append(f"{labels[key]}: {joined}")
+    text = " ".join(parts).strip()
+    return conservative_rewrite_text(text, fallback=text) or text
+
+
+async def _rewrite_always_on_packet_text(
+    *,
+    sections: Dict[str, List[str]],
+) -> str:
+    settings = get_settings()
+    fallback = _deterministic_always_on_packet_text(sections)
+    if not bool(settings.always_on_memory_packet_llm_enabled):
+        return fallback
+    client = get_llm_client()
+    prompt = (
+        "Rewrite the following structured user memory packet into a compact always-on runtime packet.\n"
+        "Constraints:\n"
+        "- plain direct language\n"
+        "- compact and readable\n"
+        "- answer who this person is before what is difficult right now\n"
+        "- separate enduring identity from the current chapter\n"
+        "- emphasize durable identity, important people, and what they are building\n"
+        "- prefer concrete declared project descriptions over generic category labels\n"
+        "- do not abstract a concrete product description into a broader vague term\n"
+        "- preserve concrete relationship-state terms exactly as they appear in the source sections\n"
+        "- do not soften, euphemize, or editorially improve relationship descriptions\n"
+        "- if the source says estranged, keep estranged; if it says long distance, keep long distance\n"
+        "- the runtime model needs accurate facts, not diplomatic summaries\n"
+        "- exclude short-lived implementation details unless they matter in most future conversations\n"
+        "- do not include transient model-switch or configuration details in the packet unless they are central to the relationship with Sophie\n"
+        "- no hidden motive inference\n"
+        "- no therapy note language\n"
+        "- no dramatic or poetic phrasing\n"
+        "- do not describe inferred feelings as if they are durable facts about the person\n"
+        "- preserve uncertainty instead of flattening it\n"
+        "- do not add facts\n"
+        "- keep section labels\n"
+        "- target roughly 350-500 tokens\n\n"
+        f"Packet sections:\n{json.dumps(sections, ensure_ascii=False)}\n\n"
+        "Return JSON only with this shape:\n"
+        "{\"packet_text\": \"...\"}"
+    )
+    try:
+        raw = await client._call_llm(
+            prompt=prompt,
+            max_tokens=700,
+            temperature=0.1,
+            task="identity",
+        )
+        parsed = _extract_json_text_object(raw or "")
+        packet_text = _truth_text((parsed or {}).get("packet_text"))
+        if not packet_text:
+            return fallback
+        cleaned = conservative_rewrite_text(packet_text, fallback=packet_text) or packet_text
+        if len(cleaned) > int(settings.always_on_memory_packet_target_chars or 2400):
+            return fallback
+        return cleaned
+    except Exception as e:
+        logger.warning("always-on memory packet rewrite failed: %s", e)
+        return fallback
+
+
+async def build_always_on_memory_packet(
+    *,
+    tenant_id: str,
+    user_id: str,
+    force_rebuild: bool = False,
+) -> Dict[str, Any]:
+    tenant_id = _normalize_text(_canonical_tenant_id(tenant_id)) or tenant_id
+    if not force_rebuild:
+        existing = await db.fetchone(
+            """
+            SELECT packet_version, generated_at, source_fingerprint, profile_truth_used,
+                   sections, packet_text, metadata
+            FROM always_on_memory_packets
+            WHERE tenant_id=$1 AND user_id=$2
+            LIMIT 1
+            """,
+            tenant_id,
+            user_id,
+        )
+        if existing:
+            return {
+                "version": _truth_text(existing.get("packet_version")) or "always_on_memory_packet.v1",
+                "generated_at": existing.get("generated_at").isoformat() if isinstance(existing.get("generated_at"), datetime) else _truth_text(existing.get("generated_at")) or datetime.now(dt_timezone.utc).isoformat(),
+                "source_fingerprint": _truth_text(existing.get("source_fingerprint")) or "",
+                "profile_truth_used": bool(existing.get("profile_truth_used")),
+                "sections": existing.get("sections") if isinstance(existing.get("sections"), dict) else {},
+                "packet_text": _truth_text(existing.get("packet_text")) or "",
+                "metadata": existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {},
+            }
+
+    explicit_truth = await _load_explicit_profile_truth(tenant_id, user_id)
+    handover = await _build_handover_packet(user_id)
+    sections = _build_always_on_packet_sections(
+        explicit_truth=explicit_truth,
+        handover=handover,
+    )
+    packet_text = await _rewrite_always_on_packet_text(sections=sections)
+    source_fingerprint = stable_short_hash(
+        {
+            "explicit_truth": explicit_truth,
+            "identity": handover.get("identity"),
+            "living_context": handover.get("living_context"),
+            "people": handover.get("people"),
+            "projects": handover.get("projects"),
+            "threads": handover.get("open_threads"),
+            "contradictions": handover.get("active_contradictions"),
+            "directives": handover.get("sophie_directives"),
+        },
+        length=24,
+    )
+    payload = {
+        "version": "always_on_memory_packet.v1",
+        "generated_at": datetime.now(dt_timezone.utc).isoformat(),
+        "source_fingerprint": source_fingerprint,
+        "profile_truth_used": bool(explicit_truth),
+        "sections": sections,
+        "packet_text": packet_text,
+        "metadata": {
+            "profile_truth_keys": sorted(list(explicit_truth.keys())),
+            "handover_projection_version": ((handover.get("provenance") or {}).get("projection_version") if isinstance(handover.get("provenance"), dict) else None),
+            "section_counts": {key: len(value) for key, value in sections.items()},
+            "target_chars": int(get_settings().always_on_memory_packet_target_chars or 2400),
+        },
+    }
+    await db.execute(
+        """
+        INSERT INTO always_on_memory_packets (
+            tenant_id, user_id, packet_version, generated_at, source_fingerprint,
+            profile_truth_used, sections, packet_text, metadata, updated_at
+        )
+        VALUES ($1,$2,$3,NOW(),$4,$5,$6::jsonb,$7,$8::jsonb,NOW())
+        ON CONFLICT (tenant_id, user_id)
+        DO UPDATE SET
+            packet_version=EXCLUDED.packet_version,
+            generated_at=NOW(),
+            source_fingerprint=EXCLUDED.source_fingerprint,
+            profile_truth_used=EXCLUDED.profile_truth_used,
+            sections=EXCLUDED.sections,
+            packet_text=EXCLUDED.packet_text,
+            metadata=EXCLUDED.metadata,
+            updated_at=NOW()
+        """,
+        tenant_id,
+        user_id,
+        payload["version"],
+        payload["source_fingerprint"],
+        payload["profile_truth_used"],
+        payload["sections"],
+        payload["packet_text"],
+        payload["metadata"],
+    )
+    return payload
 
 
 async def _resolve_canonical_entity_candidate(
@@ -13493,6 +14204,122 @@ async def session_startbrief(
         raise HTTPException(status_code=500, detail="Session startbrief failed")
 
 
+@app.get("/profile/truth", response_model=DeclaredProfileTruthResponse)
+async def get_declared_profile_truth(
+    tenantId: str,
+    userId: str,
+):
+    try:
+        tenant_id = _normalize_text(_canonical_tenant_id(tenantId)) or tenantId
+        user_id = _normalize_text(userId)
+        state = await _get_declared_profile_truth_state(tenant_id, user_id)
+        truth = normalize_declared_profile_truth(state.get("truth"))
+        row = state.get("row") if isinstance(state.get("row"), dict) else {}
+        return DeclaredProfileTruthResponse(
+            tenantId=tenant_id,
+            userId=user_id,
+            profile=DeclaredProfileTruth(**truth),
+            exists=bool(truth),
+            createdAt=row.get("created_at").isoformat() if row.get("created_at") else None,
+            updatedAt=row.get("updated_at").isoformat() if row.get("updated_at") else None,
+            metadata={
+                "auditCount": int(state.get("audit_count") or 0),
+                "lastEditAt": state.get("last_edit_at").isoformat() if state.get("last_edit_at") else None,
+                "fields": sorted(list(truth.keys())),
+            },
+        )
+    except Exception as e:
+        logger.error("get declared profile truth failed: %s", e)
+        raise HTTPException(status_code=500, detail="Get declared profile truth failed")
+
+
+@app.patch("/profile/truth", response_model=DeclaredProfileTruthResponse)
+async def patch_declared_profile_truth(request: DeclaredProfileTruthPatchRequest):
+    try:
+        tenant_id = _normalize_text(_canonical_tenant_id(request.tenantId)) or request.tenantId
+        user_id = _normalize_text(request.userId)
+        raw_patch = request.profile.model_dump(exclude_unset=True)
+        if not raw_patch:
+            raise HTTPException(status_code=400, detail="Profile patch cannot be empty")
+        result = await _write_declared_profile_truth(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            profile_patch=raw_patch,
+            source_surface=request.sourceSurface,
+            updated_by=request.updatedBy,
+            reason=request.reason,
+            replace=bool(request.replace),
+        )
+        truth = normalize_declared_profile_truth(result.get("truth"))
+        return DeclaredProfileTruthResponse(
+            tenantId=tenant_id,
+            userId=user_id,
+            profile=DeclaredProfileTruth(**truth),
+            exists=bool(truth),
+            createdAt=result.get("created_at").isoformat() if result.get("created_at") else None,
+            updatedAt=result.get("updated_at").isoformat() if result.get("updated_at") else None,
+            metadata={
+                "auditCount": int(result.get("audit_count") or 0),
+                "lastEditAt": result.get("last_edit_at").isoformat() if result.get("last_edit_at") else None,
+                "fields": sorted(list(truth.keys())),
+                "sourceSurface": _normalize_text(request.sourceSurface) or "unknown",
+                "updatedBy": _normalize_text(request.updatedBy) or "user",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("patch declared profile truth failed: %s", e)
+        raise HTTPException(status_code=500, detail="Patch declared profile truth failed")
+
+
+@app.get("/profile/truth/history", response_model=DeclaredProfileTruthHistoryResponse)
+async def get_declared_profile_truth_history(
+    tenantId: str,
+    userId: str,
+    limit: int = 20,
+):
+    try:
+        tenant_id = _normalize_text(_canonical_tenant_id(tenantId)) or tenantId
+        user_id = _normalize_text(userId)
+        clamped_limit = max(1, min(int(limit or 20), 100))
+        rows = await db.fetch(
+            """
+            SELECT id, source_surface, updated_by, reason, change_summary, created_at
+            FROM declared_profile_truth_events
+            WHERE tenant_id=$1 AND user_id=$2
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            """,
+            tenant_id,
+            user_id,
+            clamped_limit,
+        )
+        items = [
+            DeclaredProfileTruthHistoryItem(
+                id=int(row.get("id") or 0),
+                sourceSurface=_normalize_text(row.get("source_surface")),
+                updatedBy=_normalize_text(row.get("updated_by")),
+                reason=_normalize_text(row.get("reason")),
+                changeSummary=row.get("change_summary") if isinstance(row.get("change_summary"), dict) else {},
+                createdAt=row.get("created_at").isoformat() if row.get("created_at") else datetime.utcnow().replace(tzinfo=dt_timezone.utc).isoformat(),
+            )
+            for row in (rows or [])
+        ]
+        return DeclaredProfileTruthHistoryResponse(
+            tenantId=tenant_id,
+            userId=user_id,
+            items=items,
+            metadata={
+                "limit": clamped_limit,
+                "count": len(items),
+            },
+        )
+    except Exception as e:
+        logger.error("get declared profile truth history failed: %s", e)
+        raise HTTPException(status_code=500, detail="Get declared profile truth history failed")
+
+
 @app.post("/entities/profile", response_model=EntityProfileResponse)
 async def entities_profile(request: EntityProfileRequest):
     try:
@@ -14688,6 +15515,24 @@ async def debug_startbrief_ranking(
     except Exception as e:
         logger.error(f"Debug startbrief ranking failed: {e}")
         raise HTTPException(status_code=500, detail="Debug startbrief ranking failed")
+
+
+@app.get("/internal/debug/always-on-packet", response_model=AlwaysOnMemoryPacketResponse)
+async def debug_always_on_packet(
+    tenantId: str,
+    userId: str,
+    forceRebuild: bool = False,
+):
+    try:
+        packet = await build_always_on_memory_packet(
+            tenant_id=tenantId,
+            user_id=userId,
+            force_rebuild=bool(forceRebuild),
+        )
+        return AlwaysOnMemoryPacketResponse(**packet)
+    except Exception as e:
+        logger.error("Debug always-on packet failed: %s", e)
+        raise HTTPException(status_code=500, detail="Debug always-on packet failed")
 
 
 @app.post("/internal/debug/graphiti/query")

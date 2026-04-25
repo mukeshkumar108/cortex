@@ -97,7 +97,7 @@ class Settings(BaseSettings):
     derived_pipeline_enabled: bool = True
     derived_pipeline_llm_enabled: bool = True
     derived_pipeline_model_version: str = "google/gemma-4-26b-a4b-it"
-    derived_pipeline_prompt_version: str = "six-pass-v1"
+    derived_pipeline_prompt_version: str = "six-pass-v8-relationship-fact-precedence"
     derived_pipeline_policy_version: str = "derived.v1"
     derived_pipeline_identity_signal_threshold: int = 3
     derived_pipeline_identity_ceiling_days: int = 14
@@ -110,6 +110,10 @@ class Settings(BaseSettings):
     derived_pipeline_silence_detection_interval_seconds: int = 86400
     derived_pipeline_audit_enabled: bool = True
     derived_pipeline_audit_interval_seconds: int = 86400
+    always_on_memory_packet_enabled: bool = True
+    always_on_memory_packet_llm_enabled: bool = True
+    always_on_memory_packet_model_version: str = "amazon/nova-micro-v1"
+    always_on_memory_packet_target_chars: int = 2400
     retrieval_shadow_read_enabled: bool = False
     retrieval_shadow_read_sample_rate: float = 0.0
     retrieval_shadow_read_blocking: bool = False

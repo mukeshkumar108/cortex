@@ -269,6 +269,79 @@ class SessionStartBriefResponse(BaseModel):
     entity_profiles: List[SessionStartBriefEntityProfile] = []
 
 
+class AlwaysOnMemoryPacketResponse(BaseModel):
+    version: str
+    generated_at: str
+    source_fingerprint: str
+    profile_truth_used: bool = False
+    sections: Dict[str, List[str]] = {}
+    packet_text: str
+    metadata: Dict[str, Any] = {}
+
+
+class DeclaredProfilePerson(BaseModel):
+    name: str
+    relationship: Optional[str] = None
+    note: Optional[str] = None
+    situation: Optional[str] = None
+    contact: Optional[str] = None
+    context: Optional[str] = None
+    directive: Optional[str] = None
+    location: Optional[str] = None
+    faith: Optional[str] = None
+
+
+class DeclaredProfileTruth(BaseModel):
+    preferred_name: Optional[str] = None
+    location: Optional[str] = None
+    timezone: Optional[str] = None
+    age: Optional[str] = None
+    faith: Optional[str] = None
+    roles: List[str] = []
+    projects: List[str] = []
+    important_people: List[DeclaredProfilePerson] = []
+    writing_or_public_work: List[str] = []
+    health_considerations: List[str] = []
+    notes_for_sophie: Optional[str] = None
+    user_about: Optional[str] = None
+
+
+class DeclaredProfileTruthPatchRequest(BaseModel):
+    tenantId: str
+    userId: str
+    profile: DeclaredProfileTruth
+    sourceSurface: Optional[str] = None
+    updatedBy: Optional[str] = None
+    reason: Optional[str] = None
+    replace: bool = False
+
+
+class DeclaredProfileTruthResponse(BaseModel):
+    tenantId: str
+    userId: str
+    profile: DeclaredProfileTruth
+    exists: bool = False
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+
+
+class DeclaredProfileTruthHistoryItem(BaseModel):
+    id: int
+    sourceSurface: Optional[str] = None
+    updatedBy: Optional[str] = None
+    reason: Optional[str] = None
+    changeSummary: Dict[str, List[str]] = {}
+    createdAt: str
+
+
+class DeclaredProfileTruthHistoryResponse(BaseModel):
+    tenantId: str
+    userId: str
+    items: List[DeclaredProfileTruthHistoryItem] = []
+    metadata: Dict[str, Any] = {}
+
+
 class EntityProfileRequest(BaseModel):
     tenantId: str
     userId: str
