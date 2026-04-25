@@ -663,6 +663,57 @@ CREATE TABLE IF NOT EXISTS memory_relationship_links (
 CREATE INDEX IF NOT EXISTS idx_memory_relationship_links_user_source
   ON memory_relationship_links (tenant_id, user_id, source_type, source_id);
 
+CREATE TABLE IF NOT EXISTS always_on_memory_packets (
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  packet_version TEXT NOT NULL,
+  generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  source_fingerprint TEXT NOT NULL,
+  profile_truth_used BOOLEAN NOT NULL DEFAULT FALSE,
+  sections JSONB NOT NULL DEFAULT '{}'::jsonb,
+  packet_text TEXT NOT NULL,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (tenant_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_always_on_memory_packets_generated
+  ON always_on_memory_packets (tenant_id, generated_at DESC);
+
+CREATE TABLE IF NOT EXISTS durable_profile_facts (
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  fact_key TEXT NOT NULL,
+  fact_type TEXT NOT NULL,
+  fact_value TEXT NOT NULL,
+  source_type TEXT NOT NULL,
+  confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+  evidence_count INTEGER NOT NULL DEFAULT 0,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (tenant_id, user_id, fact_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_durable_profile_facts_user
+  ON durable_profile_facts (tenant_id, user_id, fact_type, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS declared_profile_truth_events (
+  id BIGSERIAL PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  source_surface TEXT,
+  updated_by TEXT,
+  reason TEXT,
+  change_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+  previous_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  new_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_declared_profile_truth_events_user
+  ON declared_profile_truth_events (tenant_id, user_id, created_at DESC);
+
 -- Lightweight temporal reinforcement for derived memory.
 ALTER TABLE entity_profiles
   ADD COLUMN IF NOT EXISTS distinct_session_count INT NOT NULL DEFAULT 0;
