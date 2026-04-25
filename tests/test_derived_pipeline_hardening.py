@@ -5,6 +5,7 @@ import uuid
 
 import asyncpg
 import pytest
+from httpx import ASGITransport, AsyncClient
 
 from src.config import get_settings
 from src.derived_pipeline import (
@@ -30,8 +31,10 @@ from src.derived_pipeline import (
 import src.derived_pipeline as derived_pipeline
 from src.derived_passes.pass4_identity import IDENTITY_SYNTHESIS_PROMPT, normalize_identity_output
 from src.derived_passes.pass5_living_context import LIVING_CONTEXT_PROMPT, normalize_living_context_output
+from src.derived_passes.pass1_triage import PASS1_PROMPT
+from src.derived_passes.pass3_threads import THREAD_EXTRACTION_PROMPT
 from src.derived_passes.synthesis_quality import conservative_rewrite_text, synthesis_quality_flags
-from src.main import app, db, _build_handover_packet, _execute_post_ingest_hook, session_startbrief
+from src.main import app, db, _build_handover_packet, _execute_post_ingest_hook, build_always_on_memory_packet, session_startbrief
 
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "derived_pipeline" / "basic_six_pass.json"
@@ -47,22 +50,58 @@ def _messages() -> list[dict]:
 
 
 def test_pass4_pass5_prompts_keep_operational_constraints():
+    pass1_prompt = PASS1_PROMPT.lower()
+    pass3_prompt = THREAD_EXTRACTION_PROMPT.lower()
     identity_prompt = IDENTITY_SYNTHESIS_PROMPT.lower()
     living_prompt = LIVING_CONTEXT_PROMPT.lower()
 
+    assert "your job is triage and routing" in pass1_prompt
+    assert "later passes will go back to the raw transcript" in pass1_prompt
+    assert "do not infer motives" in pass1_prompt
+    assert "you are probably doing later-pass work too early" in pass1_prompt
+
+    assert "routing only, not authority" in pass3_prompt
+    assert "do not add emotional narration" in pass3_prompt
+    assert "do not use it" in pass3_prompt
+    assert "name the underlying situation" in pass3_prompt
+    assert "neutral situation labels" in pass3_prompt
+
+    assert "identify this person, not interpret them" in identity_prompt
+    assert "do not synthesize a worldview" in identity_prompt
+    assert "do not produce a philosophy" in identity_prompt
+    assert "what are their durable roles" in identity_prompt
+    assert "what are they building or working on" in identity_prompt
+    assert "who matters to them and why" in identity_prompt
+    assert "plain identification over synthesis" in identity_prompt
+    assert "declared profile truth" in identity_prompt
+    assert "durable profile facts" in identity_prompt
+    assert "translate jargon into plain language" in identity_prompt
+    assert "do not let lower-authority synthesis overwrite higher-authority facts" in identity_prompt
+    assert "preserve that concrete meaning instead of abstracting it" in identity_prompt
+    assert "do not rewrite it as \"wellness application\"" in identity_prompt
+    assert "preserve concrete relationship-state terms exactly" in identity_prompt
+    assert "\"estranged\" means estranged" in identity_prompt
+    assert "\"long distance\" means long distance" in identity_prompt
     assert "not a character study" in identity_prompt
+    assert "not a therapy note" in identity_prompt
+    assert "raw user excerpts" in identity_prompt
     assert "do not dramatize the user" in identity_prompt
     assert "do not infer hidden motives" in identity_prompt
     assert "personality verdicts" in identity_prompt
     assert "trying to prove" in identity_prompt
     assert "if it is merely clever, flattering, dramatic, or poetic" in identity_prompt
+    assert "what do they want, stated plainly and not inferred" in identity_prompt
+    assert "do not freeze a hard season into identity" in identity_prompt
 
     assert "not a therapy note" in living_prompt
+    assert "raw user excerpts" in living_prompt
     assert "do not invent hidden motives" in living_prompt
     assert "do not frame the user as tragic" in living_prompt
     assert "unspoken_goal should be null unless strongly supported" in living_prompt
     assert "sophie directives must be grounded in explicit" in living_prompt
     assert "would not help sophie respond better" in living_prompt
+    assert "not a mood summary" in living_prompt
+    assert "sophie needs current operating context, not emotional weather" in living_prompt
 
 
 def test_pass4_validator_removes_personality_verdicts_and_motive_inference():
@@ -1696,6 +1735,151 @@ async def test_pass3_relationship_resolution_supersedes_old_conflict_thread(monk
 
 
 @pytest.mark.asyncio
+async def test_pass3_rejects_emotional_summary_relationship_thread_create(monkeypatch):
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.derived_pipeline_llm_enabled = True
+        tenant_id = "default"
+        user_id = _unique("thread-same-person-user")
+        session_id = _unique("thread-same-person-session")
+        existing_thread_id = _unique("existing-relationship-thread")
+        text = "I feel a lot of grief and guilt about Jasmine and the years we lost."
+        messages = [{"role": "user", "text": text, "timestamp": "2026-04-21T10:00:00Z"}]
+        await db.execute(
+            """
+            INSERT INTO session_classifications (
+                session_id, user_id, session_date, is_memory_worthy, session_kind,
+                one_line_summary, entity_mentions, run_entity_pass, run_threads_pass,
+                identity_relevant, emotional_weight, processed_at, model_used,
+                raw_triage_output, context_relevant
+            )
+            VALUES ($1,$2,NOW(),true,'personal','same person relationship','{Jasmine}'::text[],false,true,false,
+                    'high',NOW(),'fixture',$3::jsonb,true)
+            """,
+            session_id,
+            user_id,
+            {"thread_signals": ["User feels grief and guilt about Jasmine."]},
+        )
+        await db.execute(
+            """
+            INSERT INTO open_threads (
+                thread_id, user_id, title, detail, status, priority, category,
+                related_entities, source_session_ids, evidence_turn_refs,
+                distinct_session_count, lifecycle_state, created_at, last_updated_at, last_mentioned_at
+            )
+            VALUES (
+                $1,$2,'Reconnecting with Jasmine','User has been estranged from Jasmine for years and is trying to reconnect.',
+                'open','high','relationship',$3::text[],$4::text[],$5::jsonb,
+                1,'active',NOW() - interval '10 days',NOW() - interval '2 days',NOW() - interval '2 days'
+            )
+            """,
+            existing_thread_id,
+            user_id,
+            ["Jasmine"],
+            ["old-session"],
+            [{"session_id": "old-session", "turn_index": 0, "text": "I want to reconnect with Jasmine."}],
+        )
+
+        async def _actions_stub(**_kwargs):
+            return [
+                {
+                    "action": "CREATE",
+                    "title": "User's grief and guilt regarding Jasmine",
+                    "detail": text,
+                    "category": "relationship",
+                    "priority": "high",
+                    "unresolvedness": "open",
+                    "follow_up_value": "high",
+                    "evidence_strength": "strong",
+                    "why_this_matters_later": "Jasmine remains a major unresolved relationship.",
+                }
+            ]
+
+        monkeypatch.setattr(derived_pipeline, "extract_thread_actions", _actions_stub, raising=True)
+
+        await run_pass3_threads(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            messages=messages,
+            settings=settings,
+        )
+
+        rows = await db.fetch(
+            """
+            SELECT thread_id, title, detail, related_entities, source_session_ids, distinct_session_count
+            FROM open_threads
+            WHERE user_id=$1
+            ORDER BY created_at
+            """,
+            user_id,
+        )
+        assert len(rows) == 1
+        assert rows[0]["thread_id"] == existing_thread_id
+        assert rows[0]["related_entities"] == ["Jasmine"]
+        assert rows[0]["source_session_ids"] == ["old-session"]
+        assert rows[0]["distinct_session_count"] == 1
+        assert "trying to reconnect" in rows[0]["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_thread_audit_merges_emotional_relationship_summary_into_keeper():
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.derived_pipeline_llm_enabled = False
+        tenant_id = "default"
+        user_id = _unique("thread-audit-user")
+        keeper_id = _unique("keeper-thread")
+        emotional_id = _unique("emotion-thread")
+
+        await db.execute(
+            """
+            INSERT INTO open_threads (
+                thread_id, user_id, title, detail, status, priority, category,
+                related_entities, source_session_ids, evidence_turn_refs,
+                distinct_session_count, lifecycle_state, created_at, last_updated_at, last_mentioned_at
+            )
+            VALUES
+            (
+                $1,$3,'Reconnecting with Jasmine','User has been estranged from Jasmine and is trying to reconnect.',
+                'open','high','relationship',$4::text[],$5::text[],'[]'::jsonb,
+                2,'active',NOW() - interval '8 days',NOW() - interval '2 days',NOW() - interval '2 days'
+            ),
+            (
+                $2,$3,'user''s grief and guilt regarding jasmine','User described grief and guilt about the years lost with Jasmine.',
+                'open','medium','relationship',$4::text[],$6::text[],'[]'::jsonb,
+                1,'active',NOW() - interval '6 days',NOW() - interval '1 day',NOW() - interval '1 day'
+            )
+            """,
+            keeper_id,
+            emotional_id,
+            user_id,
+            ["Jasmine"],
+            ["older-session"],
+            ["newer-session"],
+        )
+
+        summary = await run_thread_audit(db=db, tenant_id=tenant_id, user_id=user_id, settings=settings)
+
+        keeper = await db.fetchone(
+            "SELECT status, lifecycle_state FROM open_threads WHERE thread_id=$1",
+            keeper_id,
+        )
+        emotional = await db.fetchone(
+            "SELECT status, lifecycle_state, superseded_by_thread_id, resolution_note FROM open_threads WHERE thread_id=$1",
+            emotional_id,
+        )
+
+        assert summary["merged"] >= 1
+        assert keeper["status"] == "open"
+        assert emotional["status"] == "resolved"
+        assert emotional["lifecycle_state"] == "superseded"
+        assert emotional["superseded_by_thread_id"] == keeper_id
+        assert "underlying relationship thread" in (emotional["resolution_note"] or "").lower()
+
+
+@pytest.mark.asyncio
 async def test_pass3_quarantines_explicit_conflicting_thread_entity_create(monkeypatch):
     async with app.router.lifespan_context(app):
         settings = get_settings()
@@ -2334,6 +2518,263 @@ async def test_conservative_memory_audits_include_retrospective_summary():
 
 
 @pytest.mark.asyncio
+async def test_always_on_packet_prefers_explicit_profile_truth_and_persists():
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.always_on_memory_packet_llm_enabled = False
+        user_id = _unique("always-on-user")
+        tenant_id = "default"
+
+        await db.execute(
+            """
+            INSERT INTO user_identity (tenant_id, user_id, data, updated_at)
+            VALUES (
+                $1,$2,$3::jsonb,NOW()
+            )
+            ON CONFLICT (tenant_id, user_id)
+            DO UPDATE SET data=EXCLUDED.data, updated_at=NOW()
+            """,
+            tenant_id,
+            user_id,
+            {
+                "name": "Kaiser",
+                "location": "Cambridge",
+                "faith": "LDS",
+                "projects": ["Sophie", "Bluum"],
+            },
+        )
+        await db.execute(
+            """
+            INSERT INTO identity_profile (
+                user_id, who_they_are, faith_and_beliefs, how_they_relate,
+                current_chapter, core_values, persistent_goals, what_they_want, assertions, last_synthesized_at,
+                source_session_count, synthesis_model, created_at, updated_at
+            )
+            VALUES (
+                $1,'Founder and builder working on memory systems.',
+                'Faith informs how he thinks about care and continuity.',
+                'He prefers directness over cushioning.',
+                'Building a memory system.', $2::jsonb, $3::jsonb, 'He wants grounded continuity.',
+                '[]'::jsonb,NOW(),2,'fixture',NOW(),NOW()
+            )
+            ON CONFLICT (user_id) DO UPDATE SET
+                who_they_are=EXCLUDED.who_they_are,
+                faith_and_beliefs=EXCLUDED.faith_and_beliefs,
+                how_they_relate=EXCLUDED.how_they_relate,
+                current_chapter=EXCLUDED.current_chapter,
+                core_values=EXCLUDED.core_values,
+                persistent_goals=EXCLUDED.persistent_goals,
+                what_they_want=EXCLUDED.what_they_want,
+                updated_at=NOW()
+            """,
+            user_id,
+            ["truth", "continuity", "faith"],
+            ["Build Sophie well"],
+        )
+        await db.execute(
+            """
+            INSERT INTO living_context (
+                user_id, current_focus, primary_tension, relationship_pulse, emotional_texture,
+                sophie_directives, active_contradictions, assertions, last_synthesized_at,
+                source_session_count, synthesis_model, created_at, updated_at
+            )
+            VALUES (
+                $1,'Current focus is building Sophie and Bluum.',
+                'Primary tension is shipping memory without drift.',
+                'Jasmine reconnection matters.', 'The user is trying to stay steady.',
+                '[]'::jsonb,'[]'::jsonb,'[]'::jsonb,NOW(),2,'fixture',NOW(),NOW()
+            )
+            ON CONFLICT (user_id) DO UPDATE SET
+                current_focus=EXCLUDED.current_focus,
+                primary_tension=EXCLUDED.primary_tension,
+                relationship_pulse=EXCLUDED.relationship_pulse,
+                emotional_texture=EXCLUDED.emotional_texture,
+                updated_at=NOW()
+            """,
+            user_id,
+        )
+        await db.execute(
+            """
+            INSERT INTO entity_profiles (
+                user_id, canonical_name, canonical_name_normalized, type, aliases,
+                status, relationship_to_user, profile_text, last_known_status,
+                confidence, mention_count, first_seen_at, last_seen_at,
+                source_session_ids, salience_score, importance_score
+            ) VALUES (
+                $1,'Jasmine','jasmine','person',$2::text[],'active','daughter',
+                'Jasmine is the user''s daughter.','Reconnection is meaningful.',
+                0.95,3,NOW(),NOW(),$3::text[],0.95,0.95
+            )
+            ON CONFLICT (user_id, canonical_name_normalized) DO UPDATE SET
+                profile_text=EXCLUDED.profile_text,
+                last_known_status=EXCLUDED.last_known_status,
+                salience_score=EXCLUDED.salience_score,
+                last_updated_at=NOW()
+            """,
+            user_id,
+            ["Jasmine"],
+            ["session-a", "session-b"],
+        )
+
+        packet = await build_always_on_memory_packet(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            force_rebuild=True,
+        )
+        stored = await db.fetchone(
+            """
+            SELECT packet_version, profile_truth_used, sections, packet_text
+            FROM always_on_memory_packets
+            WHERE tenant_id=$1 AND user_id=$2
+            """,
+            tenant_id,
+            user_id,
+        )
+
+        assert packet["profile_truth_used"] is True
+        assert "Name: Kaiser." in packet["sections"]["enduring_identity"]
+        assert any("Based in Cambridge." == item for item in packet["sections"]["enduring_identity"])
+        assert any("Faith / worldview: LDS." == item for item in packet["sections"]["enduring_identity"])
+        assert any("Founder and builder" in item for item in packet["sections"]["enduring_identity"])
+        assert len(packet["sections"]["enduring_identity"]) >= 4
+        assert any("Sophie" in item for item in packet["sections"]["work_and_building"])
+        assert any("Jasmine" in item for item in packet["sections"]["important_people"])
+        assert all("The user is trying to stay steady." != item for item in packet["sections"]["handle_carefully"])
+        assert packet["sections"].get("open_questions", []) == []
+        assert stored["packet_version"] == "always_on_memory_packet.v1"
+        assert stored["profile_truth_used"] is True
+        assert isinstance(stored["sections"], dict)
+        assert stored["packet_text"]
+
+
+@pytest.mark.asyncio
+async def test_always_on_packet_debug_endpoint_returns_cached_artifact():
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.always_on_memory_packet_llm_enabled = False
+        user_id = _unique("always-on-endpoint-user")
+        tenant_id = "default"
+
+        await db.execute(
+            """
+            INSERT INTO user_identity (tenant_id, user_id, data, updated_at)
+            VALUES ($1,$2,$3::jsonb,NOW())
+            ON CONFLICT (tenant_id, user_id)
+            DO UPDATE SET data=EXCLUDED.data, updated_at=NOW()
+            """,
+            tenant_id,
+            user_id,
+            {"name": "Casey", "location": "London"},
+        )
+
+        await build_always_on_memory_packet(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            force_rebuild=True,
+        )
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get(
+                "/internal/debug/always-on-packet",
+                params={"tenantId": tenant_id, "userId": user_id, "forceRebuild": "false"},
+            )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["version"] == "always_on_memory_packet.v1"
+        assert payload["profile_truth_used"] is True
+        assert "sections" in payload
+        assert payload["packet_text"]
+
+
+@pytest.mark.asyncio
+async def test_always_on_packet_filters_contextual_relationship_entities():
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.always_on_memory_packet_llm_enabled = False
+        user_id = _unique("always-on-tier-user")
+        tenant_id = "default"
+
+        await db.execute(
+            """
+            INSERT INTO user_identity (tenant_id, user_id, data, updated_at)
+            VALUES ($1,$2,$3::jsonb,NOW())
+            ON CONFLICT (tenant_id, user_id)
+            DO UPDATE SET data=EXCLUDED.data, updated_at=NOW()
+            """,
+            tenant_id,
+            user_id,
+            {
+                "declared_profile_truth": {
+                    "preferred_name": "Mukesh",
+                    "roles": ["founder"],
+                    "projects": ["Sophie — voice-first AI companion"],
+                }
+            },
+        )
+
+        await db.execute(
+            """
+            INSERT INTO entity_profiles (
+                user_id, canonical_name, canonical_name_normalized, type, aliases,
+                status, relationship_to_user, profile_text, key_facts, open_questions,
+                last_known_status, confidence, mention_count, distinct_session_count,
+                first_seen_at, last_seen_at, source_session_ids, salience_score, importance_score
+            ) VALUES
+            (
+                $1,'Jasmine','jasmine','person',$2::text[],'active','daughter',
+                'Jasmine is the user''s daughter.','[{\"fact\":\"The user and Jasmine have been estranged for approximately six years\"}]'::jsonb,'[]'::jsonb,
+                'In early reconciliation',0.95,4,4,NOW(),NOW(),$3::text[],0.95,0.95
+            ),
+            (
+                $1,'Ashley','ashley','person',$4::text[],'active','girlfriend',
+                'Ashley is the user''s long-term, long-distance girlfriend.','[{\"fact\":\"The relationship is long-distance\"}]'::jsonb,'[]'::jsonb,
+                'Back together after recent visit',0.95,4,4,NOW(),NOW(),$5::text[],0.94,0.94
+            ),
+            (
+                $1,'Yoshi','yoshi','person',$6::text[],'active','other',
+                'Yoshi is Ashley''s little girl.','[{\"fact\":\"Yoshi is Ashley''s daughter\"}]'::jsonb,'[]'::jsonb,
+                'In contact with the user',0.95,6,6,NOW(),NOW(),$7::text[],0.97,0.97
+            ),
+            (
+                $1,'Jasmine''s Mother','jasmine_s_mother','person',$8::text[],'active','other',
+                'Jasmine''s mother is acting as a communication bridge.','[{\"fact\":\"She is the mother of the user''s daughter\"}]'::jsonb,'[]'::jsonb,
+                'Acting as a bridge of communication',0.95,6,6,NOW(),NOW(),$9::text[],0.97,0.97
+            )
+            ON CONFLICT (user_id, canonical_name_normalized) DO UPDATE SET
+                profile_text=EXCLUDED.profile_text,
+                key_facts=EXCLUDED.key_facts,
+                last_known_status=EXCLUDED.last_known_status,
+                salience_score=EXCLUDED.salience_score,
+                importance_score=EXCLUDED.importance_score,
+                distinct_session_count=EXCLUDED.distinct_session_count,
+                last_updated_at=NOW()
+            """,
+            user_id,
+            ["Jasmine"],
+            ["session-a", "session-b", "session-c", "session-d"],
+            ["Ashley"],
+            ["session-e", "session-f", "session-g", "session-h"],
+            ["Yoshi"],
+            ["session-i", "session-j", "session-k", "session-l", "session-m", "session-n"],
+            ["Jasmine's Mother"],
+            ["session-o", "session-p", "session-q", "session-r", "session-s", "session-t"],
+        )
+
+        packet = await build_always_on_memory_packet(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            force_rebuild=True,
+        )
+
+        important = packet["sections"]["important_people"]
+        assert any("Jasmine" in item for item in important)
+        assert any("Ashley" in item for item in important)
+        assert all("Yoshi" not in item for item in important)
+        assert all("Jasmine's Mother" not in item for item in important)
+
+
+@pytest.mark.asyncio
 async def test_entity_audit_clears_assistant_contaminated_profile():
     async with app.router.lifespan_context(app):
         user_id = _unique("entity-audit-user")
@@ -2529,6 +2970,7 @@ async def test_entity_audit_scans_beyond_first_batch():
 @pytest.mark.asyncio
 async def test_packet_compilers_inject_durable_anchor_and_explain_inclusion():
     async with app.router.lifespan_context(app):
+        tenant_id = "default"
         user_id = _unique("packet-user")
         session_id = _unique("packet-session")
         await db.execute(
@@ -2591,16 +3033,141 @@ async def test_packet_compilers_inject_durable_anchor_and_explain_inclusion():
         )
 
         rows = await db.fetch("SELECT session_id, session_date, raw_triage_output, tension_signal FROM session_classifications WHERE user_id=$1", user_id)
-        pass4_packet = await build_pass4_identity_packet(db=db, user_id=user_id, rows=[dict(row) for row in rows])
+        pass4_packet = await build_pass4_identity_packet(db=db, tenant_id=tenant_id, user_id=user_id, rows=[dict(row) for row in rows])
         pass5_packet = await build_pass5_living_packet(db=db, user_id=user_id, rows=[dict(row) for row in rows])
 
         assert pass4_packet["durable_anchors"][0]["canonical_name"] == "Jules"
         assert pass4_packet["durable_anchors"][0]["why_included"] == "durable_relationship_anchor"
         assert pass4_packet["durable_anchors"][0]["evidence_strength"] in {"medium", "strong"}
+        assert isinstance(pass4_packet["declared_profile_truth"], dict)
+        assert isinstance(pass4_packet["declared_truth_facts"], list)
+        assert isinstance(pass4_packet["durable_profile_facts"], list)
         assert pass5_packet["key_entities"][0]["canonical_name"] == "Jules"
         assert pass5_packet["key_entities"][0]["why_included"] == "active_or_durable_entity"
         assert pass5_packet["active_threads"][0]["why_included"] == "high_signal_active_thread"
         assert pass5_packet["active_threads"][0]["evidence_refs"]
+
+
+@pytest.mark.asyncio
+async def test_pass4_packet_includes_declared_truth_and_durable_profile_facts():
+    async with app.router.lifespan_context(app):
+        tenant_id = "default"
+        user_id = _unique("pass4-anchors-user")
+        await db.execute(
+            """
+            INSERT INTO user_identity (tenant_id, user_id, data, updated_at)
+            VALUES ($1,$2,$3::jsonb,NOW())
+            ON CONFLICT (tenant_id, user_id)
+            DO UPDATE SET data=EXCLUDED.data, updated_at=NOW()
+            """,
+            tenant_id,
+            user_id,
+            {
+                "name": "Kaiser",
+                "location": "Cambridge",
+                "faith": "LDS",
+                "roles": ["founder", "product lead"],
+                "projects": ["Sophie", "Bluum"],
+                "writing": ["Substack essays on theology and psychology"],
+            },
+        )
+        await db.execute(
+            """
+            INSERT INTO entity_profiles (
+                user_id, canonical_name, canonical_name_normalized, type, aliases,
+                status, relationship_to_user, profile_text, last_known_status,
+                confidence, mention_count, first_seen_at, last_seen_at,
+                source_session_ids, distinct_session_count, salience_score, importance_score
+            ) VALUES
+            (
+                $1,'Jasmine','jasmine','person',$2::text[],'active','daughter',
+                'Jasmine is the user''s daughter.','Active reconciliation.',
+                0.95,3,NOW(),NOW(),$3::text[],2,0.95,0.95
+            ),
+            (
+                $1,'Sophie','sophie','project',$4::text[],'active','owned_project',
+                'Sophie is a core product.','Testing phase.',
+                0.9,4,NOW(),NOW(),$5::text[],3,0.9,0.9
+            )
+            ON CONFLICT (user_id, canonical_name_normalized) DO UPDATE
+            SET last_updated_at=NOW()
+            """,
+            user_id,
+            ["Jasmine"],
+            ["session-a", "session-b"],
+            ["Sophie"],
+            ["session-a", "session-b", "session-c"],
+        )
+        await db.execute(
+            """
+            INSERT INTO open_threads (
+                thread_id, user_id, title, detail, status, priority, category,
+                source_session_ids, evidence_turn_refs, distinct_session_count,
+                created_at, last_updated_at, last_mentioned_at
+            )
+            VALUES (
+                $1,$2,'Morning Routine and Hydration Goals',
+                'Hydration matters after recent kidney stones.',
+                'open','medium','goal',$3::text[],$4::jsonb,2,NOW(),NOW(),NOW()
+            )
+            """,
+            _unique("health-anchor-thread"),
+            user_id,
+            ["session-a", "session-b"],
+            [{"session_id": "session-b", "turn_index": 0}],
+        )
+        await db.execute(
+            """
+            INSERT INTO pipeline_runs (
+                run_id, tenant_id, user_id, session_id, pass_name,
+                model_version, prompt_version, policy_version,
+                input_watermark, input_hash, status, attempt_count, started_at
+            ) VALUES (
+                $1,$2,$3,NULL,'pass1_triage',
+                'fixture-model','fixture-prompt','fixture-policy',
+                NULL,'fixture-hash','succeeded',1,NOW()
+            )
+            ON CONFLICT (run_id) DO NOTHING
+            """,
+            999001,
+            tenant_id,
+            user_id,
+        )
+        await db.execute(
+            """
+            INSERT INTO derived_assertions (
+                tenant_id, user_id, pass_name, surface, run_id, statement_text, lifecycle_state,
+                salience, importance, confidence_extraction, confidence_validity,
+                source_session_ids, source_turn_refs, memory_layer, semantic_category,
+                retention_floor, first_seen_at, last_seen_at, distinct_session_count,
+                created_at, updated_at
+            ) VALUES (
+                $1,$2,'pass1_triage','identity_signal',$3,
+                'User writes Substack essays on LDS theology and psychology.','active',
+                0.7,0.8,0.8,0.8,$4::text[],$5::jsonb,'LML','identity_signal',0.5,
+                NOW(),NOW(),2,NOW(),NOW()
+            )
+            """,
+            tenant_id,
+            user_id,
+            999001,
+            ["session-a", "session-b"],
+            [{"session_id": "session-a", "turn_index": 0}],
+        )
+
+        packet = await build_pass4_identity_packet(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            rows=[],
+        )
+
+        assert packet["declared_profile_truth"]["preferred_name"] == "Kaiser"
+        assert any(f["fact_type"] == "role" and f["source_type"] == "declared_truth" for f in packet["declared_truth_facts"])
+        assert any(f["fact_type"] == "important_person" and f["source_type"] == "durable_derived" for f in packet["durable_profile_facts"])
+        assert any(f["fact_type"] == "work_or_project" and "Sophie" in f["fact_value"] for f in packet["durable_profile_facts"])
+        assert any(f["fact_type"] == "health_anchor" for f in packet["durable_profile_facts"])
+        assert any(f["fact_type"] == "writing_or_public_work" and f["source_type"] == "repeated_explicit" for f in packet["durable_profile_facts"])
 
 
 @pytest.mark.asyncio

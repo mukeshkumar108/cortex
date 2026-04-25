@@ -17,12 +17,14 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from .canonicalization import normalize_text, stable_short_hash
 from .config import Settings, get_settings
 from .db import Database
+from .declared_profile_truth import extract_declared_profile_truth
 from .openrouter_client import get_llm_client
 from .derived_passes.pass1_triage import run_rich_pass1_llm
 from .derived_passes.pass15_entities import build_entity_profile, resolve_entity_mentions
 from .derived_passes.pass3_threads import audit_thread_registry, extract_thread_actions, VALID_CATEGORIES, VALID_PRIORITIES
 from .derived_passes.pass4_identity import normalize_identity_output, synthesize_identity_profile
 from .derived_passes.pass5_living_context import normalize_living_context_output, synthesize_living_context
+from .relationship_tiers import entity_relationship_tier, pass4_anchor_allowed, relationship_tier_rank
 from .derived_passes.synthesis_quality import conservative_rewrite_text, has_synthesis_quality_issue
 
 logger = logging.getLogger(__name__)
@@ -251,6 +253,27 @@ def _text_list(value: Any, *, limit: int = 12) -> List[str]:
         normalized = normalize_text(text, casefold=False)
         if normalized and normalized not in out:
             out.append(normalized)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _entity_fact_texts(value: Any, *, limit: int = 12) -> List[str]:
+    out: List[str] = []
+    for item in _as_list(value):
+        if isinstance(item, dict):
+            text = (
+                item.get("fact")
+                or item.get("text")
+                or item.get("statement")
+                or item.get("value")
+                or item.get("name")
+            )
+        else:
+            text = item
+        clean = normalize_text(text, casefold=False)
+        if clean and clean not in out:
+            out.append(clean)
         if len(out) >= limit:
             break
     return out
@@ -719,18 +742,21 @@ def _thread_allowed_for_synthesis(row: Dict[str, Any]) -> bool:
 def _entity_signal_rank(row: Dict[str, Any]) -> tuple[int, float, float, datetime]:
     relationship = normalize_text(row.get("relationship_to_user"))
     role_rank = _relationship_rank(relationship)
+    tier_rank = relationship_tier_rank(entity_relationship_tier(row))
     importance = float(row.get("importance_score") or 0.0)
     salience = float(row.get("salience_score") or 0.0)
     last_seen = row.get("last_seen_at") if isinstance(row.get("last_seen_at"), datetime) else datetime.min.replace(tzinfo=timezone.utc)
     profile = normalize_text(row.get("profile_text") or row.get("profile_snippet"))
     profile_bonus = 1 if len(profile) >= 40 else 0
-    return (role_rank + profile_bonus, importance, salience, last_seen)
+    return (max(role_rank, tier_rank * 25) + profile_bonus, importance, salience, last_seen)
 
 
 def _entity_allowed_for_synthesis(row: Dict[str, Any]) -> bool:
     if not _is_entity_allowed_for_living_context(row):
         return False
     if not _has_entity_serving_content(row):
+        return False
+    if entity_relationship_tier(row) == "tier_3_contextual" and not pass4_anchor_allowed(row):
         return False
     relationship = normalize_text(row.get("relationship_to_user"))
     profile = normalize_text(row.get("profile_text") or row.get("profile_snippet"))
@@ -1488,6 +1514,48 @@ async def _source_turn_refs_from_session(
     return [{"session_id": session_id, "source": "session_classifications"}]
 
 
+def _user_excerpt_from_messages(messages: Any, *, max_chars: int = 1600) -> Optional[str]:
+    if not isinstance(messages, list):
+        return None
+    lines: List[str] = []
+    used = 0
+    for row in messages:
+        if not isinstance(row, dict):
+            continue
+        if normalize_text(row.get("role")) != "user":
+            continue
+        text = normalize_text(row.get("text") or row.get("content"), casefold=False)
+        if not text:
+            continue
+        chunk = f"User: {text}"
+        if used + len(chunk) > max_chars and lines:
+            break
+        lines.append(chunk[: max(0, max_chars - used)])
+        used += len(lines[-1]) + 1
+        if used >= max_chars:
+            break
+    excerpt = "\n".join(line for line in lines if line).strip()
+    return excerpt or None
+
+
+async def _session_user_excerpt(
+    *,
+    db: Database,
+    session_id: str,
+    max_chars: int = 1600,
+) -> Optional[str]:
+    row = await db.fetchone(
+        """
+        SELECT messages
+        FROM session_transcript
+        WHERE session_id=$1
+        LIMIT 1
+        """,
+        session_id,
+    )
+    return _user_excerpt_from_messages((row or {}).get("messages"), max_chars=max_chars)
+
+
 def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
     text = (raw or "").strip()
     if not text:
@@ -1542,13 +1610,33 @@ def _heuristic_pass1(messages: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             continue
         if name not in entity_mentions:
             entity_mentions.append(name)
+    identity_signal_terms = ("i believe", "i value", "i want", "i need", "my faith", "my daughter", "my son", "my partner", "my wife", "my husband")
     identity_signals = [
         s for s in sentences
-        if any(term in normalize_text(s) for term in ("i am", "i'm", "i want", "i believe", "i feel", "my fear", "my goal"))
+        if any(term in normalize_text(s) for term in identity_signal_terms)
+        and not any(term in normalize_text(s) for term in ("i feel", "i'm feeling", "i am feeling"))
     ][:4]
+    thread_signal_terms = (
+        "need to",
+        "follow up",
+        "remind",
+        "waiting",
+        "unresolved",
+        "goal",
+        "doctor",
+        "hospital",
+        "message",
+        "reply",
+        "did not reply",
+        "didn't reply",
+        "not speaking",
+        "estranged",
+        "followed me back",
+        "followed back",
+    )
     thread_signals = [
         s for s in sentences
-        if any(term in normalize_text(s) for term in ("need to", "follow up", "remind", "worried", "waiting", "unresolved", "goal"))
+        if any(term in normalize_text(s) for term in thread_signal_terms)
     ][:4]
     context_relevant = bool(memory_deltas or thread_signals or "tension" in text_norm or "stressed" in text_norm)
     emotional_weight = "medium" if any(t in text_norm for t in ("stressed", "upset", "worried", "scared", "angry")) else "low"
@@ -1974,7 +2062,130 @@ def _unresolvedness(value: Any, *, default: str = "open") -> str:
     return default
 
 
+EMOTION_ONLY_THREAD_TERMS = {
+    "grief",
+    "guilt",
+    "shame",
+    "anger",
+    "resentment",
+    "worthlessness",
+    "overwhelmed",
+    "stress",
+    "stressed",
+    "frustration",
+    "frustrated",
+    "sadness",
+    "sad",
+    "hurt",
+    "pain",
+    "neglect",
+    "care",
+}
+
+
+def _thread_is_emotion_summary(*, title: Any, detail: Any, category: Any) -> bool:
+    category_norm = normalize_text(category)
+    if category_norm not in {"relationship", "worry", "other", "session_observation"}:
+        return False
+    title_text = normalize_text(title).casefold()
+    detail_text = normalize_text(detail).casefold()
+    combined = f"{title_text} {detail_text}".strip()
+    if not combined:
+        return False
+    if not any(term in combined for term in EMOTION_ONLY_THREAD_TERMS):
+        return False
+    situation_terms = {
+        "message",
+        "reply",
+        "replied",
+        "follow",
+        "followed",
+        "instagram",
+        "text",
+        "email",
+        "visit",
+        "visited",
+        "hospital",
+        "doctor",
+        "hydration",
+        "kidney",
+        "not speaking",
+        "estranged",
+        "reconnect",
+        "reconciliation",
+        "breakup",
+        "broke up",
+        "together",
+        "routine",
+        "goal",
+    }
+    if any(term in combined for term in situation_terms):
+        return False
+    if any(
+        phrase in title_text
+        for phrase in (
+            "user is feeling",
+            "user's feelings",
+            "user's anger",
+            "user's grief",
+            "user's guilt",
+            "user's shame",
+            "user's approach",
+            "user's resentment",
+            "user's worthlessness",
+        )
+    ):
+        return True
+    return False
+
+
+def _relationship_thread_title(*, detail: Any, related_entities: Any) -> Optional[str]:
+    entities = _text_list(related_entities, limit=2)
+    if not entities:
+        return None
+    entity = entities[0]
+    detail_text = normalize_text(detail).casefold()
+    if any(term in detail_text for term in ("reconnect", "reconnecting", "followed", "follow request", "instagram", "message", "reply", "text")):
+        return f"Reconnecting with {entity}"
+    if any(term in detail_text for term in ("regular messages", "low-expectation", "low expectation", "giving her space", "giving him space", "still there while")):
+        return f"{entity} — maintaining contact during reconciliation"
+    if any(term in detail_text for term in ("not speaking", "estranged", "severed")):
+        return f"Relationship with {entity} is strained"
+    if any(term in detail_text for term in ("email", "colder emails", "defensive", "breakup", "blocked", "closure")):
+        return f"{entity} relationship after breakup"
+    return f"Relationship with {entity}"
+
+
+def _find_relationship_keeper_thread(rows: Sequence[Dict[str, Any]], current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    current_id = normalize_text(current.get("thread_id"))
+    current_entities = _thread_related_entity_set(current)
+    if not current_entities:
+        return None
+    for row in rows:
+        candidate = dict(row)
+        if normalize_text(candidate.get("thread_id")) == current_id:
+            continue
+        if normalize_text(candidate.get("category")) != "relationship":
+            continue
+        if _thread_is_emotion_summary(
+            title=candidate.get("title"),
+            detail=candidate.get("detail"),
+            category=candidate.get("category"),
+        ):
+            continue
+        candidate_entities = _thread_related_entity_set(candidate)
+        if candidate_entities and candidate_entities & current_entities:
+            return candidate
+    return None
+
+
 def _thread_action_allowed(action: Dict[str, Any], *, kind: str, category: str, priority: str) -> bool:
+    if _thread_is_emotion_summary(
+        title=action.get("title"),
+        detail=action.get("detail"),
+        category=category,
+    ):
+        return False
     if not _thread_quality_fields_present(action):
         return True
     evidence_strength = _resolution_strength(action.get("evidence_strength"))
@@ -2152,6 +2363,12 @@ async def _find_existing_thread_for_topic(
     )
     if not incoming_key:
         return None
+    incoming_category = normalize_text(category)
+    incoming_entities = {
+        _canonical_name_norm(item)
+        for item in _text_list(related_entities, limit=8)
+        if _canonical_name_norm(item)
+    }
     rows = await db.fetch(
         """
         SELECT thread_id, title, detail, category, status, lifecycle_state, related_entities,
@@ -2180,6 +2397,13 @@ async def _find_existing_thread_for_topic(
         )
         if existing_key == incoming_key:
             return dict(row)
+    if incoming_category == "relationship" and incoming_entities:
+        for row in rows:
+            if normalize_text(row.get("category")) != "relationship":
+                continue
+            existing_entities = _thread_related_entity_set(dict(row))
+            if existing_entities and existing_entities & incoming_entities:
+                return dict(row)
     return None
 
 
@@ -2565,11 +2789,12 @@ async def run_pass3_threads(
 ) -> DerivedPassResult:
     s = settings or get_settings()
     classification = await db.fetchone(
-        "SELECT raw_triage_output FROM session_classifications WHERE session_id=$1 AND user_id=$2",
+        "SELECT entity_mentions, raw_triage_output FROM session_classifications WHERE session_id=$1 AND user_id=$2",
         session_id,
         user_id,
     )
     raw = (classification or {}).get("raw_triage_output") if classification else {}
+    session_entity_mentions = _text_list((classification or {}).get("entity_mentions"), limit=6)
     thread_signals = _text_list((raw or {}).get("thread_signals"), limit=8) if isinstance(raw, dict) else []
     input_hash = _input_hash(
         tenant_id=tenant_id,
@@ -2702,6 +2927,8 @@ async def run_pass3_threads(
                 thread_id_existing = normalize_text(action.get("thread_id"))
                 action_category = normalize_text(action.get("category")) or "other"
                 action_priority = normalize_text(action.get("priority")) or "medium"
+                if action_category == "relationship" and not _text_list(action.get("related_entities"), limit=6):
+                    action["related_entities"] = session_entity_mentions
                 if action_priority not in VALID_PRIORITIES:
                     action_priority = "medium"
                 if not _thread_action_allowed(
@@ -2847,6 +3074,12 @@ async def run_pass3_threads(
             if priority not in VALID_PRIORITIES:
                 priority = "medium"
             related_entities = _text_list(action.get("related_entities"), limit=6)
+            if category == "relationship" and not related_entities:
+                related_entities = session_entity_mentions
+            if category == "relationship":
+                canonical_title = _relationship_thread_title(detail=signal, related_entities=related_entities)
+                if canonical_title:
+                    title = canonical_title[:120]
             if _is_relationship_resolution_action(action, category=category):
                 resolved_count = await _resolve_prior_relationship_threads(action=action)
                 if resolved_count > 0:
@@ -3339,6 +3572,9 @@ def _packet_importance(row: Dict[str, Any]) -> float:
             pass
     if _relationship_rank(row.get("relationship_to_user")) >= 85:
         values.append(0.95)
+    tier = entity_relationship_tier(row)
+    if tier:
+        values.append(min(0.98, relationship_tier_rank(tier) * 0.22))
     if normalize_text(row.get("priority")) == "high":
         values.append(0.9)
     return max(values or [0.0])
@@ -3354,6 +3590,14 @@ def _with_packet_reason(row: Dict[str, Any], *, why: str) -> Dict[str, Any]:
     return out
 
 
+def _build_relationship_anchor(row: Dict[str, Any]) -> Dict[str, Any]:
+    anchor = _with_packet_reason(row, why="durable_relationship_anchor")
+    anchor["durable_facts"] = _entity_fact_texts(row.get("key_facts"), limit=4)
+    anchor["profile_context"] = normalize_text(row.get("profile_text"), casefold=False) or None
+    anchor["current_status"] = normalize_text(row.get("last_known_status"), casefold=False) or None
+    return anchor
+
+
 def _entity_name_candidates(row: Dict[str, Any]) -> List[str]:
     names = [normalize_text(row.get("canonical_name"))]
     names.extend(_text_list(row.get("aliases"), limit=12))
@@ -3363,6 +3607,427 @@ def _entity_name_candidates(row: Dict[str, Any]) -> List[str]:
         if clean and clean not in out:
             out.append(clean)
     return out
+
+
+def _fact_key(prefix: str, value: Any) -> str:
+    text = normalize_text(value).casefold()
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    if not text:
+        text = stable_short_hash({"prefix": prefix, "value": normalize_text(value)}, length=12)
+    return f"{prefix}.{text}"
+
+
+def _append_fact(
+    out: List[Dict[str, Any]],
+    *,
+    fact_key: str,
+    fact_type: str,
+    fact_value: str,
+    source_type: str,
+    confidence: float,
+    evidence_count: int,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    value = normalize_text(fact_value, casefold=False)
+    if not value:
+        return
+    if any(normalize_text(item.get("fact_key")) == fact_key for item in out):
+        return
+    out.append(
+        {
+            "fact_key": fact_key,
+            "fact_type": fact_type,
+            "fact_value": value,
+            "source_type": source_type,
+            "confidence": float(confidence),
+            "evidence_count": int(evidence_count),
+            "metadata": metadata or {},
+        }
+    )
+
+
+async def _load_declared_profile_truth(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+) -> Dict[str, Any]:
+    identity_row = await db.fetchone(
+        """
+        SELECT data
+        FROM user_identity
+        WHERE tenant_id=$1 AND user_id=$2
+        LIMIT 1
+        """,
+        tenant_id,
+        user_id,
+    )
+    identity_cache_row = await db.fetchone(
+        """
+        SELECT preferred_name, timezone, facts
+        FROM identity_cache
+        WHERE tenant_id=$1 AND user_id=$2
+        LIMIT 1
+        """,
+        tenant_id,
+        user_id,
+    )
+    data = identity_row.get("data") if isinstance(identity_row, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    cache = identity_cache_row or {}
+    return extract_declared_profile_truth(data, cache)
+
+
+def _truth_to_declared_facts(truth: Dict[str, Any]) -> List[Dict[str, Any]]:
+    facts: List[Dict[str, Any]] = []
+    for role in _text_list(truth.get("roles"), limit=8):
+        _append_fact(
+            facts,
+            fact_key=_fact_key("declared.role", role),
+            fact_type="role",
+            fact_value=role,
+            source_type="declared_truth",
+            confidence=1.0,
+            evidence_count=1,
+        )
+    for work_item in _text_list(truth.get("projects") or truth.get("work"), limit=8):
+        _append_fact(
+            facts,
+            fact_key=_fact_key("declared.work", work_item),
+            fact_type="work_or_project",
+            fact_value=work_item,
+            source_type="declared_truth",
+            confidence=1.0,
+            evidence_count=1,
+        )
+    for writing in _text_list(truth.get("writing_or_public_work") or truth.get("writing"), limit=6):
+        _append_fact(
+            facts,
+            fact_key=_fact_key("declared.writing", writing),
+            fact_type="writing_or_public_work",
+            fact_value=writing,
+            source_type="declared_truth",
+            confidence=1.0,
+            evidence_count=1,
+        )
+    for health in _text_list(truth.get("health_considerations") or truth.get("health"), limit=6):
+        _append_fact(
+            facts,
+            fact_key=_fact_key("declared.health", health),
+            fact_type="health_anchor",
+            fact_value=health,
+            source_type="declared_truth",
+            confidence=1.0,
+            evidence_count=1,
+        )
+    if normalize_text(truth.get("faith"), casefold=False):
+        _append_fact(
+            facts,
+            fact_key=_fact_key("declared.faith", truth.get("faith")),
+            fact_type="belief_or_faith",
+            fact_value=normalize_text(truth.get("faith"), casefold=False),
+            source_type="declared_truth",
+            confidence=1.0,
+            evidence_count=1,
+        )
+    for rel in truth.get("important_people") or truth.get("relationships") or []:
+        if not isinstance(rel, dict):
+            continue
+        name = normalize_text(rel.get("name"), casefold=False)
+        relation = normalize_text(rel.get("relationship"), casefold=False)
+        note = normalize_text(rel.get("note"), casefold=False)
+        situation = normalize_text(rel.get("situation"), casefold=False)
+        contact = normalize_text(rel.get("contact"), casefold=False)
+        context = normalize_text(rel.get("context"), casefold=False)
+        directive = normalize_text(rel.get("directive"), casefold=False)
+        location = normalize_text(rel.get("location"), casefold=False)
+        faith = normalize_text(rel.get("faith"), casefold=False)
+        if not name:
+            continue
+        value = f"{name} — {relation}" if relation else name
+        detail_parts = [part for part in (note, situation, contact, context, location, faith) if part]
+        if detail_parts:
+            value = f"{value}; {'; '.join(detail_parts[:3])}"
+        _append_fact(
+            facts,
+            fact_key=_fact_key("declared.person", name),
+            fact_type="important_person",
+            fact_value=value,
+            source_type="declared_truth",
+            confidence=1.0,
+            evidence_count=1,
+            metadata={
+                "name": name,
+                "relationship": relation or None,
+                "note": note or None,
+                "situation": situation or None,
+                "contact": contact or None,
+                "context": context or None,
+                "directive": directive or None,
+                "location": location or None,
+                "faith": faith or None,
+            },
+        )
+    return facts
+
+
+async def _refresh_durable_profile_facts(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+) -> List[Dict[str, Any]]:
+    facts: List[Dict[str, Any]] = []
+    entity_rows = await db.fetch(
+        """
+        SELECT canonical_name, canonical_name_normalized, type, relationship_to_user,
+               profile_text, key_facts, last_known_status,
+               confidence, distinct_session_count, source_session_ids
+        FROM entity_profiles
+        WHERE user_id=$1
+          AND status='active'
+          AND (
+            COALESCE(distinct_session_count, 0) >= 1
+            OR COALESCE(cardinality(source_session_ids), 0) >= 1
+          )
+        ORDER BY importance_score DESC NULLS LAST, salience_score DESC NULLS LAST, last_seen_at DESC NULLS LAST
+        LIMIT 80
+        """,
+        user_id,
+    )
+    project_count = 0
+    has_child = False
+    has_partner = False
+    for row in entity_rows:
+        row_dict = dict(row)
+        name = normalize_text(row_dict.get("canonical_name"), casefold=False)
+        relation = normalize_text(row_dict.get("relationship_to_user"), casefold=False)
+        entity_type = normalize_text(row_dict.get("type"))
+        evidence_count = max(
+            int(row_dict.get("distinct_session_count") or 0),
+            len(set(_text_list(row_dict.get("source_session_ids"), limit=32))),
+            1,
+        )
+        confidence = _confidence_float(row_dict.get("confidence"), default=0.7)
+        if relation in FAMILY_RELATIONSHIP_ROLES:
+            has_child = has_child or relation in {"daughter", "son", "child"}
+            value = f"{name} — {relation}" if name else relation
+            durable_facts = _entity_fact_texts(row_dict.get("key_facts"), limit=3)
+            profile_context = normalize_text(row_dict.get("profile_text"), casefold=False)
+            status = normalize_text(row_dict.get("last_known_status"), casefold=False)
+            detail_parts = [*durable_facts[:2]]
+            if profile_context:
+                detail_parts.append(profile_context)
+            if status:
+                detail_parts.append(f"Current status: {status}")
+            if detail_parts:
+                value = f"{value}; {'; '.join(detail_parts[:3])}"
+            _append_fact(
+                facts,
+                fact_key=_fact_key("person", name or relation),
+                fact_type="important_person",
+                fact_value=value,
+                source_type="durable_derived",
+                confidence=confidence,
+                evidence_count=evidence_count,
+                metadata={
+                    "relationship": relation or None,
+                    "durable_facts": durable_facts,
+                    "profile_context": profile_context or None,
+                    "current_status": status or None,
+                },
+            )
+        elif relation in PARTNER_RELATIONSHIP_ROLES:
+            has_partner = True
+            value = f"{name} — {relation}" if name else relation
+            durable_facts = _entity_fact_texts(row_dict.get("key_facts"), limit=3)
+            profile_context = normalize_text(row_dict.get("profile_text"), casefold=False)
+            status = normalize_text(row_dict.get("last_known_status"), casefold=False)
+            detail_parts = [*durable_facts[:2]]
+            if profile_context:
+                detail_parts.append(profile_context)
+            if status:
+                detail_parts.append(f"Current status: {status}")
+            if detail_parts:
+                value = f"{value}; {'; '.join(detail_parts[:3])}"
+            _append_fact(
+                facts,
+                fact_key=_fact_key("person", name or relation),
+                fact_type="important_person",
+                fact_value=value,
+                source_type="durable_derived",
+                confidence=confidence,
+                evidence_count=evidence_count,
+                metadata={
+                    "relationship": relation or None,
+                    "durable_facts": durable_facts,
+                    "profile_context": profile_context or None,
+                    "current_status": status or None,
+                },
+            )
+        elif entity_type == "project":
+            project_count += 1
+            value = name
+            status = normalize_text(row_dict.get("last_known_status"), casefold=False)
+            if status:
+                value = f"{value} — {status}"
+            _append_fact(
+                facts,
+                fact_key=_fact_key("project", name),
+                fact_type="work_or_project",
+                fact_value=value,
+                source_type="durable_derived",
+                confidence=confidence,
+                evidence_count=evidence_count,
+            )
+    if has_child:
+        _append_fact(
+            facts,
+            fact_key="role.parent",
+            fact_type="role",
+            fact_value="parent",
+            source_type="durable_derived",
+            confidence=0.95,
+            evidence_count=1,
+        )
+    if has_partner:
+        _append_fact(
+            facts,
+            fact_key="role.partner",
+            fact_type="role",
+            fact_value="partner",
+            source_type="durable_derived",
+            confidence=0.9,
+            evidence_count=1,
+        )
+    if project_count > 0:
+        _append_fact(
+            facts,
+            fact_key="role.builder",
+            fact_type="role",
+            fact_value="builder",
+            source_type="durable_derived",
+            confidence=0.78,
+            evidence_count=max(project_count, 1),
+        )
+
+    assertion_rows = await db.fetch(
+        """
+        SELECT statement_text, surface, distinct_session_count
+        FROM derived_assertions
+        WHERE tenant_id=$1
+          AND user_id=$2
+          AND lifecycle_state='active'
+          AND surface IN ('identity_signal','memory_delta')
+          AND COALESCE(distinct_session_count, 0) >= 2
+        ORDER BY distinct_session_count DESC, updated_at DESC
+        LIMIT 80
+        """,
+        tenant_id,
+        user_id,
+    )
+    for row in assertion_rows:
+        statement = normalize_text(row.get("statement_text"), casefold=False)
+        if not statement:
+            continue
+        evidence_count = int(row.get("distinct_session_count") or 2)
+        lower = statement.casefold()
+        if "lds" in lower or "latter-day saint" in lower or "prayer" in lower:
+            _append_fact(
+                facts,
+                fact_key="belief.explicit_faith",
+                fact_type="belief_or_faith",
+                fact_value=statement,
+                source_type="repeated_explicit",
+                confidence=0.88,
+                evidence_count=evidence_count,
+                metadata={"surface": row.get("surface")},
+            )
+        if any(term in lower for term in ("substack", "essay", "writing", "writer")):
+            _append_fact(
+                facts,
+                fact_key=_fact_key("writing", statement),
+                fact_type="writing_or_public_work",
+                fact_value=statement,
+                source_type="repeated_explicit",
+                confidence=0.82,
+                evidence_count=evidence_count,
+                metadata={"surface": row.get("surface")},
+            )
+        if any(term in lower for term in ("founder", "product lead", "architecture lead", "architect")):
+            _append_fact(
+                facts,
+                fact_key=_fact_key("role", statement),
+                fact_type="role",
+                fact_value=statement,
+                source_type="repeated_explicit",
+                confidence=0.82,
+                evidence_count=evidence_count,
+                metadata={"surface": row.get("surface")},
+            )
+
+    health_rows = await db.fetch(
+        """
+        SELECT title, detail, distinct_session_count
+        FROM open_threads
+        WHERE user_id=$1
+          AND status='open'
+          AND category IN ('health','goal','commitment')
+        ORDER BY last_updated_at DESC NULLS LAST
+        LIMIT 30
+        """,
+        user_id,
+    )
+    for row in health_rows:
+        blob = " ".join(
+            [
+                normalize_text(row.get("title"), casefold=False),
+                normalize_text(row.get("detail"), casefold=False),
+            ]
+        ).casefold()
+        if not any(term in blob for term in ("kidney", "hydration", "water", "electrolyte", "hospital")):
+            continue
+        text = normalize_text(row.get("detail"), casefold=False) or normalize_text(row.get("title"), casefold=False)
+        _append_fact(
+            facts,
+            fact_key="health.hydration_or_kidney",
+            fact_type="health_anchor",
+            fact_value=text,
+            source_type="durable_derived",
+            confidence=0.78,
+            evidence_count=max(int(row.get("distinct_session_count") or 1), 1),
+        )
+        break
+
+    await db.execute(
+        """
+        DELETE FROM durable_profile_facts
+        WHERE tenant_id=$1 AND user_id=$2
+        """,
+        tenant_id,
+        user_id,
+    )
+    for fact in facts:
+        await db.execute(
+            """
+            INSERT INTO durable_profile_facts (
+              tenant_id, user_id, fact_key, fact_type, fact_value,
+              source_type, confidence, evidence_count, metadata, created_at, updated_at
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,NOW(),NOW())
+            """,
+            tenant_id,
+            user_id,
+            fact["fact_key"],
+            fact["fact_type"],
+            fact["fact_value"],
+            fact["source_type"],
+            float(fact["confidence"]),
+            int(fact["evidence_count"]),
+            fact.get("metadata") or {},
+        )
+    return facts
 
 
 def _text_mentions_name(text: Any, name: Any) -> bool:
@@ -3665,10 +4330,21 @@ async def _review_tentative_entities(
 async def build_pass4_identity_packet(
     *,
     db: Database,
+    tenant_id: str,
     user_id: str,
     rows: Sequence[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    ranked_rows = _rank_and_prune_sessions([dict(row) for row in rows], limit=30)
+    ranked_rows = _rank_and_prune_sessions([dict(row) for row in rows], limit=12)
+    for row in ranked_rows:
+        session_id = normalize_text(row.get("session_id"))
+        if not session_id:
+            continue
+        raw = row.get("raw_triage_output") if isinstance(row.get("raw_triage_output"), dict) else {}
+        row["user_excerpt"] = await _session_user_excerpt(db=db, session_id=session_id, max_chars=1000)
+        row["routing_hints"] = {
+            "memory_deltas": _text_list(raw.get("memory_deltas"), limit=2),
+            "identity_signals": _text_list(raw.get("identity_signals"), limit=1),
+        }
     persistent_goals_raw = await db.fetch(
         """
         SELECT thread_id, title, detail, source_session_ids, first_seen_at,
@@ -3707,14 +4383,28 @@ async def build_pass4_identity_packet(
         if _packet_evidence_strength(row.get("source_session_ids"), row.get("distinct_session_count")) != "weak"
     ]
     durable_anchors = [
-        _with_packet_reason(dict(row), why="durable_relationship_anchor")
+        _build_relationship_anchor(dict(row))
         for row in durable_anchors_raw
-        if _has_entity_serving_content(dict(row))
+        if _has_entity_serving_content(dict(row)) and pass4_anchor_allowed(dict(row))
     ]
+    declared_profile_truth = await _load_declared_profile_truth(
+        db=db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+    )
+    declared_truth_facts = _truth_to_declared_facts(declared_profile_truth)
+    durable_profile_facts = await _refresh_durable_profile_facts(
+        db=db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+    )
     return {
         "recent_identity_sessions": ranked_rows,
         "persistent_goals": persistent_goals,
         "durable_anchors": durable_anchors,
+        "declared_profile_truth": declared_profile_truth,
+        "declared_truth_facts": declared_truth_facts,
+        "durable_profile_facts": durable_profile_facts,
         "dropped": [],
     }
 
@@ -3726,6 +4416,16 @@ async def build_pass5_living_packet(
     rows: Sequence[Dict[str, Any]],
 ) -> Dict[str, Any]:
     ranked_rows = _rank_and_prune_sessions([dict(row) for row in rows], limit=20)
+    for row in ranked_rows:
+        session_id = normalize_text(row.get("session_id"))
+        if not session_id:
+            continue
+        raw = row.get("raw_triage_output") if isinstance(row.get("raw_triage_output"), dict) else {}
+        row["user_excerpt"] = await _session_user_excerpt(db=db, session_id=session_id, max_chars=1800)
+        row["routing_hints"] = {
+            "memory_deltas": _text_list(raw.get("memory_deltas"), limit=4),
+            "thread_signals": _text_list(raw.get("thread_signals"), limit=4),
+        }
     open_thread_rows = await db.fetch(
         """
         SELECT thread_id, title, detail, priority, category, thread_type,
@@ -3866,16 +4566,21 @@ async def run_pass4_identity(
     rows = [
         row
         for row in rows
-        if _text_list(((row.get("raw_triage_output") if isinstance(row.get("raw_triage_output"), dict) else {}) or {}).get("identity_signals"), limit=8)
+        if _to_bool(row.get("identity_relevant"))
+        or _text_list(((row.get("raw_triage_output") if isinstance(row.get("raw_triage_output"), dict) else {}) or {}).get("memory_deltas"), limit=4)
     ]
-    identity_packet = await build_pass4_identity_packet(db=db, user_id=user_id, rows=rows)
+    identity_packet = await build_pass4_identity_packet(db=db, tenant_id=tenant_id, user_id=user_id, rows=rows)
     rows = identity_packet["recent_identity_sessions"]
     input_hash = _input_hash(
         tenant_id=tenant_id,
         user_id=user_id,
         session_id=None,
         pass_name=PASS4_IDENTITY,
-        extra={"sessions": [r.get("session_id") for r in rows]},
+        extra={
+            "sessions": [r.get("session_id") for r in rows],
+            "declared_truth_keys": sorted(list((identity_packet.get("declared_profile_truth") or {}).keys())),
+            "durable_fact_keys": [normalize_text(f.get("fact_key")) for f in identity_packet.get("durable_profile_facts", [])[:32]],
+        },
         settings=s,
     )
     run_id = await _start_run(
@@ -3941,14 +4646,17 @@ async def run_pass4_identity(
                 "SELECT * FROM identity_profile WHERE user_id=$1",
                 user_id,
             )
-            persistent_goals = [
+            supplemental_facts = [
                 *identity_packet.get("persistent_goals", []),
                 *identity_packet.get("durable_anchors", []),
             ]
             parsed = await synthesize_identity_profile(
                 existing_profile=existing_profile,
                 session_rows=list(reversed(rows)),
-                persistent_goals=persistent_goals,
+                persistent_goals=supplemental_facts,
+                declared_profile_truth=identity_packet.get("declared_profile_truth") or {},
+                declared_truth_facts=identity_packet.get("declared_truth_facts") or [],
+                durable_profile_facts=identity_packet.get("durable_profile_facts") or [],
                 model=s.derived_pipeline_model_version,
             )
             if parsed:
@@ -4446,7 +5154,7 @@ async def run_thread_audit(
         rows = await db.fetch(
             """
             SELECT thread_id, title, detail, status, priority, category, thread_type,
-                   lifecycle_state, source_session_ids, evidence_turn_refs,
+                   lifecycle_state, related_entities, source_session_ids, evidence_turn_refs,
                    first_seen_at, last_updated_at, last_mentioned_at,
                    follow_up_after, salience_score, importance_score
             FROM open_threads
@@ -4458,6 +5166,46 @@ async def run_thread_audit(
         )
         if not rows:
             continue
+        for row in rows:
+            row_dict = dict(row)
+            if not _thread_is_emotion_summary(
+                title=row_dict.get("title"),
+                detail=row_dict.get("detail"),
+                category=row_dict.get("category"),
+            ):
+                continue
+            keeper = _find_relationship_keeper_thread(rows, row_dict)
+            if keeper:
+                await db.execute(
+                    """
+                    UPDATE open_threads
+                    SET status='resolved',
+                        lifecycle_state='superseded',
+                        superseded_by_thread_id=$3,
+                        resolution_note='Resolved into underlying relationship thread.',
+                        resolved_at=NOW(),
+                        last_updated_at=NOW()
+                    WHERE user_id=$1 AND thread_id=$2
+                    """,
+                    uid,
+                    row_dict["thread_id"],
+                    keeper["thread_id"],
+                )
+                summary["merged"] += 1
+                continue
+            await db.execute(
+                """
+                UPDATE open_threads
+                SET status='snoozed',
+                    lifecycle_state='snoozed',
+                    resolution_note=COALESCE(NULLIF(resolution_note,''), 'Non-durable emotional observation.'),
+                    last_updated_at=NOW()
+                WHERE user_id=$1 AND thread_id=$2
+                """,
+                uid,
+                row_dict["thread_id"],
+            )
+            summary["snoozed"] += 1
         for row in rows:
             if not _is_static_zombie_thread(dict(row)):
                 continue
