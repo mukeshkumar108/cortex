@@ -957,6 +957,89 @@ async def test_pass1_5_weak_entity_stays_tentative_without_profile(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_pass1_5_tiered_relationship_seeds_scores_and_promotes_core_anchor(monkeypatch):
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.derived_pipeline_llm_enabled = True
+        tenant_id = "default"
+        user_id = _unique("tiered-entity-user")
+        session_id = _unique("tiered-entity-session")
+        messages = [
+            {
+                "role": "user",
+                "text": "Jordan is my daughter and she is central to my life decisions.",
+                "timestamp": "2026-04-21T10:00:00Z",
+            }
+        ]
+        await db.execute(
+            """
+            INSERT INTO session_classifications (
+                session_id, user_id, session_date, is_memory_worthy, session_kind,
+                one_line_summary, entity_mentions, run_entity_pass, run_threads_pass,
+                identity_relevant, emotional_weight, processed_at, model_used,
+                raw_triage_output, context_relevant
+            )
+            VALUES ($1,$2,NOW(),true,'personal','tiered entity',$3::text[],true,false,true,
+                    'medium',NOW(),'fixture',$4::jsonb,true)
+            """,
+            session_id,
+            user_id,
+            ["Jordan"],
+            {"entity_mentions": ["Jordan"]},
+        )
+
+        async def _entity_stub(existing_entities, mentions, model):
+            return [
+                {
+                    "decision": "NEW",
+                    "mention": "Jordan",
+                    "canonical_name": "Jordan",
+                    "type": "person",
+                    "status": "tentative",
+                    "relationship_to_user": "daughter",
+                    "confidence": 0.6,
+                    "evidence_strength": "medium",
+                    "memory_relevance": "high",
+                    "relationship_confidence": 0.8,
+                    "aliases": ["Jordan"],
+                }
+            ]
+
+        async def _profile_stub(canonical_name, entity_type, relationship_to_user, messages, existing_profile_text, model):
+            return {
+                "profile_text": f"{canonical_name} profile",
+                "key_facts": [],
+                "open_questions": [],
+                "last_known_status": None,
+            }
+
+        monkeypatch.setattr(derived_pipeline, "resolve_entity_mentions", _entity_stub, raising=True)
+        monkeypatch.setattr(derived_pipeline, "build_entity_profile", _profile_stub, raising=True)
+
+        await run_pass1_5_entities(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            messages=messages,
+            settings=settings,
+        )
+
+        entity = await db.fetchone(
+            """
+            SELECT relationship_to_user, status, salience_score, importance_score
+            FROM entity_profiles
+            WHERE user_id=$1 AND canonical_name_normalized='jordan'
+            """,
+            user_id,
+        )
+        assert entity["relationship_to_user"] == "daughter"
+        assert entity["status"] == "active"
+        assert float(entity["salience_score"] or 0.0) >= 0.8
+        assert float(entity["importance_score"] or 0.0) >= 0.9
+
+
+@pytest.mark.asyncio
 async def test_empty_entities_do_not_surface_in_startbrief_or_handover():
     async with app.router.lifespan_context(app):
         user_id = _unique("empty-entity-user")

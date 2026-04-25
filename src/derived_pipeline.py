@@ -751,6 +751,17 @@ def _entity_signal_rank(row: Dict[str, Any]) -> tuple[int, float, float, datetim
     return (max(role_rank, tier_rank * 25) + profile_bonus, importance, salience, last_seen)
 
 
+def _relationship_tier_score_floors(row: Dict[str, Any]) -> tuple[float, float]:
+    rank = relationship_tier_rank(entity_relationship_tier(row))
+    floors = {
+        4: (0.8, 0.9),
+        3: (0.68, 0.78),
+        2: (0.52, 0.62),
+        1: (0.35, 0.42),
+    }
+    return floors.get(rank, (0.0, 0.0))
+
+
 def _entity_allowed_for_synthesis(row: Dict[str, Any]) -> bool:
     if not _is_entity_allowed_for_living_context(row):
         return False
@@ -2581,9 +2592,27 @@ async def run_pass1_5_entities(
                 messages=messages,
                 existing_relationship=(existing_entity or {}).get("relationship_to_user"),
             )
+            tier_row = {
+                "canonical_name": canonical,
+                "type": entity_type,
+                "relationship_to_user": relationship_to_user,
+            }
+            tier_rank = relationship_tier_rank(entity_relationship_tier(tier_row))
+            tier_salience_floor, tier_importance_floor = _relationship_tier_score_floors(tier_row)
+            if (
+                entity_status == "tentative"
+                and tier_rank >= 3
+                and relationship_confidence >= 0.55
+                and evidence_strength != "weak"
+                and memory_relevance != "low"
+            ):
+                entity_status = "active"
             confidence_value = (item or {}).get("confidence") if isinstance(item, dict) else None
             if not isinstance(confidence_value, (int, float)):
                 confidence_value = 0.45
+            confidence_value = float(confidence_value)
+            seeded_salience = max(float(confidence_value), tier_salience_floor)
+            seeded_importance = max(float(confidence_value), tier_importance_floor)
             aliases_value = _text_list((item or {}).get("aliases") if isinstance(item, dict) else None) or [canonical]
             await db.execute(
                 """
@@ -2591,10 +2620,10 @@ async def run_pass1_5_entities(
                     user_id, canonical_name, canonical_name_normalized, type,
                     aliases, status, relationship_to_user, confidence, mention_count, first_seen_at,
                     last_seen_at, last_updated_at, last_processed_session_date,
-                    source_session_ids, memory_layer
+                    source_session_ids, memory_layer, salience_score, importance_score
                 )
                 VALUES (
-                    $1,$2,$3,$4,$5::text[],$6,$7,$8,1,NOW(),NOW(),NOW(),NOW(),$9::text[],$10
+                    $1,$2,$3,$4,$5::text[],$6,$7,$8,1,NOW(),NOW(),NOW(),NOW(),$9::text[],$10,$11,$12
                 )
                 ON CONFLICT (user_id, canonical_name_normalized)
                 DO UPDATE SET
@@ -2621,6 +2650,8 @@ async def run_pass1_5_entities(
                         WHEN COALESCE(entity_profiles.mention_count, 0) + 1 >= 3 THEN 'active'
                         ELSE entity_profiles.status
                     END,
+                    salience_score = GREATEST(COALESCE(entity_profiles.salience_score, 0.0), COALESCE(EXCLUDED.salience_score, 0.0)),
+                    importance_score = GREATEST(COALESCE(entity_profiles.importance_score, 0.0), COALESCE(EXCLUDED.importance_score, 0.0)),
                     memory_layer = COALESCE(entity_profiles.memory_layer, EXCLUDED.memory_layer)
                 """,
                 user_id,
@@ -2630,9 +2661,11 @@ async def run_pass1_5_entities(
                 aliases_value,
                 entity_status,
                 relationship_to_user,
-                float(confidence_value),
+                confidence_value,
                 [session_id],
                 memory_layer,
+                seeded_salience,
+                seeded_importance,
             )
             await db.execute(
                 """
