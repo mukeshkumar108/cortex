@@ -61,7 +61,7 @@ RETROSPECTIVE_SESSION_THRESHOLD = 3
 RETROSPECTIVE_LOW_CONFIDENCE_CLOSE_DAYS = 21
 RETROSPECTIVE_LOW_CONFIDENCE_PRUNE_DAYS = 45
 RETROSPECTIVE_TENTATIVE_ENTITY_PRUNE_DAYS = 45
-PROACTIVE_SHADOW_ASSERTION_LOOKBACK_DAYS = 7
+PROACTIVE_SHADOW_ASSERTION_LOOKBACK_DAYS = 30
 PROACTIVE_SHADOW_MAX_CANDIDATES_PER_QUEUE = 12
 
 RETROSPECTIVE_PROCESSING_ORDER = [
@@ -5938,7 +5938,9 @@ async def _refresh_recent_change_candidates_for_user(
     db: Database,
     tenant_id: str,
     user_id: str,
+    lookback_days: int,
 ) -> Dict[str, int]:
+    safe_lookback_days = max(1, int(lookback_days or PROACTIVE_SHADOW_ASSERTION_LOOKBACK_DAYS))
     rows = await db.fetch(
         """
         SELECT assertion_id, surface, statement_text, salience, importance,
@@ -5954,7 +5956,7 @@ async def _refresh_recent_change_candidates_for_user(
         """,
         tenant_id,
         user_id,
-        str(PROACTIVE_SHADOW_ASSERTION_LOOKBACK_DAYS),
+        str(safe_lookback_days),
     )
     now = _utcnow()
     candidates: List[Dict[str, Any]] = []
@@ -6016,10 +6018,12 @@ async def _proactive_shadow_candidate_users(
     tenant_id: str,
     user_id: Optional[str],
     max_users: int,
+    lookback_days: int,
 ) -> List[str]:
     if user_id:
         clean = normalize_text(user_id)
         return [clean] if clean else []
+    safe_lookback_days = max(1, int(lookback_days or PROACTIVE_SHADOW_ASSERTION_LOOKBACK_DAYS))
     candidates: List[str] = []
     max_rows = max(1, min(int(max_users or 300), 1000))
 
@@ -6072,7 +6076,7 @@ async def _proactive_shadow_candidate_users(
         LIMIT $3
         """,
         tenant_id,
-        str(PROACTIVE_SHADOW_ASSERTION_LOOKBACK_DAYS),
+        str(safe_lookback_days),
         max_rows,
     )
     for row in assertion_rows:
@@ -6089,12 +6093,14 @@ async def run_proactive_shadow_candidates(
     tenant_id: str = "default",
     user_id: Optional[str] = None,
     max_users: int = 300,
+    lookback_days: int = PROACTIVE_SHADOW_ASSERTION_LOOKBACK_DAYS,
 ) -> Dict[str, Any]:
     users = await _proactive_shadow_candidate_users(
         db=db,
         tenant_id=tenant_id,
         user_id=user_id,
         max_users=max_users,
+        lookback_days=lookback_days,
     )
     summary: Dict[str, Any] = {
         "users_considered": len(users),
@@ -6124,6 +6130,7 @@ async def run_proactive_shadow_candidates(
             db=db,
             tenant_id=tenant_id,
             user_id=uid,
+            lookback_days=lookback_days,
         )
         summary["users_processed"] += 1
         summary["follow_up_candidates_upserted"] += int(follow_up.get("upserted") or 0)

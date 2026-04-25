@@ -117,6 +117,7 @@ class Settings(BaseSettings):
     proactive_shadow_candidates_enabled: bool = True
     proactive_shadow_candidates_interval_seconds: int = 3600
     proactive_shadow_candidates_max_users: int = 300
+    proactive_shadow_recent_change_lookback_days: int = 30
     retrieval_shadow_read_enabled: bool = False
     retrieval_shadow_read_sample_rate: float = 0.0
     retrieval_shadow_read_blocking: bool = False

@@ -3171,6 +3171,70 @@ async def test_proactive_shadow_candidates_populate_all_three_queues():
 
 
 @pytest.mark.asyncio
+async def test_proactive_shadow_recent_change_lookback_includes_older_assertions():
+    async with app.router.lifespan_context(app):
+        tenant_id = "default"
+        user_id = _unique("proactive-shadow-lookback-user")
+        session_id = _unique("proactive-shadow-lookback-session")
+        run_row = await db.fetchone(
+            """
+            INSERT INTO pipeline_runs (
+                tenant_id, user_id, session_id, pass_name, model_version, prompt_version,
+                policy_version, input_hash, status, started_at, completed_at
+            ) VALUES (
+                $1,$2,$3,$4,'fixture','fixture','derived.v1','hash-fixture','succeeded',NOW(),NOW()
+            )
+            RETURNING run_id
+            """,
+            tenant_id,
+            user_id,
+            session_id,
+            PASS5_LIVING_CONTEXT,
+        )
+        run_id = int((run_row or {}).get("run_id") or 0)
+        assert run_id > 0
+
+        await db.execute(
+            """
+            INSERT INTO derived_assertions (
+                tenant_id, user_id, pass_name, surface, statement_text, lifecycle_state,
+                salience, importance, confidence_extraction, confidence_validity,
+                source_session_ids, source_turn_refs, run_id, metadata, created_at, updated_at
+            ) VALUES (
+                $1,$2,$3,'memory_delta',
+                'User is re-evaluating long-term work direction.',
+                'active',0.77,0.82,0.70,0.75,$4::text[],$5::jsonb,$6,'{}'::jsonb,
+                NOW() - interval '20 days', NOW() - interval '20 days'
+            )
+            """,
+            tenant_id,
+            user_id,
+            PASS5_LIVING_CONTEXT,
+            ["s20"],
+            [{"session_id": "s20", "turn_index": 0}],
+            run_id,
+        )
+
+        seven_day = await run_proactive_shadow_candidates(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            max_users=1,
+            lookback_days=7,
+        )
+        assert seven_day["recent_change_candidates_active"] == 0
+
+        thirty_day = await run_proactive_shadow_candidates(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            max_users=1,
+            lookback_days=30,
+        )
+        assert thirty_day["recent_change_candidates_active"] >= 1
+
+
+@pytest.mark.asyncio
 async def test_packet_compilers_inject_durable_anchor_and_explain_inclusion():
     async with app.router.lifespan_context(app):
         tenant_id = "default"

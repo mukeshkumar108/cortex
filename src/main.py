@@ -7934,13 +7934,14 @@ async def derived_memory_audit_loop(interval_seconds: int) -> None:
         await asyncio.sleep(max(3600, interval_seconds))
 
 
-async def proactive_shadow_candidates_loop(interval_seconds: int, max_users: int) -> None:
+async def proactive_shadow_candidates_loop(interval_seconds: int, max_users: int, lookback_days: int) -> None:
     while True:
         try:
             summary = await run_proactive_shadow_candidates(
                 db=db,
                 tenant_id="default",
                 max_users=max_users,
+                lookback_days=lookback_days,
             )
             total_active = (
                 int(summary.get("follow_up_candidates_active") or 0)
@@ -12292,6 +12293,7 @@ async def lifespan(app: FastAPI):
                 proactive_shadow_candidates_loop(
                     interval_seconds=settings.proactive_shadow_candidates_interval_seconds,
                     max_users=settings.proactive_shadow_candidates_max_users,
+                    lookback_days=settings.proactive_shadow_recent_change_lookback_days,
                 )
             )
             logger.info("Proactive shadow candidates loop started")
@@ -15579,6 +15581,7 @@ async def debug_rebuild_proactive_shadow_candidates(
     tenantId: str = "default",
     userId: str | None = None,
     maxUsers: int = 200,
+    lookbackDays: int = 30,
 ):
     try:
         tenant_id = _normalize_text(_canonical_tenant_id(tenantId)) or tenantId
@@ -15588,6 +15591,7 @@ async def debug_rebuild_proactive_shadow_candidates(
             tenant_id=tenant_id,
             user_id=user_id,
             max_users=maxUsers,
+            lookback_days=max(1, int(lookbackDays or 30)),
         )
         return {
             "tenantId": tenant_id,
