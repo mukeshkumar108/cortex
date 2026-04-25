@@ -98,3 +98,5 @@ Also fixed a test bug in `tests/test_derived_pipeline_hardening.py` (`tenant_id`
 1. Continue retrospective conservative reinterpretation extensions (remaining tracker items).
 2. Keep packet quality stable while widening real-data coverage.
 3. Keep a dated status doc per major checkpoint to avoid losing cross-day context.
+4. Use strict binary rollout gates in:
+   - `docs/SOPHIE_PROACTIVE_SHADOW_GO_LIVE_CHECKLIST_2026-04-25.md`
