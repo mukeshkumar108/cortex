@@ -108,6 +108,7 @@ from .derived_pipeline import (
     run_pass4_identity,
     run_pass5_living_context,
     run_conservative_memory_audits,
+    run_proactive_shadow_candidates,
     run_silence_detection,
 )
 from .derived_passes.synthesis_quality import conservative_rewrite_text
@@ -7933,6 +7934,28 @@ async def derived_memory_audit_loop(interval_seconds: int) -> None:
         await asyncio.sleep(max(3600, interval_seconds))
 
 
+async def proactive_shadow_candidates_loop(interval_seconds: int, max_users: int) -> None:
+    while True:
+        try:
+            summary = await run_proactive_shadow_candidates(
+                db=db,
+                tenant_id="default",
+                max_users=max_users,
+            )
+            total_active = (
+                int(summary.get("follow_up_candidates_active") or 0)
+                + int(summary.get("clarification_candidates_active") or 0)
+                + int(summary.get("recent_change_candidates_active") or 0)
+            )
+            if total_active > 0:
+                logger.info("proactive shadow candidates summary=%s", summary)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("proactive shadow candidates loop error: %s", e)
+        await asyncio.sleep(max(600, int(interval_seconds or 3600)))
+
+
 async def v2_invariant_checker_loop(
     *,
     interval_seconds: int,
@@ -12264,6 +12287,14 @@ async def lifespan(app: FastAPI):
                 )
             )
             logger.info("Derived memory audit loop started")
+        if settings.proactive_shadow_candidates_enabled:
+            app.state.proactive_shadow_candidates_task = asyncio.create_task(
+                proactive_shadow_candidates_loop(
+                    interval_seconds=settings.proactive_shadow_candidates_interval_seconds,
+                    max_users=settings.proactive_shadow_candidates_max_users,
+                )
+            )
+            logger.info("Proactive shadow candidates loop started")
         if settings.daily_analysis_enabled:
             app.state.daily_analysis_task = asyncio.create_task(
                 daily_analysis_loop(
@@ -12358,6 +12389,14 @@ async def lifespan(app: FastAPI):
         app.state.derived_memory_audit_task.cancel()
         try:
             await app.state.derived_memory_audit_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+    if getattr(app.state, "proactive_shadow_candidates_task", None):
+        app.state.proactive_shadow_candidates_task.cancel()
+        try:
+            await app.state.proactive_shadow_candidates_task
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -15533,6 +15572,121 @@ async def debug_always_on_packet(
     except Exception as e:
         logger.error("Debug always-on packet failed: %s", e)
         raise HTTPException(status_code=500, detail="Debug always-on packet failed")
+
+
+@app.post("/internal/debug/proactive-shadow/rebuild")
+async def debug_rebuild_proactive_shadow_candidates(
+    tenantId: str = "default",
+    userId: str | None = None,
+    maxUsers: int = 200,
+):
+    try:
+        tenant_id = _normalize_text(_canonical_tenant_id(tenantId)) or tenantId
+        user_id = _normalize_text(userId) if userId else None
+        summary = await run_proactive_shadow_candidates(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            max_users=maxUsers,
+        )
+        return {
+            "tenantId": tenant_id,
+            "userId": user_id,
+            "summary": summary,
+        }
+    except Exception as e:
+        logger.error("Debug proactive-shadow rebuild failed: %s", e)
+        raise HTTPException(status_code=500, detail="Debug proactive-shadow rebuild failed")
+
+
+@app.get("/internal/debug/proactive-shadow/candidates")
+async def debug_proactive_shadow_candidates(
+    tenantId: str = "default",
+    userId: str | None = None,
+    queue: str = "all",
+    status: str = "shadow_open",
+    limit: int = 40,
+):
+    try:
+        tenant_id = _normalize_text(_canonical_tenant_id(tenantId)) or tenantId
+        user_id = _normalize_text(userId) if userId else None
+        queue_key = _normalize_text(queue).lower()
+        status_key = _normalize_text(status).lower()
+        if status_key not in {"all", "shadow_open", "shadow_stale", "shadow_dismissed", "shadow_sent"}:
+            raise HTTPException(status_code=400, detail="Invalid status")
+        queue_map = {
+            "follow_up": "follow_up_candidates",
+            "clarification": "clarification_candidates",
+            "recent_change": "recent_change_candidates",
+        }
+        if queue_key == "all":
+            queue_items = list(queue_map.items())
+        elif queue_key in queue_map:
+            queue_items = [(queue_key, queue_map[queue_key])]
+        else:
+            raise HTTPException(status_code=400, detail="Invalid queue")
+        safe_limit = max(1, min(int(limit or 40), 200))
+        payload: Dict[str, Any] = {}
+        for label, table_name in queue_items:
+            where = ["tenant_id=$1"]
+            args: List[Any] = [tenant_id]
+            if user_id:
+                where.append(f"user_id=${len(args) + 1}")
+                args.append(user_id)
+            if status_key != "all":
+                where.append(f"status=${len(args) + 1}")
+                args.append(status_key)
+            where_sql = " AND ".join(where)
+            rows = await db.fetch(
+                f"""
+                SELECT candidate_id, user_id, candidate_key, title, reason, suggested_prompt,
+                       source_surface, source_ref, priority_score, confidence, due_at,
+                       status, source_session_ids, source_turn_refs, metadata,
+                       last_computed_at, created_at, updated_at
+                FROM {table_name}
+                WHERE {where_sql}
+                ORDER BY priority_score DESC, due_at NULLS LAST, updated_at DESC
+                LIMIT ${len(args) + 1}
+                """,
+                *args,
+                safe_limit,
+            )
+            payload[label] = [
+                {
+                    "candidateId": int(row.get("candidate_id") or 0),
+                    "userId": _normalize_text(row.get("user_id")),
+                    "candidateKey": _normalize_text(row.get("candidate_key")),
+                    "title": _normalize_text(row.get("title")),
+                    "reason": _normalize_text(row.get("reason")),
+                    "suggestedPrompt": _normalize_text(row.get("suggested_prompt")),
+                    "sourceSurface": _normalize_text(row.get("source_surface")),
+                    "sourceRef": _normalize_text(row.get("source_ref")),
+                    "priorityScore": float(row.get("priority_score") or 0.0),
+                    "confidence": float(row.get("confidence") or 0.0),
+                    "dueAt": row.get("due_at").isoformat() if row.get("due_at") else None,
+                    "status": _normalize_text(row.get("status")),
+                    "sourceSessionIds": row.get("source_session_ids") if isinstance(row.get("source_session_ids"), list) else [],
+                    "sourceTurnRefs": row.get("source_turn_refs") if isinstance(row.get("source_turn_refs"), list) else [],
+                    "metadata": row.get("metadata") if isinstance(row.get("metadata"), dict) else {},
+                    "lastComputedAt": row.get("last_computed_at").isoformat() if row.get("last_computed_at") else None,
+                    "createdAt": row.get("created_at").isoformat() if row.get("created_at") else None,
+                    "updatedAt": row.get("updated_at").isoformat() if row.get("updated_at") else None,
+                }
+                for row in (rows or [])
+            ]
+        return {
+            "tenantId": tenant_id,
+            "userId": user_id,
+            "queue": queue_key,
+            "status": status_key,
+            "limit": safe_limit,
+            "items": payload,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Debug proactive-shadow candidates failed: %s", e)
+        raise HTTPException(status_code=500, detail="Debug proactive-shadow candidates failed")
 
 
 @app.post("/internal/debug/graphiti/query")

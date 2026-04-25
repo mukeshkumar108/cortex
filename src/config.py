@@ -114,6 +114,9 @@ class Settings(BaseSettings):
     always_on_memory_packet_llm_enabled: bool = True
     always_on_memory_packet_model_version: str = "amazon/nova-micro-v1"
     always_on_memory_packet_target_chars: int = 2400
+    proactive_shadow_candidates_enabled: bool = True
+    proactive_shadow_candidates_interval_seconds: int = 3600
+    proactive_shadow_candidates_max_users: int = 300
     retrieval_shadow_read_enabled: bool = False
     retrieval_shadow_read_sample_rate: float = 0.0
     retrieval_shadow_read_blocking: bool = False

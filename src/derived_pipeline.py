@@ -61,6 +61,8 @@ RETROSPECTIVE_SESSION_THRESHOLD = 3
 RETROSPECTIVE_LOW_CONFIDENCE_CLOSE_DAYS = 21
 RETROSPECTIVE_LOW_CONFIDENCE_PRUNE_DAYS = 45
 RETROSPECTIVE_TENTATIVE_ENTITY_PRUNE_DAYS = 45
+PROACTIVE_SHADOW_ASSERTION_LOOKBACK_DAYS = 7
+PROACTIVE_SHADOW_MAX_CANDIDATES_PER_QUEUE = 12
 
 RETROSPECTIVE_PROCESSING_ORDER = [
     "contradictions",
@@ -223,6 +225,14 @@ class DerivedPassResult:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _truncate_text(text: Any, *, limit: int = 220) -> str:
+    clean = normalize_text(text, casefold=False)
+    if len(clean) <= limit:
+        return clean
+    trimmed = clean[: limit - 1].rsplit(" ", 1)[0].strip()
+    return (trimmed or clean[: limit - 1]).rstrip(" ,;:") + "…"
 
 
 def _as_list(value: Any) -> List[Any]:
@@ -5652,6 +5662,479 @@ async def run_retrospective_worker_v1(
         except Exception as exc:
             await _fail_run(db, run_id, "retrospective_v1_failed", str(exc))
             raise
+    return summary
+
+
+def _command_count(result: Any) -> int:
+    try:
+        return int(str(result or "").split()[-1])
+    except Exception:
+        return 0
+
+
+def _valid_shadow_table_name(name: str) -> str:
+    valid = {
+        "follow_up_candidates",
+        "clarification_candidates",
+        "recent_change_candidates",
+    }
+    table = normalize_text(name)
+    if table not in valid:
+        raise ValueError(f"invalid shadow candidate table: {name}")
+    return table
+
+
+async def _upsert_shadow_candidates(
+    *,
+    db: Database,
+    table_name: str,
+    tenant_id: str,
+    user_id: str,
+    rows: Sequence[Dict[str, Any]],
+) -> int:
+    table = _valid_shadow_table_name(table_name)
+    inserted_or_updated = 0
+    for row in rows:
+        result = await db.execute(
+            f"""
+            INSERT INTO {table} (
+                tenant_id, user_id, candidate_key, title, reason, suggested_prompt,
+                source_surface, source_ref, priority_score, confidence, due_at,
+                source_session_ids, source_turn_refs, status, metadata, last_computed_at, updated_at
+            ) VALUES (
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+                $12::text[],$13::jsonb,'shadow_open',$14::jsonb,NOW(),NOW()
+            )
+            ON CONFLICT (tenant_id, user_id, candidate_key)
+            DO UPDATE SET
+                title=EXCLUDED.title,
+                reason=EXCLUDED.reason,
+                suggested_prompt=EXCLUDED.suggested_prompt,
+                source_surface=EXCLUDED.source_surface,
+                source_ref=EXCLUDED.source_ref,
+                priority_score=EXCLUDED.priority_score,
+                confidence=EXCLUDED.confidence,
+                due_at=EXCLUDED.due_at,
+                source_session_ids=EXCLUDED.source_session_ids,
+                source_turn_refs=EXCLUDED.source_turn_refs,
+                metadata=EXCLUDED.metadata,
+                last_computed_at=NOW(),
+                updated_at=NOW(),
+                status=CASE
+                  WHEN {table}.status IN ('shadow_dismissed','shadow_sent') THEN {table}.status
+                  ELSE 'shadow_open'
+                END
+            """,
+            tenant_id,
+            user_id,
+            normalize_text(row.get("candidate_key")),
+            _truncate_text(row.get("title"), limit=180),
+            _truncate_text(row.get("reason"), limit=360),
+            _truncate_text(row.get("suggested_prompt"), limit=360),
+            normalize_text(row.get("source_surface")) or "unknown",
+            normalize_text(row.get("source_ref")),
+            float(row.get("priority_score") or 0.0),
+            float(row.get("confidence") or 0.0),
+            row.get("due_at"),
+            _text_list(row.get("source_session_ids"), limit=16),
+            row.get("source_turn_refs") if isinstance(row.get("source_turn_refs"), list) else [],
+            row.get("metadata") if isinstance(row.get("metadata"), dict) else {},
+        )
+        inserted_or_updated += _command_count(result)
+    return inserted_or_updated
+
+
+async def _mark_shadow_candidates_stale(
+    *,
+    db: Database,
+    table_name: str,
+    tenant_id: str,
+    user_id: str,
+    active_keys: Sequence[str],
+) -> int:
+    table = _valid_shadow_table_name(table_name)
+    keys = [normalize_text(k) for k in active_keys if normalize_text(k)]
+    if keys:
+        result = await db.execute(
+            f"""
+            UPDATE {table}
+            SET status='shadow_stale',
+                updated_at=NOW()
+            WHERE tenant_id=$1
+              AND user_id=$2
+              AND status='shadow_open'
+              AND candidate_key <> ALL($3::text[])
+            """,
+            tenant_id,
+            user_id,
+            keys,
+        )
+        return _command_count(result)
+    result = await db.execute(
+        f"""
+        UPDATE {table}
+        SET status='shadow_stale',
+            updated_at=NOW()
+        WHERE tenant_id=$1
+          AND user_id=$2
+          AND status='shadow_open'
+        """,
+        tenant_id,
+        user_id,
+    )
+    return _command_count(result)
+
+
+async def _refresh_follow_up_candidates_for_user(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+) -> Dict[str, int]:
+    rows = await db.fetch(
+        """
+        SELECT thread_id, title, detail, priority, category, follow_up_after,
+               source_session_ids, evidence_turn_refs, salience_score, importance_score,
+               last_mentioned_at
+        FROM open_threads
+        WHERE user_id=$1
+          AND status='open'
+        ORDER BY priority DESC, salience_score DESC NULLS LAST, importance_score DESC NULLS LAST, last_mentioned_at DESC NULLS LAST
+        LIMIT 50
+        """,
+        user_id,
+    )
+    now = _utcnow()
+    candidates: List[Dict[str, Any]] = []
+    for row in rows:
+        priority = normalize_text(row.get("priority"))
+        importance = float(row.get("importance_score") or 0.0)
+        salience = float(row.get("salience_score") or 0.0)
+        detail = _truncate_text(row.get("detail"), limit=260)
+        due_at = row.get("follow_up_after")
+        if not isinstance(due_at, datetime):
+            last = row.get("last_mentioned_at")
+            if isinstance(last, datetime):
+                due_at = last + timedelta(hours=18 if priority == "high" else 36)
+        if isinstance(due_at, datetime) and due_at > now + timedelta(days=7):
+            continue
+        due_bonus = 0.25 if isinstance(due_at, datetime) and due_at <= now + timedelta(hours=12) else 0.0
+        score = min(1.0, 0.25 + (importance * 0.35) + (salience * 0.30) + (_priority_rank(priority) * 0.08) + due_bonus)
+        confidence = min(0.98, 0.52 + (importance * 0.2) + (salience * 0.15))
+        title = _truncate_text(row.get("title"), limit=120) or "Follow-up needed"
+        reason = detail or f"Open {normalize_text(row.get('category')) or 'general'} thread remains unresolved."
+        suggested_prompt = f"Quick check-in on {title.lower()}: any update?"
+        candidates.append(
+            {
+                "candidate_key": f"thread:{normalize_text(row.get('thread_id'))}",
+                "title": title,
+                "reason": reason,
+                "suggested_prompt": suggested_prompt,
+                "source_surface": "open_thread",
+                "source_ref": normalize_text(row.get("thread_id")),
+                "priority_score": score,
+                "confidence": confidence,
+                "due_at": due_at if isinstance(due_at, datetime) else now,
+                "source_session_ids": _text_list(row.get("source_session_ids"), limit=12),
+                "source_turn_refs": row.get("evidence_turn_refs") if isinstance(row.get("evidence_turn_refs"), list) else [],
+                "metadata": {
+                    "category": normalize_text(row.get("category")) or "other",
+                    "priority": priority or "medium",
+                },
+            }
+        )
+    candidates.sort(key=lambda item: (float(item.get("priority_score") or 0.0), float(item.get("confidence") or 0.0)), reverse=True)
+    candidates = candidates[:PROACTIVE_SHADOW_MAX_CANDIDATES_PER_QUEUE]
+    active_keys = [c["candidate_key"] for c in candidates if c.get("candidate_key")]
+    upserted = await _upsert_shadow_candidates(
+        db=db,
+        table_name="follow_up_candidates",
+        tenant_id=tenant_id,
+        user_id=user_id,
+        rows=candidates,
+    )
+    stale = await _mark_shadow_candidates_stale(
+        db=db,
+        table_name="follow_up_candidates",
+        tenant_id=tenant_id,
+        user_id=user_id,
+        active_keys=active_keys,
+    )
+    return {"upserted": upserted, "stale": stale, "active": len(candidates)}
+
+
+async def _refresh_clarification_candidates_for_user(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+) -> Dict[str, int]:
+    rows = await db.fetch(
+        """
+        SELECT item_id, surface, statement_text, question_text, confidence,
+               source_session_ids, source_turn_refs, last_seen_at
+        FROM low_confidence_items
+        WHERE tenant_id=$1
+          AND user_id=$2
+          AND status='open'
+        ORDER BY confidence ASC NULLS FIRST, last_seen_at DESC NULLS LAST
+        LIMIT 50
+        """,
+        tenant_id,
+        user_id,
+    )
+    now = _utcnow()
+    candidates: List[Dict[str, Any]] = []
+    for row in rows:
+        item_id = int(row.get("item_id") or 0)
+        if item_id <= 0:
+            continue
+        low_conf = float(row.get("confidence") or 0.42)
+        recency_bonus = 0.15 if isinstance(row.get("last_seen_at"), datetime) and row.get("last_seen_at") >= now - timedelta(days=2) else 0.0
+        score = min(1.0, max(0.0, (1.0 - low_conf) * 0.72 + recency_bonus))
+        clarification_value = max(0.35, min(0.95, 1.0 - low_conf))
+        statement = _truncate_text(row.get("statement_text"), limit=180)
+        question = _truncate_text(row.get("question_text"), limit=220)
+        title = question or f"Clarify: {statement}" if statement else "Clarification needed"
+        suggested_prompt = question or f"You mentioned \"{statement}\" earlier. Did I understand that correctly?"
+        candidates.append(
+            {
+                "candidate_key": f"low_conf:{item_id}",
+                "title": title,
+                "reason": statement or "Open low-confidence memory item needs confirmation.",
+                "suggested_prompt": suggested_prompt,
+                "source_surface": normalize_text(row.get("surface")) or "low_confidence_item",
+                "source_ref": str(item_id),
+                "priority_score": score,
+                "confidence": clarification_value,
+                "due_at": now,
+                "source_session_ids": _text_list(row.get("source_session_ids"), limit=12),
+                "source_turn_refs": row.get("source_turn_refs") if isinstance(row.get("source_turn_refs"), list) else [],
+                "metadata": {"low_confidence_score": low_conf},
+            }
+        )
+    candidates.sort(key=lambda item: float(item.get("priority_score") or 0.0), reverse=True)
+    candidates = candidates[:PROACTIVE_SHADOW_MAX_CANDIDATES_PER_QUEUE]
+    active_keys = [c["candidate_key"] for c in candidates if c.get("candidate_key")]
+    upserted = await _upsert_shadow_candidates(
+        db=db,
+        table_name="clarification_candidates",
+        tenant_id=tenant_id,
+        user_id=user_id,
+        rows=candidates,
+    )
+    stale = await _mark_shadow_candidates_stale(
+        db=db,
+        table_name="clarification_candidates",
+        tenant_id=tenant_id,
+        user_id=user_id,
+        active_keys=active_keys,
+    )
+    return {"upserted": upserted, "stale": stale, "active": len(candidates)}
+
+
+async def _refresh_recent_change_candidates_for_user(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+) -> Dict[str, int]:
+    rows = await db.fetch(
+        """
+        SELECT assertion_id, surface, statement_text, salience, importance,
+               confidence_validity, source_session_ids, source_turn_refs, updated_at
+        FROM derived_assertions
+        WHERE tenant_id=$1
+          AND user_id=$2
+          AND lifecycle_state='active'
+          AND surface IN ('memory_delta','thread_signal','identity_signal','living_context_statement')
+          AND updated_at >= NOW() - ($3::text || ' days')::interval
+        ORDER BY updated_at DESC, importance DESC NULLS LAST, salience DESC NULLS LAST
+        LIMIT 80
+        """,
+        tenant_id,
+        user_id,
+        str(PROACTIVE_SHADOW_ASSERTION_LOOKBACK_DAYS),
+    )
+    now = _utcnow()
+    candidates: List[Dict[str, Any]] = []
+    for row in rows:
+        assertion_id = int(row.get("assertion_id") or 0)
+        if assertion_id <= 0:
+            continue
+        statement = _truncate_text(row.get("statement_text"), limit=200)
+        if not statement:
+            continue
+        salience = float(row.get("salience") or 0.0)
+        importance = float(row.get("importance") or 0.0)
+        validity = float(row.get("confidence_validity") or 0.55)
+        recency_bonus = 0.12 if isinstance(row.get("updated_at"), datetime) and row.get("updated_at") >= now - timedelta(days=1) else 0.0
+        score = min(1.0, 0.20 + salience * 0.32 + importance * 0.32 + validity * 0.16 + recency_bonus)
+        suggested_prompt = f"You mentioned \"{statement}\" recently. Is this still current?"
+        candidates.append(
+            {
+                "candidate_key": f"assertion:{assertion_id}",
+                "title": statement,
+                "reason": f"Recent {normalize_text(row.get('surface')) or 'memory'} change worth continuity follow-up.",
+                "suggested_prompt": suggested_prompt,
+                "source_surface": normalize_text(row.get("surface")) or "derived_assertion",
+                "source_ref": str(assertion_id),
+                "priority_score": score,
+                "confidence": min(0.98, max(0.35, validity)),
+                "due_at": now,
+                "source_session_ids": _text_list(row.get("source_session_ids"), limit=12),
+                "source_turn_refs": row.get("source_turn_refs") if isinstance(row.get("source_turn_refs"), list) else [],
+                "metadata": {
+                    "salience": salience,
+                    "importance": importance,
+                },
+            }
+        )
+    candidates.sort(key=lambda item: float(item.get("priority_score") or 0.0), reverse=True)
+    candidates = candidates[:PROACTIVE_SHADOW_MAX_CANDIDATES_PER_QUEUE]
+    active_keys = [c["candidate_key"] for c in candidates if c.get("candidate_key")]
+    upserted = await _upsert_shadow_candidates(
+        db=db,
+        table_name="recent_change_candidates",
+        tenant_id=tenant_id,
+        user_id=user_id,
+        rows=candidates,
+    )
+    stale = await _mark_shadow_candidates_stale(
+        db=db,
+        table_name="recent_change_candidates",
+        tenant_id=tenant_id,
+        user_id=user_id,
+        active_keys=active_keys,
+    )
+    return {"upserted": upserted, "stale": stale, "active": len(candidates)}
+
+
+async def _proactive_shadow_candidate_users(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: Optional[str],
+    max_users: int,
+) -> List[str]:
+    if user_id:
+        clean = normalize_text(user_id)
+        return [clean] if clean else []
+    candidates: List[str] = []
+    max_rows = max(1, min(int(max_users or 300), 1000))
+
+    open_thread_rows = await db.fetch(
+        """
+        SELECT DISTINCT user_id
+        FROM open_threads
+        WHERE status='open'
+          AND (
+            last_mentioned_at >= NOW() - interval '30 days'
+            OR follow_up_after IS NOT NULL
+          )
+        ORDER BY user_id
+        LIMIT $1
+        """,
+        max_rows,
+    )
+    for row in open_thread_rows:
+        clean = normalize_text(row.get("user_id"))
+        if clean and clean not in candidates:
+            candidates.append(clean)
+
+    low_conf_rows = await db.fetch(
+        """
+        SELECT DISTINCT user_id
+        FROM low_confidence_items
+        WHERE tenant_id=$1
+          AND status='open'
+          AND last_seen_at >= NOW() - interval '30 days'
+        ORDER BY user_id
+        LIMIT $2
+        """,
+        tenant_id,
+        max_rows,
+    )
+    for row in low_conf_rows:
+        clean = normalize_text(row.get("user_id"))
+        if clean and clean not in candidates:
+            candidates.append(clean)
+
+    assertion_rows = await db.fetch(
+        """
+        SELECT DISTINCT user_id
+        FROM derived_assertions
+        WHERE tenant_id=$1
+          AND lifecycle_state='active'
+          AND surface IN ('memory_delta','thread_signal','identity_signal','living_context_statement')
+          AND updated_at >= NOW() - ($2::text || ' days')::interval
+        ORDER BY user_id
+        LIMIT $3
+        """,
+        tenant_id,
+        str(PROACTIVE_SHADOW_ASSERTION_LOOKBACK_DAYS),
+        max_rows,
+    )
+    for row in assertion_rows:
+        clean = normalize_text(row.get("user_id"))
+        if clean and clean not in candidates:
+            candidates.append(clean)
+
+    return candidates[:max_rows]
+
+
+async def run_proactive_shadow_candidates(
+    *,
+    db: Database,
+    tenant_id: str = "default",
+    user_id: Optional[str] = None,
+    max_users: int = 300,
+) -> Dict[str, Any]:
+    users = await _proactive_shadow_candidate_users(
+        db=db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        max_users=max_users,
+    )
+    summary: Dict[str, Any] = {
+        "users_considered": len(users),
+        "users_processed": 0,
+        "follow_up_candidates_upserted": 0,
+        "follow_up_candidates_stale": 0,
+        "follow_up_candidates_active": 0,
+        "clarification_candidates_upserted": 0,
+        "clarification_candidates_stale": 0,
+        "clarification_candidates_active": 0,
+        "recent_change_candidates_upserted": 0,
+        "recent_change_candidates_stale": 0,
+        "recent_change_candidates_active": 0,
+    }
+    for uid in users:
+        follow_up = await _refresh_follow_up_candidates_for_user(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=uid,
+        )
+        clarification = await _refresh_clarification_candidates_for_user(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=uid,
+        )
+        recent_change = await _refresh_recent_change_candidates_for_user(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=uid,
+        )
+        summary["users_processed"] += 1
+        summary["follow_up_candidates_upserted"] += int(follow_up.get("upserted") or 0)
+        summary["follow_up_candidates_stale"] += int(follow_up.get("stale") or 0)
+        summary["follow_up_candidates_active"] += int(follow_up.get("active") or 0)
+        summary["clarification_candidates_upserted"] += int(clarification.get("upserted") or 0)
+        summary["clarification_candidates_stale"] += int(clarification.get("stale") or 0)
+        summary["clarification_candidates_active"] += int(clarification.get("active") or 0)
+        summary["recent_change_candidates_upserted"] += int(recent_change.get("upserted") or 0)
+        summary["recent_change_candidates_stale"] += int(recent_change.get("stale") or 0)
+        summary["recent_change_candidates_active"] += int(recent_change.get("active") or 0)
     return summary
 
 
