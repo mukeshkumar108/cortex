@@ -1,6 +1,6 @@
 # Synapse Pipelines: Current Runtime State
 
-Date audited: 2026-04-21
+Date audited: 2026-04-28
 Audit basis: current repository code (`src/`), migrations/schema (`migrations/`, `schema.sql`), and runtime endpoints (`src/main.py`)
 
 Update: Phase 0 through Phase 2 memory-first implementation is active. The derived synthesis pipeline has an ingest-triggered async DAG, evidence traces, pipeline run state, Stage A quarantine, lifecycle fields, and meaning-memory primitive tables for low-confidence items, contradictions, events, silence flags, and relationship links. Runtime `startbrief`, `handover`, and compatibility `session/brief` remain sourced from derived Postgres tables.
@@ -52,21 +52,48 @@ Pass 1 triage:
 - Script: `scripts/run_pass1_memory_triage_batch.py`
 - Live hook: `pass1_triage`
 - Writes: `session_classifications`
-- Typical fields: memory-worthiness, session kind, memory deltas, entity mentions, thread/identity signals, emotional/tension fields, `context_relevant`
-- Also writes atomic `derived_assertions(surface='memory_delta'|'identity_signal'|'thread_signal'|'living_context_statement')` with `source_session_ids` and `source_turn_refs`
-- Also writes selected meaning-memory primitives when present: `memory_events` for explicit events/commitments and `low_confidence_items` for uncertain statements
+- Typical fields: memory-worthiness, session kind, boolean routing flags, emotional/tension fields, `context_relevant`
+- Pass 1 is routing-only; no entity/thread/actionable/memory/identity extraction payloads in Pass 1 output
+
+Pass 2 actionable extraction:
+- Live hook: `pass2_actionable` after successful Pass 1 when `run_actionable_pass=true`
+- Writes: `actionable_candidates`
+- Purpose: source-agnostic extraction of event/task/reminder/commitment candidates with provenance and lifecycle status
+- Prompt lane: dedicated Pass 2 actionable prompt (separate from Pass 1 triage prompt)
+- Extraction standard: only emit standalone useful items; unresolved pronoun-only fragments should not be emitted
+- Temporal grounding: prompts receive `now_iso`, `timezone`, `local_date`, `local_day`, and `time_of_day`
+- Time rules: resolve `tomorrow` / `Friday` / `tonight` from reference time; preserve vague phrases in `due_text` / `time_text`; do not invent ISO dates
+- Current default model: `google/gemma-4-26b-a4b-it`
+- Current storage note: `record_type` remains coarse; `candidate_subtype` holds the sharper action/tool shape
+
+Pass 2b session changes:
+- Live hook: `pass2b_session_changes` after successful Pass 1 when `run_session_changes_pass=true`
+- Writes: `session_changes`
+- Purpose: extract factual/contextual changes that materially update the user's world model
+- Examples: changed plan/date, changed project focus, changed relationship state, changed decision
+- Temporal grounding: prompts receive `now_iso`, `timezone`, `local_date`, `local_day`, and `time_of_day`
+- Time rules: `effective_iso` is only emitted when explicit or safely resolvable from reference time; vague timing stays in `time_text`
+- Current default model: `google/gemma-4-26b-a4b-it`
+
+Pass 2c entity candidates:
+- Live hook: `pass2c_entity_candidates` after successful Pass 1 when `run_entity_pass=true`
+- Writes: `entity_candidates`
+- Purpose: capture durable named-entity candidates before canonical profile resolution
+- Downstream flow: `pass2c_entity_candidates` feeds `pass1_5_entities`, which resolves/persists into `entity_profiles`
 
 Pass 1.5 entity pipeline:
 - Script: `scripts/run_entity_pipeline.py`
-- Live hook: `pass1_5_entities` after successful Pass 1 when entity mentions exist
+- Live hook: `pass1_5_entities` after successful Pass 2c entity-candidate extraction
 - Writes: `entity_profiles`
+- Consumes `entity_candidates` as the primary candidate source; legacy `session_classifications.entity_mentions` is compatibility-only
 - Also writes atomic `derived_assertions(surface='entity_mention')`
 - Also writes `memory_relationship_links` connecting entity mentions to source sessions
 
 Pass 3 threads pipeline:
 - Script: `scripts/run_threads_pipeline.py`
-- Live hook: `pass3_threads` after successful Pass 1 when thread signals exist
+- Live hook: `pass3_threads` after successful Pass 1 when `run_threads_pass=true`
 - Writes: `open_threads`
+- Discovers unresolved-thread signal from raw transcript inside the lane; legacy `raw_triage_output.thread_signals` is compatibility-only
 - Now includes `lifecycle_state`, `evidence_turn_refs`, extraction/validity confidence, memory layer, semantic category, retention floor, and access counters
 - Supports evidence-backed create/update/resolve/snooze transitions and reactivation of previously snoozed threads
 
@@ -111,6 +138,18 @@ Scoring refresh helpers:
 - Reads derived classifications/handover state only
 - Does not read Graphiti or canonical claims as serving authority
 
+`GET /daily-candidates` and `GET /review-queue`:
+- Read from `actionable_candidates`
+- `daily-candidates` is a serving lens, not source of truth
+- Default daily lens excludes low-confidence undated chatter and caps results to a small useful set
+- Current cleanup/audit flow can rewrite/dismiss historical rows without deleting underlying evidence
+
+`GET /session-changes`:
+- Read from `session_changes`
+
+`GET /entity-candidates`:
+- Read from `entity_candidates`
+
 Derived continuity retrieval helpers:
 - `_pg_search_nodes`, `_pg_search_continuity_facts`, `_pg_get_entity_role_hint`, `_pg_get_entity_continuity_facts`
 - Pull from derived tables (with some canonical supplementation in helper-level continuity functions)
@@ -120,6 +159,17 @@ Derived continuity retrieval helpers:
 This process is quality-proven in prior testing and now has a live ingest-triggered async DAG using the existing durable outbox. The scripts and live hooks use shared pass modules; parity tests compare both paths against the same fixtures. Live hardening is additive and preserves endpoint output shape.
 
 Current limitation: deterministic fixture parity is proven, but live model outputs still require human review for specificity, warmth, and non-generic synthesis quality.
+
+### 2.6 Current actionable lane status
+
+As of 2026-04-28:
+- Pass 1 is flags-only and no longer emits actionable, memory-delta, identity-signal, entity-mention, or thread-signal payloads
+- Pass 2 actionable is the dedicated action/tool candidate lane
+- Candidate cleanup/audit is LLM-primary for meaning decisions; deterministic code is limited to validation, normalization, persistence, lifecycle, and serving constraints
+- Historical low-quality rows were partially cleaned for the default test user; the remaining surfaced habit candidate was rewritten into a high-confidence `habit` with daily cadence
+
+Known remaining limitation:
+- Older historical `actionable_candidates` rows may still have `candidate_subtype=null` until re-audited or re-extracted
 
 ## 3. Process B: Canonical v2 truth pipeline
 
@@ -251,7 +301,7 @@ Meaning-first policy:
 ## 8. What is clearly manual vs integrated
 
 Integrated/live:
-- ingest -> derived Pass 1 triage -> async Pass 1.5 entities / Pass 3 threads -> signal/time-ceiling Pass 4 identity and Pass 5 living context
+- ingest -> derived Pass 1 triage -> async Pass 2 actionable / Pass 1.5 entities / Pass 3 threads -> signal/time-ceiling Pass 4 identity and Pass 5 living context
 - daily silence detection -> `memory_silence_flags`
 - ingest -> extract_results -> optional live entity/claim resolution -> canonical mutation logging
 - v2 retrieval + legacy adapter routing

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from src.canonicalization import normalize_text
 from src.openrouter_client import get_llm_client
@@ -84,6 +86,54 @@ def format_user_turns(messages: List[Dict[str, Any]]) -> str:
         if text:
             lines.append(f"User: {text}")
     return "\n".join(lines).strip()
+
+
+def _resolve_zoneinfo(timezone_name: Optional[str]) -> timezone | ZoneInfo:
+    raw = clean_text(timezone_name)
+    if not raw:
+        return timezone.utc
+    if raw.upper() == "UTC":
+        return timezone.utc
+    try:
+        return ZoneInfo(raw)
+    except Exception:
+        return timezone.utc
+
+
+def build_temporal_context(*, reference_time: Optional[datetime], timezone_name: Optional[str]) -> Dict[str, str]:
+    base = reference_time or datetime.now(timezone.utc)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    zone = _resolve_zoneinfo(timezone_name)
+    local_dt = base.astimezone(zone)
+    hour = int(local_dt.hour)
+    if 5 <= hour < 12:
+        time_of_day = "morning"
+    elif 12 <= hour < 17:
+        time_of_day = "afternoon"
+    elif 17 <= hour < 22:
+        time_of_day = "evening"
+    else:
+        time_of_day = "night"
+    return {
+        "now_iso": local_dt.isoformat(),
+        "timezone": getattr(zone, "key", None) or ("UTC" if zone == timezone.utc else str(zone)),
+        "local_date": local_dt.date().isoformat(),
+        "local_day": local_dt.strftime("%A"),
+        "time_of_day": time_of_day,
+    }
+
+
+def format_temporal_context_block(*, reference_time: Optional[datetime], timezone_name: Optional[str]) -> str:
+    ctx = build_temporal_context(reference_time=reference_time, timezone_name=timezone_name)
+    return (
+        "Temporal reference context:\n"
+        f"- now_iso: {ctx['now_iso']}\n"
+        f"- timezone: {ctx['timezone']}\n"
+        f"- local_date: {ctx['local_date']}\n"
+        f"- local_day: {ctx['local_day']}\n"
+        f"- time_of_day: {ctx['time_of_day']}"
+    )
 
 
 async def call_json_llm(*, prompt: str, model: str, max_tokens: int = 1600, temperature: float = 0.1) -> Optional[Dict[str, Any]]:

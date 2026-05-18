@@ -192,14 +192,17 @@ async def synthesize_identity_profile(
     existing_profile_text = "None — first synthesis" if not existing_profile else __import__('json').dumps(existing_profile, ensure_ascii=False, default=str)
     session_lines = []
     for row in session_rows:
-        raw = row.get("raw_triage_output") if isinstance(row.get("raw_triage_output"), dict) else {}
         session_lines.append(__import__('json').dumps({
             "session_id": row.get("session_id"),
             "session_date": row.get("session_date"),
             "user_excerpt": row.get("user_excerpt"),
             "routing_hints": row.get("routing_hints") or {
-                "memory_deltas": as_list(raw.get("memory_deltas")),
-                "identity_signals": as_list(raw.get("identity_signals")),
+                "identity_relevant": bool(row.get("identity_relevant")),
+                "run_entity_pass": bool(row.get("run_entity_pass")),
+                "run_threads_pass": bool(row.get("run_threads_pass")),
+                "session_kind": clean_text(row.get("session_kind")) or None,
+                "emotional_weight": clean_text(row.get("emotional_weight")) or None,
+                "tension_signal": clean_text(row.get("tension_signal")) or None,
             },
         }, ensure_ascii=False, default=str))
     prompt = IDENTITY_SYNTHESIS_PROMPT.format(

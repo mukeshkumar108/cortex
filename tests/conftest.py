@@ -12,3 +12,9 @@ def _stub_llm_calls(monkeypatch):
         return "summary"
 
     monkeypatch.setattr(llm_client, "_call_llm", _stub_call_llm, raising=True)
+
+
+@pytest.fixture(autouse=True)
+def _stub_internal_auth(monkeypatch):
+    # Default test stance keeps existing endpoint business-logic tests focused.
+    monkeypatch.setattr("src.main._require_internal_token", lambda _token: None, raising=True)

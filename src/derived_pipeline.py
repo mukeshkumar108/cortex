@@ -20,16 +20,29 @@ from .db import Database
 from .declared_profile_truth import extract_declared_profile_truth
 from .openrouter_client import get_llm_client
 from .derived_passes.pass1_triage import run_rich_pass1_llm
-from .derived_passes.pass15_entities import build_entity_profile, resolve_entity_mentions
+from .derived_passes.pass2_actionable import run_pass2_actionable_llm, _normalize_actionable_payload
+from .derived_passes.candidate_audits import (
+    audit_actionable_candidates,
+    audit_entity_candidates,
+    reconcile_actionable_candidate,
+    audit_session_changes,
+)
+from .derived_passes.pass2b_session_changes import run_pass2b_session_changes_llm, _normalize_session_changes_payload
+from .derived_passes.pass2c_entity_candidates import run_pass2c_entity_candidates_llm, _normalize_entity_candidates_payload
+from .derived_passes.pass15_entities import build_entity_profile, discover_entity_mentions, resolve_entity_mentions
 from .derived_passes.pass3_threads import audit_thread_registry, extract_thread_actions, VALID_CATEGORIES, VALID_PRIORITIES
 from .derived_passes.pass4_identity import normalize_identity_output, synthesize_identity_profile
 from .derived_passes.pass5_living_context import normalize_living_context_output, synthesize_living_context
-from .relationship_tiers import entity_relationship_tier, pass4_anchor_allowed, relationship_tier_rank
+from .derived_passes.common import build_temporal_context
+from .relationship_tiers import TIER_3_CONTEXTUAL, entity_relationship_tier, pass4_anchor_allowed, relationship_tier_rank
 from .derived_passes.synthesis_quality import conservative_rewrite_text, has_synthesis_quality_issue
 
 logger = logging.getLogger(__name__)
 
 PASS1_TRIAGE = "pass1_triage"
+PASS2_ACTIONABLE = "pass2_actionable"
+PASS2B_SESSION_CHANGES = "pass2b_session_changes"
+PASS2C_ENTITY_CANDIDATES = "pass2c_entity_candidates"
 PASS1_5_ENTITIES = "pass1_5_entities"
 PASS3_THREADS = "pass3_threads"
 PASS4_IDENTITY = "pass4_identity"
@@ -63,6 +76,57 @@ RETROSPECTIVE_LOW_CONFIDENCE_PRUNE_DAYS = 45
 RETROSPECTIVE_TENTATIVE_ENTITY_PRUNE_DAYS = 45
 PROACTIVE_SHADOW_ASSERTION_LOOKBACK_DAYS = 30
 PROACTIVE_SHADOW_MAX_CANDIDATES_PER_QUEUE = 12
+PROACTIVE_SHADOW_MIN_RECENT_CHANGE_VALIDITY = 0.65
+
+PROACTIVE_SHADOW_RELATIONAL_CATEGORIES = {
+    "relationship",
+    "commitment",
+    "worry",
+}
+
+PROACTIVE_SHADOW_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "any",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "up",
+    "user",
+    "users",
+    "with",
+}
+
+PROACTIVE_SHADOW_HEALTH_LOOP_TERMS = (
+    "water",
+    "hydration",
+    "kidney",
+    "electrolyte",
+    "lemon water",
+    "walk",
+    "walking",
+    "run",
+    "running",
+    "injury",
+    "knee",
+    "exercise",
+    "steps",
+    "sleep",
+)
 
 RETROSPECTIVE_PROCESSING_ORDER = [
     "contradictions",
@@ -211,6 +275,56 @@ PARTNER_RELATIONSHIP_ROLES = {
     "spouse",
 }
 
+ACTIONABLE_CANDIDATE_TYPES = {
+    "event_candidate",
+    "task_candidate",
+    "reminder_candidate",
+    "commitment",
+}
+
+ACTIONABLE_CANDIDATE_SUBTYPES = {
+    "todo",
+    "reminder",
+    "calendar_event",
+    "habit",
+    "follow_up",
+    "waiting_on",
+    "nudge",
+}
+
+ACTIONABLE_CANDIDATE_STATUSES = {
+    "detected",
+    "needs_review",
+    "confirmed",
+    "dismissed",
+    "acted_on",
+    "superseded",
+    "stale",
+}
+
+ACTIONABLE_CONFIDENCE_LABELS = {"low", "medium", "high"}
+
+WEEKDAY_TO_INDEX = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+ACTIONABLE_OPEN_STATUSES = {"detected", "needs_review", "confirmed"}
+ACTIONABLE_CANCEL_TERMS = (
+    "cancel",
+    "cancelled",
+    "canceled",
+    "called off",
+    "no longer",
+    "won't happen",
+    "will not happen",
+)
+
 
 @dataclass(frozen=True)
 class DerivedPassResult:
@@ -219,6 +333,8 @@ class DerivedPassResult:
     output_hash: str
     run_entity_pass: bool = False
     run_threads_pass: bool = False
+    run_actionable_pass: bool = False
+    run_session_changes_pass: bool = False
     should_run_identity: bool = False
     should_run_living_context: bool = False
 
@@ -721,6 +837,88 @@ def _priority_rank(value: Any) -> int:
     return 0
 
 
+def _shadow_title_tokens(value: Any) -> set[str]:
+    text = normalize_text(value)
+    if not text:
+        return set()
+    return {
+        tok
+        for tok in re.findall(r"[a-z0-9']{3,}", text)
+        if tok not in PROACTIVE_SHADOW_STOPWORDS
+    }
+
+
+def _shadow_token_overlap(a: Any, b: Any) -> float:
+    ta = _shadow_title_tokens(a)
+    tb = _shadow_title_tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return float(len(ta.intersection(tb))) / float(len(ta.union(tb)))
+
+
+def _primary_related_entity(value: Any) -> str:
+    items = _text_list(value, limit=1)
+    return normalize_text(items[0]) if items else ""
+
+
+def _is_low_leverage_recent_change_statement(statement: Any, semantic_category: Any) -> bool:
+    text = normalize_text(statement)
+    category = normalize_text(semantic_category)
+    if not text:
+        return True
+    if any(
+        phrase in text
+        for phrase in (
+            "delicate phase",
+            "delicate stage",
+            "in a delicate",
+            "clearly overthinking",
+            "emphasizes multiple times",
+        )
+    ):
+        return True
+    if any(phrase in text for phrase in ("family is originally", "originally from", "was born in", "were born in")):
+        return True
+    kinship_terms = ("grandfather", "granddad", "father", "mother", "family")
+    migration_terms = ("moved from", "moved to", "from india", "from africa", "uganda", "england", "states")
+    if any(term in text for term in kinship_terms) and any(term in text for term in migration_terms):
+        return True
+    if category == "session_observation" and any(
+        phrase in text
+        for phrase in (
+            "was born in",
+            "were born in",
+            "family is originally",
+        )
+    ):
+        return True
+    return False
+
+
+def _is_high_value_health_loop(row: Dict[str, Any]) -> bool:
+    loop_type = normalize_text(row.get("type"))
+    if loop_type not in {"habit", "commitment", "thread"}:
+        return False
+    status = normalize_text(row.get("status"))
+    if status not in {"active", "needs_review", "stale"}:
+        return False
+    text = normalize_text(row.get("text"))
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    domain = normalize_text(metadata.get("domain"))
+    tags = " ".join(_text_list(row.get("tags"), limit=16))
+    signal_blob = f"{text} {tags}"
+    if domain == "health":
+        return True
+    if not any(term in signal_blob for term in PROACTIVE_SHADOW_HEALTH_LOOP_TERMS):
+        return False
+    if any(term in text for term in ("repo", "repository", "code", "sdk", "push fix", "project updates")):
+        return False
+    updated_at = row.get("updated_at")
+    if isinstance(updated_at, datetime) and updated_at < _utcnow() - timedelta(days=120):
+        return False
+    return True
+
+
 def _thread_signal_rank(row: Dict[str, Any]) -> tuple[int, float, float, datetime]:
     category = normalize_text(row.get("category"))
     thread_type = normalize_text(row.get("thread_type"))
@@ -803,12 +1001,18 @@ def _rank_and_prune_entities(rows: Sequence[Dict[str, Any]], *, limit: int = 5) 
 def _rank_and_prune_sessions(rows: Sequence[Dict[str, Any]], *, limit: int = 20) -> List[Dict[str, Any]]:
     def score(row: Dict[str, Any]) -> tuple[int, int, datetime]:
         raw = row.get("raw_triage_output") if isinstance(row.get("raw_triage_output"), dict) else {}
-        deltas = [x for x in _text_list(raw.get("memory_deltas"), limit=8) if not _is_greeting_or_presence_check(x)]
         threads = _text_list(raw.get("thread_signals"), limit=8)
-        identity = _text_list(raw.get("identity_signals"), limit=8)
         tension = 1 if normalize_text(row.get("tension_signal")) else 0
-        signal_count = len(deltas) + len(threads) + len(identity) + tension
-        role_bonus = 1 if any(_semantic_category(x, "session") in {"relationship", "health", "persistent_goal"} for x in [*deltas, *threads, *identity]) else 0
+        flags = [
+            bool(row.get("identity_relevant")),
+            bool(row.get("run_entity_pass")),
+            bool(row.get("run_threads_pass")),
+            bool((raw or {}).get("run_actionable_pass")) if isinstance(raw, dict) else False,
+            bool(row.get("context_relevant")),
+        ]
+        signal_count = sum(1 for flag in flags if flag) + len(threads) + tension
+        session_kind = normalize_text(row.get("session_kind")).lower()
+        role_bonus = 1 if session_kind in {"personal", "mixed"} else 0
         ts = row.get("session_date") if isinstance(row.get("session_date"), datetime) else datetime.min.replace(tzinfo=timezone.utc)
         return (role_bonus, signal_count, ts)
 
@@ -1316,6 +1520,800 @@ async def _write_memory_event(
     )
 
 
+def _actionable_confidence_score(label: str) -> float:
+    normalized = normalize_text(label).lower()
+    if normalized == "high":
+        return 0.85
+    if normalized == "low":
+        return 0.45
+    return 0.65
+
+
+def _actionable_candidate_key(record_type: str, title: str, due_iso: Optional[str]) -> str:
+    return stable_short_hash(
+        {
+            "record_type": normalize_text(record_type).lower(),
+            "title": normalize_text(title).lower(),
+            "due_iso": normalize_text(due_iso),
+        },
+        version="actionable_candidate.v1",
+        length=28,
+    )
+
+
+def _actionable_item_kind_for_candidate(record_type: str, candidate_subtype: Optional[str]) -> Optional[str]:
+    subtype = normalize_text(candidate_subtype).lower()
+    if subtype in {"todo", "reminder", "habit"}:
+        return subtype
+    if subtype in {"follow_up", "waiting_on", "nudge"}:
+        return "todo"
+    record = normalize_text(record_type).lower()
+    if record == "reminder_candidate":
+        return "reminder"
+    if record in {"task_candidate", "commitment"}:
+        return "todo"
+    return None
+
+
+def _actionable_day_bucket(value: Optional[datetime]) -> Optional[str]:
+    if not isinstance(value, datetime):
+        return None
+    dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).date().isoformat()
+
+
+def _actionable_item_date_bucket(row: Dict[str, Any], kind: str) -> Optional[str]:
+    primary = row.get("remind_at") if kind == "reminder" else row.get("due_at")
+    if primary is None:
+        primary = row.get("due_at") or row.get("remind_at")
+    primary_dt = primary if isinstance(primary, datetime) else _parse_optional_dt(primary)
+    return _actionable_day_bucket(primary_dt)
+
+
+def _source_ref_matches_candidate(source_ref: Any, provenance: Dict[str, Any], session_id: str) -> bool:
+    if not isinstance(source_ref, dict):
+        return False
+    candidate_session = normalize_text(session_id)
+    source_session = normalize_text(source_ref.get("sessionId") or source_ref.get("session_id"))
+    if candidate_session and source_session and candidate_session == source_session:
+        return True
+    refs = provenance.get("source_turn_refs") if isinstance(provenance, dict) else None
+    if isinstance(refs, list):
+        for ref in refs:
+            if not isinstance(ref, dict):
+                continue
+            ref_session = normalize_text(ref.get("sessionId") or ref.get("session_id") or ref.get("session"))
+            if candidate_session and ref_session and candidate_session == ref_session:
+                return True
+    return False
+
+
+def _action_item_candidate_match_score(
+    *,
+    item: Dict[str, Any],
+    kind: str,
+    title: str,
+    candidate_bucket: Optional[str],
+    provenance: Dict[str, Any],
+    session_id: str,
+) -> tuple[float, bool, bool]:
+    if normalize_text(item.get("kind")).lower() != kind:
+        return (0.0, False, False)
+    title_score = _shadow_token_overlap(title, item.get("title"))
+    item_bucket = _actionable_item_date_bucket(item, kind)
+    date_match = bool(candidate_bucket and item_bucket and candidate_bucket == item_bucket)
+    both_undated = candidate_bucket is None and item_bucket is None
+    source_match = _source_ref_matches_candidate(item.get("source_ref"), provenance, session_id)
+    score = title_score
+    if date_match:
+        score += 0.18
+    if source_match:
+        score += 0.16
+    if both_undated:
+        score += 0.04
+    return (min(1.0, score), date_match or both_undated, source_match)
+
+
+async def _find_matching_action_item(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+    kind: Optional[str],
+    title: str,
+    candidate_bucket: Optional[str],
+    provenance: Dict[str, Any],
+    session_id: str,
+) -> Optional[Dict[str, Any]]:
+    if kind not in {"todo", "reminder", "habit"}:
+        return None
+    rows = await db.fetch(
+        """
+        SELECT id, tenant_id, user_id, kind, title, status, due_at, remind_at,
+               source_type, source_ref, confidence, provenance_summary, created_at, updated_at
+        FROM action_items
+        WHERE tenant_id = $1
+          AND user_id = $2
+          AND kind = $3
+        ORDER BY updated_at DESC
+        LIMIT 120
+        """,
+        tenant_id,
+        user_id,
+        kind,
+    )
+    best_row: Optional[Dict[str, Any]] = None
+    best_score = 0.0
+    best_date_or_undated = False
+    best_source_match = False
+    for row in [dict(r) for r in (rows or []) if isinstance(r, dict)]:
+        score, date_or_undated, source_match = _action_item_candidate_match_score(
+            item=row,
+            kind=kind,
+            title=title,
+            candidate_bucket=candidate_bucket,
+            provenance=provenance,
+            session_id=session_id,
+        )
+        if score > best_score:
+            best_row = row
+            best_score = score
+            best_date_or_undated = date_or_undated
+            best_source_match = source_match
+    if not best_row:
+        return None
+    threshold = 0.62 if (best_date_or_undated or best_source_match) else 0.78
+    return best_row if best_score >= threshold else None
+
+
+def _actionable_time_distance_seconds(a: Optional[datetime], b: Optional[datetime]) -> Optional[float]:
+    if not isinstance(a, datetime) or not isinstance(b, datetime):
+        return None
+    da = a if a.tzinfo is not None else a.replace(tzinfo=timezone.utc)
+    db = b if b.tzinfo is not None else b.replace(tzinfo=timezone.utc)
+    return abs((da - db).total_seconds())
+
+
+def _source_strength(source: str, linked_external_type: Optional[str]) -> int:
+    src = normalize_text(source).lower()
+    ext = normalize_text(linked_external_type).lower()
+    if ext == "calendar" or "calendar" in src:
+        return 100
+    if "email" in src:
+        return 80
+    if "whatsapp" in src:
+        return 70
+    if "chat" in src:
+        return 60
+    return 50
+
+
+def _is_authoritative_source(source: str, linked_external_id: Optional[str], linked_external_type: Optional[str]) -> bool:
+    ext_type = normalize_text(linked_external_type).lower()
+    if ext_type == "calendar" and normalize_text(linked_external_id):
+        return True
+    return False
+
+
+def _looks_cancelled(text: str) -> bool:
+    lowered = normalize_text(text).lower()
+    if not lowered:
+        return False
+    return any(term in lowered for term in ACTIONABLE_CANCEL_TERMS)
+
+
+def _merge_provenance(
+    *,
+    existing: Dict[str, Any],
+    incoming: Dict[str, Any],
+    source: str,
+    linked_external_id: Optional[str],
+    linked_external_type: Optional[str],
+    session_id: str,
+    run_id: Optional[int],
+    title: str,
+    summary: Optional[str],
+    due_dt: Optional[datetime],
+) -> Dict[str, Any]:
+    base = dict(existing) if isinstance(existing, dict) else {}
+    incoming_payload = dict(incoming) if isinstance(incoming, dict) else {}
+    current_event = {
+        "source": normalize_text(source) or "chat",
+        "session_id": normalize_text(session_id) or None,
+        "run_id": int(run_id) if run_id is not None else None,
+        "title": normalize_text(title, casefold=False)[:180],
+        "summary": normalize_text(summary, casefold=False)[:320] if normalize_text(summary, casefold=False) else None,
+        "due_iso": _format_due_iso(due_dt),
+        "linked_external_id": normalize_text(linked_external_id) or None,
+        "linked_external_type": normalize_text(linked_external_type) or None,
+        "message_hint": normalize_text((incoming_payload or {}).get("message_hint"), casefold=False)[:240]
+        if normalize_text((incoming_payload or {}).get("message_hint"), casefold=False)
+        else None,
+        "source_turn_refs": incoming_payload.get("source_turn_refs") if isinstance(incoming_payload.get("source_turn_refs"), list) else [],
+        "source_strength": _source_strength(source, linked_external_type),
+        "ingested_at": _format_due_iso(_utcnow()),
+    }
+    seed_events: List[Dict[str, Any]] = [current_event]
+    existing_events = base.get("events") if isinstance(base.get("events"), list) else []
+    merged_events: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in seed_events + [dict(e) for e in existing_events if isinstance(e, dict)]:
+        fingerprint = stable_short_hash(
+            {
+                "source": normalize_text(row.get("source")),
+                "session_id": normalize_text(row.get("session_id")),
+                "title": normalize_text(row.get("title")),
+                "due_iso": normalize_text(row.get("due_iso")),
+                "linked_external_id": normalize_text(row.get("linked_external_id")),
+            },
+            version="actionable_provenance_event.v1",
+            length=16,
+        )
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        merged_events.append(row)
+    ranked = sorted(
+        merged_events,
+        key=lambda r: (
+            int(r.get("source_strength") or 0),
+            normalize_text(r.get("ingested_at")),
+        ),
+        reverse=True,
+    )
+    merged = {
+        **base,
+        **incoming_payload,
+        "events": ranked[:24],
+        "primary_source": normalize_text((ranked[0] if ranked else {}).get("source")) or normalize_text(source) or "chat",
+        "primary_external_id": normalize_text((ranked[0] if ranked else {}).get("linked_external_id")) or None,
+        "primary_external_type": normalize_text((ranked[0] if ranked else {}).get("linked_external_type")) or None,
+    }
+    return merged
+
+
+def _candidate_similarity(
+    *,
+    new_record_type: str,
+    new_title: str,
+    new_due_dt: Optional[datetime],
+    row: Dict[str, Any],
+) -> tuple[float, bool]:
+    if normalize_text(row.get("record_type")).lower() != normalize_text(new_record_type).lower():
+        return (0.0, False)
+    overlap = _shadow_token_overlap(new_title, row.get("title"))
+    old_due = row.get("due_iso")
+    old_due_dt = old_due if isinstance(old_due, datetime) else _parse_optional_dt(old_due)
+    dist = _actionable_time_distance_seconds(new_due_dt, old_due_dt)
+    time_overlap = (
+        dist is None
+        or dist <= 6 * 3600
+        or (
+            isinstance(new_due_dt, datetime)
+            and isinstance(old_due_dt, datetime)
+            and (new_due_dt.date() == old_due_dt.date())
+        )
+    )
+    score = overlap
+    if time_overlap:
+        score += 0.2
+    return (min(1.0, score), bool(time_overlap))
+
+
+async def _upsert_actionable_candidate(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    run_id: Optional[int],
+    record_type: str,
+    candidate_subtype: Optional[str],
+    title: str,
+    summary: Optional[str],
+    due_iso: Optional[str],
+    relevant_from_iso: Optional[str],
+    relevant_until_iso: Optional[str],
+    waiting_on: Optional[str],
+    needs_response: Optional[bool],
+    cadence_text: Optional[str],
+    suggested_action: Optional[str],
+    linked_external_id: Optional[str],
+    linked_external_type: Optional[str],
+    source: str,
+    provenance: Dict[str, Any],
+    confidence_label: str,
+    status: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    normalized_type = normalize_text(record_type).lower()
+    normalized_subtype = normalize_text(candidate_subtype).lower() or None
+    normalized_status = normalize_text(status).lower() or "detected"
+    if normalized_type not in ACTIONABLE_CANDIDATE_TYPES:
+        return
+    if normalized_subtype not in ACTIONABLE_CANDIDATE_SUBTYPES:
+        normalized_subtype = None
+    if normalized_status not in ACTIONABLE_CANDIDATE_STATUSES:
+        normalized_status = "detected"
+    clean_title = normalize_text(title, casefold=False)
+    if not clean_title:
+        return
+    due_dt = _parse_optional_dt(due_iso)
+    relevant_from_dt = _parse_optional_dt(relevant_from_iso)
+    relevant_until_dt = _parse_optional_dt(relevant_until_iso)
+    if due_dt and relevant_from_dt is None:
+        relevant_from_dt = due_dt
+    if due_dt and relevant_until_dt is None:
+        relevant_until_dt = due_dt
+    if relevant_from_dt and relevant_until_dt and relevant_until_dt < relevant_from_dt:
+        relevant_until_dt = relevant_from_dt
+    candidate_key = _actionable_candidate_key(normalized_type, clean_title, _format_due_iso(due_dt))
+    confidence = normalize_text(confidence_label).lower() or "medium"
+    if confidence not in ACTIONABLE_CONFIDENCE_LABELS:
+        confidence = "medium"
+    incoming_conf_score = float(_actionable_confidence_score(confidence))
+    source_norm = normalize_text(source) or "chat"
+    summary_clean = normalize_text(summary, casefold=False)[:320] if normalize_text(summary, casefold=False) else None
+    waiting_on_clean = normalize_text(waiting_on, casefold=False)[:180] if normalize_text(waiting_on, casefold=False) else None
+    cadence_text_clean = normalize_text(cadence_text, casefold=False)[:120] if normalize_text(cadence_text, casefold=False) else None
+    base_metadata = metadata or {}
+    is_cancelled = _looks_cancelled(f"{clean_title} {summary_clean or ''}")
+    incoming_authoritative = _is_authoritative_source(source_norm, linked_external_id, linked_external_type)
+    merged_new_provenance = _merge_provenance(
+        existing={},
+        incoming=provenance,
+        source=source_norm,
+        linked_external_id=linked_external_id,
+        linked_external_type=linked_external_type,
+        session_id=session_id,
+        run_id=run_id,
+        title=clean_title,
+        summary=summary_clean,
+        due_dt=due_dt,
+    )
+
+    item_kind = _actionable_item_kind_for_candidate(normalized_type, normalized_subtype)
+    matching_action_item = await _find_matching_action_item(
+        db=db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        kind=item_kind,
+        title=clean_title,
+        candidate_bucket=_actionable_day_bucket(due_dt),
+        provenance=provenance if isinstance(provenance, dict) else {},
+        session_id=session_id,
+    )
+    if matching_action_item:
+        await db.execute(
+            """
+            INSERT INTO actionable_candidates (
+              tenant_id, user_id, session_id, run_id, candidate_key, record_type, title, summary,
+              due_iso, candidate_subtype, relevant_from_iso, relevant_until_iso, waiting_on, needs_response, cadence_text, suggested_action,
+              linked_external_id, linked_external_type,
+              source, provenance, confidence_score, confidence_label, status, promoted_action_item_id, metadata,
+              created_at, updated_at
+            )
+            VALUES (
+              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20::jsonb,$21,$22,$23,$24::uuid,$25::jsonb,NOW(),NOW()
+            )
+            ON CONFLICT (tenant_id, user_id, candidate_key)
+            DO UPDATE SET
+              session_id = EXCLUDED.session_id,
+              run_id = EXCLUDED.run_id,
+              title = EXCLUDED.title,
+              summary = EXCLUDED.summary,
+              due_iso = COALESCE(EXCLUDED.due_iso, actionable_candidates.due_iso),
+              candidate_subtype = COALESCE(EXCLUDED.candidate_subtype, actionable_candidates.candidate_subtype),
+              relevant_from_iso = COALESCE(EXCLUDED.relevant_from_iso, actionable_candidates.relevant_from_iso),
+              relevant_until_iso = COALESCE(EXCLUDED.relevant_until_iso, actionable_candidates.relevant_until_iso),
+              waiting_on = COALESCE(EXCLUDED.waiting_on, actionable_candidates.waiting_on),
+              needs_response = COALESCE(EXCLUDED.needs_response, actionable_candidates.needs_response),
+              cadence_text = COALESCE(EXCLUDED.cadence_text, actionable_candidates.cadence_text),
+              suggested_action = COALESCE(EXCLUDED.suggested_action, actionable_candidates.suggested_action),
+              linked_external_id = COALESCE(EXCLUDED.linked_external_id, actionable_candidates.linked_external_id),
+              linked_external_type = COALESCE(EXCLUDED.linked_external_type, actionable_candidates.linked_external_type),
+              source = EXCLUDED.source,
+              provenance = COALESCE(actionable_candidates.provenance, '{}'::jsonb) || EXCLUDED.provenance,
+              confidence_score = GREATEST(actionable_candidates.confidence_score, EXCLUDED.confidence_score),
+              confidence_label = CASE
+                WHEN actionable_candidates.confidence_score >= EXCLUDED.confidence_score THEN actionable_candidates.confidence_label
+                ELSE EXCLUDED.confidence_label
+              END,
+              status = CASE
+                WHEN actionable_candidates.status IN ('confirmed', 'dismissed', 'acted_on') THEN actionable_candidates.status
+                ELSE 'superseded'
+              END,
+              promoted_action_item_id = COALESCE(actionable_candidates.promoted_action_item_id, EXCLUDED.promoted_action_item_id),
+              metadata = COALESCE(actionable_candidates.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+              updated_at = NOW()
+            """,
+            tenant_id,
+            user_id,
+            session_id,
+            run_id,
+            candidate_key,
+            normalized_type,
+            clean_title[:180],
+            summary_clean,
+            due_dt,
+            normalized_subtype,
+            relevant_from_dt,
+            relevant_until_dt,
+            waiting_on_clean,
+            needs_response,
+            cadence_text_clean,
+            normalize_text(suggested_action, casefold=False) or None,
+            normalize_text(linked_external_id) or None,
+            normalize_text(linked_external_type) or None,
+            source_norm,
+            merged_new_provenance,
+            incoming_conf_score,
+            confidence,
+            "superseded",
+            str(matching_action_item.get("id")),
+            {
+                **base_metadata,
+                "reconciled": True,
+                "reconciliation_action": "already_confirmed_action_item",
+                "matched_action_item_id": str(matching_action_item.get("id")),
+                "matched_action_item_status": normalize_text(matching_action_item.get("status")) or None,
+                "incoming_source": source_norm,
+            },
+        )
+        return
+
+    existing_rows = await db.fetch(
+        """
+        SELECT
+          candidate_id, candidate_key, record_type, title, summary, due_iso,
+          candidate_subtype, relevant_from_iso, relevant_until_iso, waiting_on, needs_response, cadence_text, suggested_action,
+          linked_external_id, linked_external_type, source, provenance,
+          confidence_score, confidence_label, status, metadata, created_at, updated_at
+        FROM actionable_candidates
+        WHERE tenant_id = $1
+          AND user_id = $2
+          AND status = ANY($3::text[])
+        ORDER BY updated_at DESC
+        LIMIT 120
+        """,
+        tenant_id,
+        user_id,
+        list(ACTIONABLE_OPEN_STATUSES),
+    )
+    normalized_existing = [dict(r) for r in (existing_rows or []) if isinstance(r, dict)]
+
+    # External authoritative linkage wins first if ID matches.
+    ext_match = None
+    if normalize_text(linked_external_id):
+        for row in normalized_existing:
+            if normalize_text(row.get("linked_external_id")) == normalize_text(linked_external_id):
+                ext_match = row
+                break
+
+    best_row = ext_match
+    best_score = 0.0
+    best_time_overlap = False
+    llm_reconciliation = None
+    settings = get_settings()
+    if best_row is None and bool(settings.derived_pipeline_llm_enabled) and normalized_existing:
+        new_candidate_payload = {
+            "record_type": normalized_type,
+            "candidate_subtype": normalized_subtype,
+            "title": clean_title[:180],
+            "summary": summary_clean,
+            "due_iso": _format_due_iso(due_dt),
+            "waiting_on": waiting_on_clean,
+            "needs_response": needs_response,
+            "cadence_text": cadence_text_clean,
+            "source": source_norm,
+            "confidence_label": confidence,
+            "status": normalized_status,
+            "provenance": {
+                "message_hint": normalize_text((provenance or {}).get("message_hint"), casefold=False)[:180]
+                if normalize_text((provenance or {}).get("message_hint"), casefold=False)
+                else None,
+                "resolved_object": normalize_text((provenance or {}).get("resolved_object"), casefold=False)[:180]
+                if normalize_text((provenance or {}).get("resolved_object"), casefold=False)
+                else None,
+                "related_entities": [
+                    normalize_text(item, casefold=False)[:120]
+                    for item in ((provenance or {}).get("related_entities") if isinstance((provenance or {}).get("related_entities"), list) else [])
+                    if normalize_text(item, casefold=False)
+                ][:6],
+            },
+        }
+        candidate_group = [_compact_actionable_candidate_for_reconciliation(row) for row in normalized_existing[:20]]
+        llm_reconciliation = await reconcile_actionable_candidate(
+            new_candidate=new_candidate_payload,
+            existing_candidates=candidate_group,
+            model=settings.derived_pipeline_model_version,
+        )
+        if llm_reconciliation and float(llm_reconciliation.get("confidence") or 0.0) >= 0.75:
+            target_id = llm_reconciliation.get("target_candidate_id")
+            if target_id:
+                best_row = next((row for row in normalized_existing if int(row.get("candidate_id") or 0) == int(target_id)), None)
+
+    if best_row is None:
+        for row in normalized_existing:
+            score, time_overlap = _candidate_similarity(
+                new_record_type=normalized_type,
+                new_title=clean_title,
+                new_due_dt=due_dt,
+                row=row,
+            )
+            if score > best_score:
+                best_score = score
+                best_time_overlap = time_overlap
+                best_row = row
+
+    if llm_reconciliation and float(llm_reconciliation.get("confidence") or 0.0) >= 0.75:
+        action = normalize_text(llm_reconciliation.get("action")).upper()
+        if action == "DISMISS":
+            return
+        if action == "STALE_EXISTING" and best_row:
+            await db.execute(
+                """
+                UPDATE actionable_candidates
+                SET status='stale',
+                    metadata=COALESCE(metadata, '{}'::jsonb) || $4::jsonb,
+                    updated_at=NOW()
+                WHERE tenant_id=$1 AND user_id=$2 AND candidate_id=$3
+                """,
+                tenant_id,
+                user_id,
+                int(best_row.get("candidate_id")),
+                {
+                    **base_metadata,
+                    "reconciled": True,
+                    "reconciliation_action": "llm_stale_existing",
+                    "reconciliation_reason": llm_reconciliation.get("reason"),
+                },
+            )
+        elif action == "MERGE" and best_row:
+            best_score = max(best_score, 0.9)
+            best_time_overlap = True
+        elif action == "SUPERSEDE" and best_row:
+            best_score = max(best_score, 0.9)
+            best_time_overlap = False
+        elif action == "SEPARATE":
+            best_row = None
+
+    if is_cancelled:
+        cancel_target = best_row
+        if cancel_target and (best_score >= 0.72 or ext_match is not None):
+            target_status = "dismissed" if incoming_authoritative else "stale"
+            merged_prov = _merge_provenance(
+                existing=cancel_target.get("provenance") if isinstance(cancel_target.get("provenance"), dict) else {},
+                incoming=provenance,
+                source=source_norm,
+                linked_external_id=linked_external_id,
+                linked_external_type=linked_external_type,
+                session_id=session_id,
+                run_id=run_id,
+                title=clean_title,
+                summary=summary_clean,
+                due_dt=due_dt,
+            )
+            await db.execute(
+                """
+                UPDATE actionable_candidates
+                SET
+                  status = $4,
+                  confidence_score = GREATEST(confidence_score, $5),
+                  confidence_label = CASE
+                    WHEN confidence_score >= $5 THEN confidence_label
+                    ELSE $6
+                  END,
+                  provenance = $7::jsonb,
+                  metadata = COALESCE(metadata, '{}'::jsonb) || $8::jsonb,
+                  updated_at = NOW()
+                WHERE tenant_id = $1 AND user_id = $2 AND candidate_id = $3
+                """,
+                tenant_id,
+                user_id,
+                int(cancel_target.get("candidate_id")),
+                target_status,
+                incoming_conf_score,
+                confidence,
+                merged_prov,
+                {
+                    **base_metadata,
+                    "reconciled": True,
+                    "reconciliation_action": "cancellation_status_update",
+                    "reconciliation_source": source_norm,
+                },
+            )
+        return
+
+    if best_row and (best_score >= 0.72 or ext_match is not None):
+        old_due = best_row.get("due_iso")
+        old_due_dt = old_due if isinstance(old_due, datetime) else _parse_optional_dt(old_due)
+        due_changed = (
+            isinstance(due_dt, datetime)
+            and isinstance(old_due_dt, datetime)
+            and _actionable_time_distance_seconds(due_dt, old_due_dt) is not None
+            and _actionable_time_distance_seconds(due_dt, old_due_dt) > 6 * 3600
+        )
+        if due_changed and not best_time_overlap:
+            await db.execute(
+                """
+                UPDATE actionable_candidates
+                SET
+                  status = 'superseded',
+                  metadata = COALESCE(metadata, '{}'::jsonb) || $4::jsonb,
+                  updated_at = NOW()
+                WHERE tenant_id = $1 AND user_id = $2 AND candidate_id = $3
+                """,
+                tenant_id,
+                user_id,
+                int(best_row.get("candidate_id")),
+                {
+                    "reconciled": True,
+                    "reconciliation_action": "superseded_by_new_time",
+                    "superseded_by_candidate_key": candidate_key,
+                    "superseded_at": _format_due_iso(_utcnow()),
+                },
+            )
+        else:
+            merged_prov = _merge_provenance(
+                existing=best_row.get("provenance") if isinstance(best_row.get("provenance"), dict) else {},
+                incoming=provenance,
+                source=source_norm,
+                linked_external_id=linked_external_id,
+                linked_external_type=linked_external_type,
+                session_id=session_id,
+                run_id=run_id,
+                title=clean_title,
+                summary=summary_clean,
+                due_dt=due_dt,
+            )
+            current_status = normalize_text(best_row.get("status")).lower() or "detected"
+            next_status = current_status
+            if incoming_authoritative:
+                next_status = "confirmed"
+            elif current_status == "detected":
+                next_status = "needs_review"
+            await db.execute(
+                """
+                UPDATE actionable_candidates
+                SET
+                  session_id = $4,
+                  run_id = $5,
+                  title = COALESCE($6, title),
+                  summary = COALESCE($7, summary),
+                  due_iso = COALESCE($8, due_iso),
+                  candidate_subtype = COALESCE($9, candidate_subtype),
+                  relevant_from_iso = COALESCE($10, relevant_from_iso),
+                  relevant_until_iso = COALESCE($11, relevant_until_iso),
+                  waiting_on = COALESCE($12, waiting_on),
+                  needs_response = COALESCE($13, needs_response),
+                  cadence_text = COALESCE($14, cadence_text),
+                  suggested_action = COALESCE($15, suggested_action),
+                  linked_external_id = COALESCE($16, linked_external_id),
+                  linked_external_type = COALESCE($17, linked_external_type),
+                  source = $18,
+                  provenance = $19::jsonb,
+                  confidence_score = LEAST(1.0, GREATEST(confidence_score, $20) + $21),
+                  confidence_label = CASE
+                    WHEN GREATEST(confidence_score, $20) >= 0.82 THEN 'high'
+                    WHEN GREATEST(confidence_score, $20) >= 0.55 THEN 'medium'
+                    ELSE 'low'
+                  END,
+                  status = CASE
+                    WHEN status IN ('dismissed', 'acted_on', 'superseded') THEN status
+                    ELSE $22
+                  END,
+                  metadata = COALESCE(metadata, '{}'::jsonb) || $23::jsonb,
+                  updated_at = NOW()
+                WHERE tenant_id = $1 AND user_id = $2 AND candidate_id = $3
+                """,
+                tenant_id,
+                user_id,
+                int(best_row.get("candidate_id")),
+                session_id,
+                run_id,
+                clean_title[:180],
+                summary_clean,
+                due_dt,
+                normalized_subtype,
+                relevant_from_dt,
+                relevant_until_dt,
+                waiting_on_clean,
+                needs_response,
+                cadence_text_clean,
+                normalize_text(suggested_action, casefold=False) or None,
+                normalize_text(linked_external_id) or None,
+                normalize_text(linked_external_type) or None,
+                source_norm,
+                merged_prov,
+                incoming_conf_score,
+                0.08 if ext_match is None else 0.04,
+                next_status,
+                {
+                    **base_metadata,
+                    "reconciled": True,
+                    "reconciliation_action": "merged_existing",
+                    "reconciliation_score": best_score,
+                    "time_overlap": best_time_overlap,
+                    "incoming_source": source_norm,
+                },
+            )
+            return
+
+    await db.execute(
+        """
+        INSERT INTO actionable_candidates (
+          tenant_id, user_id, session_id, run_id, candidate_key, record_type, title, summary,
+          due_iso, candidate_subtype, relevant_from_iso, relevant_until_iso, waiting_on, needs_response, cadence_text, suggested_action,
+          linked_external_id, linked_external_type,
+          source, provenance, confidence_score, confidence_label, status, metadata,
+          created_at, updated_at
+        )
+        VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20,$21,$22,$23::jsonb,NOW(),NOW()
+        )
+        ON CONFLICT (tenant_id, user_id, candidate_key)
+        DO UPDATE SET
+          session_id = EXCLUDED.session_id,
+          run_id = EXCLUDED.run_id,
+          title = EXCLUDED.title,
+          summary = EXCLUDED.summary,
+          due_iso = COALESCE(EXCLUDED.due_iso, actionable_candidates.due_iso),
+          candidate_subtype = COALESCE(EXCLUDED.candidate_subtype, actionable_candidates.candidate_subtype),
+          relevant_from_iso = COALESCE(EXCLUDED.relevant_from_iso, actionable_candidates.relevant_from_iso),
+          relevant_until_iso = COALESCE(EXCLUDED.relevant_until_iso, actionable_candidates.relevant_until_iso),
+          waiting_on = COALESCE(EXCLUDED.waiting_on, actionable_candidates.waiting_on),
+          needs_response = COALESCE(EXCLUDED.needs_response, actionable_candidates.needs_response),
+          cadence_text = COALESCE(EXCLUDED.cadence_text, actionable_candidates.cadence_text),
+          suggested_action = COALESCE(EXCLUDED.suggested_action, actionable_candidates.suggested_action),
+          linked_external_id = COALESCE(EXCLUDED.linked_external_id, actionable_candidates.linked_external_id),
+          linked_external_type = COALESCE(EXCLUDED.linked_external_type, actionable_candidates.linked_external_type),
+          source = EXCLUDED.source,
+          provenance = COALESCE(actionable_candidates.provenance, '{}'::jsonb) || EXCLUDED.provenance,
+          confidence_score = GREATEST(actionable_candidates.confidence_score, EXCLUDED.confidence_score),
+          confidence_label = CASE
+            WHEN actionable_candidates.confidence_score >= EXCLUDED.confidence_score THEN actionable_candidates.confidence_label
+            ELSE EXCLUDED.confidence_label
+          END,
+          status = CASE
+            WHEN actionable_candidates.status IN ('confirmed', 'dismissed', 'acted_on') THEN actionable_candidates.status
+            ELSE EXCLUDED.status
+          END,
+          metadata = COALESCE(actionable_candidates.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+          updated_at = NOW()
+        """,
+        tenant_id,
+        user_id,
+        session_id,
+        run_id,
+        candidate_key,
+        normalized_type,
+        clean_title[:180],
+        normalize_text(summary, casefold=False)[:320] if normalize_text(summary, casefold=False) else None,
+        due_dt,
+        normalized_subtype,
+        relevant_from_dt,
+        relevant_until_dt,
+        waiting_on_clean,
+        needs_response,
+        cadence_text_clean,
+        normalize_text(suggested_action, casefold=False) or None,
+        normalize_text(linked_external_id) or None,
+        normalize_text(linked_external_type) or None,
+        normalize_text(source) or "chat",
+        merged_new_provenance,
+        incoming_conf_score,
+        confidence,
+        "confirmed" if incoming_authoritative else normalized_status,
+        {
+            **base_metadata,
+            "reconciled": True,
+            "reconciliation_action": "insert_new",
+            "incoming_source": source_norm,
+        },
+    )
+
+
 async def _write_memory_contradiction(
     *,
     db: Database,
@@ -1597,84 +2595,50 @@ def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _heuristic_pass1(messages: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    user_text = _messages_text(messages, user_only=True)
-    text_norm = normalize_text(user_text)
-    sentences = [
-        normalize_text(s, casefold=False)
-        for s in re.split(r"(?<=[.!?])\s+|\n+", user_text)
-        if normalize_text(s)
-    ]
-    signal_terms = (
-        "remember",
-        "don't forget",
-        "do not forget",
-        "need to",
-        "i want",
-        "i am",
-        "i'm",
-        "my ",
-        "ashley",
-        "jasmine",
-        "health",
-        "pain",
-        "hospital",
-        "relationship",
-        "sophie",
-        "synapse",
-    )
-    memory_deltas = [s for s in sentences if any(term in normalize_text(s) for term in signal_terms)][:4]
-    entity_mentions: List[str] = []
-    for match in re.findall(r"\b[A-Z][a-zA-Z]{2,}(?:\s+[A-Z][a-zA-Z]{2,}){0,2}\b", user_text):
-        name = normalize_text(match, casefold=False)
-        if name in {"I", "The", "This", "That", "Pass", "Model", "JSON"}:
-            continue
-        if name not in entity_mentions:
-            entity_mentions.append(name)
-    identity_signal_terms = ("i believe", "i value", "i want", "i need", "my faith", "my daughter", "my son", "my partner", "my wife", "my husband")
-    identity_signals = [
-        s for s in sentences
-        if any(term in normalize_text(s) for term in identity_signal_terms)
-        and not any(term in normalize_text(s) for term in ("i feel", "i'm feeling", "i am feeling"))
-    ][:4]
-    thread_signal_terms = (
-        "need to",
-        "follow up",
-        "remind",
-        "waiting",
-        "unresolved",
-        "goal",
-        "doctor",
-        "hospital",
-        "message",
-        "reply",
-        "did not reply",
-        "didn't reply",
-        "not speaking",
-        "estranged",
-        "followed me back",
-        "followed back",
-    )
-    thread_signals = [
-        s for s in sentences
-        if any(term in normalize_text(s) for term in thread_signal_terms)
-    ][:4]
-    context_relevant = bool(memory_deltas or thread_signals or "tension" in text_norm or "stressed" in text_norm)
-    emotional_weight = "medium" if any(t in text_norm for t in ("stressed", "upset", "worried", "scared", "angry")) else "low"
+def _to_utc_datetime(value: Optional[datetime]) -> datetime:
+    dt = value or _utcnow()
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _format_due_iso(value: Optional[datetime]) -> Optional[str]:
+    if not isinstance(value, datetime):
+        return None
+    dt = value
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_optional_dt(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    raw = normalize_text(value, casefold=False)
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00").replace("z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _heuristic_pass1(messages: Sequence[Dict[str, Any]], *, reference_time: Optional[datetime] = None) -> Dict[str, Any]:
     return {
-        "is_memory_worthy": bool(memory_deltas or entity_mentions or identity_signals or thread_signals),
-        "session_kind": "mixed" if memory_deltas else "transient",
-        "memory_deltas": memory_deltas,
-        "entity_mentions": entity_mentions[:12],
-        "thread_signals": thread_signals,
-        "identity_signals": identity_signals,
-        "emotional_weight": emotional_weight,
+        "is_memory_worthy": False,
+        "session_kind": "transient",
+        "entity_mentions": [],
+        "thread_signals": [],
+        "run_actionable_pass": False,
+        "run_session_changes_pass": False,
+        "emotional_weight": "none",
         "emotional_note": None,
         "tension_signal": None,
-        "context_relevant": context_relevant,
-        "run_entity_pass": bool(entity_mentions),
-        "run_threads_pass": bool(thread_signals),
-        "identity_relevant": bool(identity_signals),
+        "context_relevant": False,
+        "run_entity_pass": False,
+        "run_threads_pass": False,
+        "identity_relevant": False,
+        "ignore_reasons": ["Pass 1 fallback disabled to avoid heuristic extraction."],
     }
 
 
@@ -1687,27 +2651,651 @@ async def _call_pass1_llm(messages: Sequence[Dict[str, Any]], settings: Settings
     )
 
 
+async def _call_pass2_actionable_llm(
+    messages: Sequence[Dict[str, Any]],
+    settings: Settings,
+    *,
+    reference_time: Optional[datetime] = None,
+    timezone_name: Optional[str] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    if not bool(settings.derived_pipeline_llm_enabled):
+        return None
+    parsed = await run_pass2_actionable_llm(
+        messages=list(messages),
+        model=settings.derived_pipeline_model_version,
+        reference_time=reference_time,
+        timezone_name=timezone_name,
+    )
+    if parsed is None:
+        return None
+    return _normalize_actionable_rows(parsed)
+
+
+def _normalize_actionable_rows(value: Any) -> List[Dict[str, Any]]:
+    rows = value if isinstance(value, list) else []
+    out: List[Dict[str, Any]] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        record_type = normalize_text(item.get("record_type")).lower()
+        if record_type not in ACTIONABLE_CANDIDATE_TYPES:
+            continue
+        candidate_subtype = normalize_text(item.get("candidate_subtype")).lower() or None
+        if candidate_subtype not in ACTIONABLE_CANDIDATE_SUBTYPES:
+            candidate_subtype = None
+        title = normalize_text(item.get("title"), casefold=False)
+        if not title:
+            continue
+        summary = normalize_text(item.get("summary"), casefold=False) or None
+        due_iso_raw = normalize_text(item.get("due_iso"))
+        due_iso = _format_due_iso(_parse_optional_dt(due_iso_raw)) if due_iso_raw else None
+        relevant_from_raw = normalize_text(item.get("relevant_from_iso"))
+        relevant_from_iso = _format_due_iso(_parse_optional_dt(relevant_from_raw)) if relevant_from_raw else None
+        relevant_until_raw = normalize_text(item.get("relevant_until_iso"))
+        relevant_until_iso = _format_due_iso(_parse_optional_dt(relevant_until_raw)) if relevant_until_raw else None
+        source = normalize_text(item.get("source")) or "chat"
+        provenance = item.get("provenance") if isinstance(item.get("provenance"), dict) else {}
+        waiting_on = normalize_text(item.get("waiting_on"), casefold=False) or None
+        needs_response_raw = item.get("needs_response")
+        if isinstance(needs_response_raw, bool):
+            needs_response = needs_response_raw
+        elif isinstance(needs_response_raw, str):
+            lowered = normalize_text(needs_response_raw).lower()
+            needs_response = True if lowered in {"true", "yes", "1"} else False if lowered in {"false", "no", "0"} else None
+        else:
+            needs_response = None
+        cadence_text = normalize_text(item.get("cadence_text"), casefold=False) or None
+        suggested_action = normalize_text(item.get("suggested_action"), casefold=False) or None
+        linked_external_id = normalize_text(item.get("linked_external_id")) or None
+        linked_external_type = normalize_text(item.get("linked_external_type")) or None
+        confidence_raw = item.get("confidence")
+        confidence: str
+        if isinstance(confidence_raw, (int, float)):
+            val = float(confidence_raw)
+            if val >= 0.82:
+                confidence = "high"
+            elif val >= 0.55:
+                confidence = "medium"
+            else:
+                confidence = "low"
+        else:
+            confidence = normalize_text(confidence_raw).lower() or "medium"
+            if confidence not in ACTIONABLE_CONFIDENCE_LABELS:
+                confidence = "medium"
+        status = normalize_text(item.get("status")).lower() or "detected"
+        if status not in ACTIONABLE_CANDIDATE_STATUSES:
+            status = "detected"
+        out.append(
+            {
+                "record_type": record_type,
+                "candidate_subtype": candidate_subtype,
+                "title": title[:180],
+                "summary": (summary[:320] if summary else None),
+                "due_iso": due_iso,
+                "relevant_from_iso": relevant_from_iso,
+                "relevant_until_iso": relevant_until_iso,
+                "waiting_on": waiting_on[:180] if waiting_on else None,
+                "needs_response": needs_response,
+                "cadence_text": cadence_text[:120] if cadence_text else None,
+                "suggested_action": suggested_action[:240] if suggested_action else None,
+                "linked_external_id": linked_external_id[:120] if linked_external_id else None,
+                "linked_external_type": linked_external_type[:64] if linked_external_type else None,
+                "source": source[:64],
+                "provenance": provenance,
+                "confidence": confidence,
+                "status": status,
+            }
+        )
+        if len(out) >= 16:
+            break
+    return out
+
+
 def _normalize_pass1_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    memory_deltas = _text_list(payload.get("memory_deltas"), limit=6)
-    entity_mentions = _text_list(payload.get("entity_mentions"), limit=20)
-    thread_signals = _text_list(payload.get("thread_signals"), limit=8)
-    identity_signals = _text_list(payload.get("identity_signals"), limit=8)
-    context_relevant = _to_bool(payload.get("context_relevant")) or bool(memory_deltas or thread_signals or payload.get("tension_signal"))
+    context_relevant = _to_bool(payload.get("context_relevant")) or bool(payload.get("tension_signal"))
     return {
-        "is_memory_worthy": _to_bool(payload.get("is_memory_worthy")) or bool(memory_deltas or entity_mentions or thread_signals or identity_signals),
+        "is_memory_worthy": _to_bool(payload.get("is_memory_worthy")),
         "session_kind": normalize_text(payload.get("session_kind")) or "transient",
-        "memory_deltas": memory_deltas,
-        "entity_mentions": entity_mentions,
-        "thread_signals": thread_signals,
-        "identity_signals": identity_signals,
+        "run_actionable_pass": _to_bool(payload.get("run_actionable_pass")),
+        "run_session_changes_pass": _to_bool(payload.get("run_session_changes_pass")),
         "emotional_weight": normalize_text(payload.get("emotional_weight")) or "none",
         "emotional_note": normalize_text(payload.get("emotional_note"), casefold=False) or None,
         "tension_signal": normalize_text(payload.get("tension_signal"), casefold=False) or None,
         "context_relevant": context_relevant,
-        "run_entity_pass": _to_bool(payload.get("run_entity_pass")) or bool(entity_mentions),
-        "run_threads_pass": _to_bool(payload.get("run_threads_pass")) or bool(thread_signals),
-        "identity_relevant": _to_bool(payload.get("identity_relevant")) or bool(identity_signals),
+        "run_entity_pass": _to_bool(payload.get("run_entity_pass")),
+        "run_threads_pass": _to_bool(payload.get("run_threads_pass")),
+        "identity_relevant": _to_bool(payload.get("identity_relevant")),
     }
+
+
+async def run_pass2_actionable(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    messages: Sequence[Dict[str, Any]],
+    reference_time: Optional[datetime] = None,
+    settings: Optional[Settings] = None,
+) -> DerivedPassResult:
+    s = settings or get_settings()
+    input_hash = _input_hash(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        session_id=session_id,
+        pass_name=PASS2_ACTIONABLE,
+        messages=messages,
+        settings=s,
+    )
+    run_id = await _start_run(
+        db=db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        session_id=session_id,
+        pass_name=PASS2_ACTIONABLE,
+        input_hash=input_hash,
+        input_watermark=session_id,
+        settings=s,
+    )
+    existing = await _succeeded_run(db, run_id)
+    if existing:
+        return DerivedPassResult(
+            run_id=run_id,
+            pass_name=PASS2_ACTIONABLE,
+            output_hash=str(existing["output_hash"]),
+        )
+
+    try:
+        source = "llm"
+        actionable_candidates: List[Dict[str, Any]] = []
+        timezone_name = (
+            getattr(reference_time.tzinfo, "key", None)
+            if isinstance(reference_time, datetime) and reference_time.tzinfo is not None
+            else "UTC"
+        )
+        llm_candidates = await _call_pass2_actionable_llm(messages, s, reference_time=reference_time, timezone_name=timezone_name)
+        if llm_candidates is None:
+            source = "llm_unavailable"
+            if bool(s.derived_pipeline_llm_enabled):
+                await _quarantine(
+                    db=db,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    pass_name=PASS2_ACTIONABLE,
+                    session_id=session_id,
+                    reason_code=QUARANTINE_PARSE_FAILURE,
+                    payload={
+                        "message": "Pass 2 LLM output was missing or invalid JSON; no heuristic fallback allowed by policy.",
+                        "fallback": "disabled",
+                    },
+                    run_id=run_id,
+                )
+        else:
+            actionable_candidates = llm_candidates
+
+        payload = {
+            "actionable_candidates": actionable_candidates,
+            "source": source,
+        }
+        for candidate in payload["actionable_candidates"]:
+            title = normalize_text(candidate.get("title"), casefold=False)
+            if not title:
+                continue
+            refs = _source_turn_refs(
+                session_id=session_id,
+                messages=messages,
+                text_hint=title,
+            )
+            provenance = candidate.get("provenance") if isinstance(candidate.get("provenance"), dict) else {}
+            if refs:
+                provenance = {**provenance, "source_turn_refs": refs}
+            await _upsert_actionable_candidate(
+                db=db,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=session_id,
+                run_id=run_id,
+                record_type=normalize_text(candidate.get("record_type")).lower(),
+                candidate_subtype=normalize_text(candidate.get("candidate_subtype")).lower() or None,
+                title=title,
+                summary=normalize_text(candidate.get("summary"), casefold=False) or title,
+                due_iso=normalize_text(candidate.get("due_iso")) or None,
+                relevant_from_iso=normalize_text(candidate.get("relevant_from_iso")) or None,
+                relevant_until_iso=normalize_text(candidate.get("relevant_until_iso")) or None,
+                waiting_on=normalize_text(candidate.get("waiting_on"), casefold=False) or None,
+                needs_response=candidate.get("needs_response") if isinstance(candidate.get("needs_response"), bool) else None,
+                cadence_text=normalize_text(candidate.get("cadence_text"), casefold=False) or None,
+                suggested_action=normalize_text(candidate.get("suggested_action"), casefold=False) or None,
+                linked_external_id=normalize_text(candidate.get("linked_external_id")) or None,
+                linked_external_type=normalize_text(candidate.get("linked_external_type")) or None,
+                source=normalize_text(candidate.get("source")) or "chat",
+                provenance=provenance,
+                confidence_label=normalize_text(candidate.get("confidence")).lower() or ("medium" if source == "llm" else "low"),
+                status=normalize_text(candidate.get("status")).lower() or "detected",
+                metadata={"source": "pass2.actionable_candidate", "run_source": source},
+            )
+
+        output_hash = stable_short_hash(payload, length=24)
+        await _complete_run(db, run_id, output_hash)
+        await _update_checkpoint(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            pipeline_name=PASS2_ACTIONABLE,
+            run_id=run_id,
+            input_watermark=session_id,
+            output_hash=output_hash,
+        )
+        return DerivedPassResult(
+            run_id=run_id,
+            pass_name=PASS2_ACTIONABLE,
+            output_hash=output_hash,
+        )
+    except Exception as exc:
+        await _fail_run(db, run_id, "pass2_actionable_failed", str(exc))
+        raise
+
+
+def _session_change_key(kind: str, title: str, effective_iso: Optional[str]) -> str:
+    return stable_short_hash(
+        {
+            "kind": normalize_text(kind),
+            "title": normalize_text(title),
+            "effective": normalize_text(effective_iso),
+        },
+        length=24,
+    )
+
+
+def _session_change_topic_key(value: Optional[str]) -> str:
+    text = normalize_text(value).lower()
+    if not text:
+        return ""
+    tokens = [token for token in re.split(r"[^a-z0-9]+", text) if token]
+    stop = {"the", "a", "an", "to", "for", "on", "at", "of", "and", "from", "with", "my", "our", "is", "was", "now"}
+    time_words = {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "today", "tomorrow", "morning", "evening", "afternoon"}
+    filtered = [token for token in tokens if token not in stop and token not in time_words]
+    return " ".join(filtered[:8])
+
+
+async def _find_related_open_session_change(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+    kind: str,
+    title: str,
+) -> Optional[Dict[str, Any]]:
+    rows = await db.fetch(
+        """
+        SELECT change_id, kind, title, summary, effective_iso, status, metadata
+        FROM session_changes
+        WHERE tenant_id=$1
+          AND user_id=$2
+          AND kind=$3
+          AND status IN ('detected','needs_review','confirmed')
+        ORDER BY updated_at DESC
+        LIMIT 20
+        """,
+        tenant_id,
+        user_id,
+        kind,
+    )
+    incoming_topic = _session_change_topic_key(title)
+    if not incoming_topic:
+        return None
+    for row in rows or []:
+        if not isinstance(row, dict):
+            row = dict(row)
+        existing_topic = _session_change_topic_key(row.get("title"))
+        if existing_topic and (existing_topic == incoming_topic or incoming_topic in existing_topic or existing_topic in incoming_topic):
+            return dict(row)
+    return None
+
+
+async def _upsert_session_change(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    run_id: Optional[int],
+    kind: str,
+    title: str,
+    summary: Optional[str],
+    effective_iso: Optional[str],
+    source: str,
+    provenance: Dict[str, Any],
+    confidence_label: str,
+    status: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    clean_kind = normalize_text(kind).lower()
+    clean_title = normalize_text(title, casefold=False)[:180]
+    if not clean_kind or not clean_title:
+        return
+    effective_clean = normalize_text(effective_iso) or None
+    related = await _find_related_open_session_change(
+        db=db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        kind=clean_kind,
+        title=clean_title,
+    )
+    if related:
+        existing_id = int(related.get("change_id") or 0)
+        existing_effective = related.get("effective_iso")
+        existing_effective_iso = existing_effective.isoformat() if isinstance(existing_effective, datetime) else normalize_text(existing_effective) or None
+        existing_key = _session_change_key(clean_kind, normalize_text(related.get("title"), casefold=False), existing_effective_iso)
+        incoming_key = _session_change_key(clean_kind, clean_title, effective_clean)
+        if existing_id and existing_key != incoming_key and (existing_effective_iso != effective_clean or normalize_text(related.get("title")) != normalize_text(clean_title)):
+            await db.execute(
+                """
+                UPDATE session_changes
+                SET status='superseded',
+                    metadata=COALESCE(metadata, '{}'::jsonb) || $4::jsonb,
+                    updated_at=NOW()
+                WHERE tenant_id=$1 AND user_id=$2 AND change_id=$3
+                """,
+                tenant_id,
+                user_id,
+                existing_id,
+                {
+                    "superseded_by_title": clean_title,
+                    "superseded_by_effective_iso": effective_clean,
+                    "superseded_in_session": session_id,
+                },
+            )
+    key = _session_change_key(clean_kind, clean_title, effective_iso)
+    effective_dt = _parse_optional_dt(effective_iso)
+    confidence = normalize_text(confidence_label).lower() or "medium"
+    if confidence not in ACTIONABLE_CONFIDENCE_LABELS:
+        confidence = "medium"
+    await db.execute(
+        """
+        INSERT INTO session_changes (
+          tenant_id, user_id, session_id, run_id, change_key, kind, title, summary,
+          effective_iso, source, provenance, confidence_score, confidence_label, status, metadata,
+          created_at, updated_at
+        )
+        VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15::jsonb,NOW(),NOW()
+        )
+        ON CONFLICT (tenant_id, user_id, change_key)
+        DO UPDATE SET
+          session_id=EXCLUDED.session_id,
+          run_id=EXCLUDED.run_id,
+          title=EXCLUDED.title,
+          summary=COALESCE(EXCLUDED.summary, session_changes.summary),
+          effective_iso=COALESCE(EXCLUDED.effective_iso, session_changes.effective_iso),
+          source=EXCLUDED.source,
+          provenance=COALESCE(session_changes.provenance, '{}'::jsonb) || EXCLUDED.provenance,
+          confidence_score=GREATEST(session_changes.confidence_score, EXCLUDED.confidence_score),
+          confidence_label=CASE
+            WHEN session_changes.confidence_score >= EXCLUDED.confidence_score THEN session_changes.confidence_label
+            ELSE EXCLUDED.confidence_label
+          END,
+          status=CASE
+            WHEN session_changes.status IN ('confirmed','dismissed','superseded') THEN session_changes.status
+            ELSE EXCLUDED.status
+          END,
+          metadata=COALESCE(session_changes.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+          updated_at=NOW()
+        """,
+        tenant_id,
+        user_id,
+        session_id,
+        run_id,
+        key,
+        clean_kind,
+        clean_title,
+        normalize_text(summary, casefold=False)[:320] if normalize_text(summary, casefold=False) else None,
+        effective_dt,
+        normalize_text(source) or "chat",
+        provenance or {},
+        _actionable_confidence_score(confidence),
+        confidence,
+        normalize_text(status) or "detected",
+        metadata or {},
+    )
+
+
+async def run_pass2b_session_changes(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    messages: Sequence[Dict[str, Any]],
+    reference_time: Optional[datetime] = None,
+    settings: Optional[Settings] = None,
+) -> DerivedPassResult:
+    s = settings or get_settings()
+    input_hash = _input_hash(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        session_id=session_id,
+        pass_name=PASS2B_SESSION_CHANGES,
+        messages=messages,
+        settings=s,
+    )
+    run_id = await _start_run(
+        db=db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        session_id=session_id,
+        pass_name=PASS2B_SESSION_CHANGES,
+        input_hash=input_hash,
+        input_watermark=session_id,
+        settings=s,
+    )
+    existing = await _succeeded_run(db, run_id)
+    if existing:
+        return DerivedPassResult(run_id=run_id, pass_name=PASS2B_SESSION_CHANGES, output_hash=str(existing["output_hash"]))
+    try:
+        source = "llm"
+        session_changes: List[Dict[str, Any]] = []
+        timezone_name = (
+            getattr(reference_time.tzinfo, "key", None)
+            if isinstance(reference_time, datetime) and reference_time.tzinfo is not None
+            else "UTC"
+        )
+        llm_changes = (
+            await run_pass2b_session_changes_llm(
+                messages=list(messages),
+                model=s.derived_pipeline_model_version,
+                reference_time=reference_time,
+                timezone_name=timezone_name,
+            )
+            if bool(s.derived_pipeline_llm_enabled)
+            else None
+        )
+        if llm_changes is None:
+            source = "llm_unavailable"
+            if bool(s.derived_pipeline_llm_enabled):
+                await _quarantine(
+                    db=db,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    pass_name=PASS2B_SESSION_CHANGES,
+                    session_id=session_id,
+                    reason_code=QUARANTINE_PARSE_FAILURE,
+                    payload={"message": "Pass 2b LLM output was missing or invalid JSON.", "fallback": "disabled"},
+                    run_id=run_id,
+                )
+        else:
+            session_changes = llm_changes
+        payload = {"session_changes": session_changes, "source": source}
+        for item in session_changes:
+            title = normalize_text(item.get("title"), casefold=False)
+            if not title:
+                continue
+            refs = _source_turn_refs(session_id=session_id, messages=messages, text_hint=title)
+            provenance = item.get("provenance") if isinstance(item.get("provenance"), dict) else {}
+            if refs:
+                provenance = {**provenance, "source_turn_refs": refs}
+            await _upsert_session_change(
+                db=db,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=session_id,
+                run_id=run_id,
+                kind=normalize_text(item.get("kind")).lower(),
+                title=title,
+                summary=normalize_text(item.get("summary"), casefold=False) or title,
+                effective_iso=normalize_text(item.get("effective_iso")) or None,
+                source=normalize_text(item.get("source")) or "chat",
+                provenance=provenance,
+                confidence_label=normalize_text(item.get("confidence")).lower() or "medium",
+                status=normalize_text(item.get("status")).lower() or "detected",
+                metadata={"source": "pass2b.session_change", "run_source": source},
+            )
+        output_hash = stable_short_hash(payload, length=24)
+        await _complete_run(db, run_id, output_hash)
+        await _update_checkpoint(db=db, tenant_id=tenant_id, user_id=user_id, pipeline_name=PASS2B_SESSION_CHANGES, run_id=run_id, input_watermark=session_id, output_hash=output_hash)
+        return DerivedPassResult(run_id=run_id, pass_name=PASS2B_SESSION_CHANGES, output_hash=output_hash)
+    except Exception as exc:
+        await _fail_run(db, run_id, "pass2b_session_changes_failed", str(exc))
+        raise
+
+
+def _entity_candidate_key(name: str, candidate_type: str) -> str:
+    return stable_short_hash({"name": normalize_text(name), "candidate_type": normalize_text(candidate_type)}, length=24)
+
+
+async def _upsert_entity_candidate(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    run_id: Optional[int],
+    name: str,
+    candidate_type: str,
+    summary: Optional[str],
+    source: str,
+    provenance: Dict[str, Any],
+    confidence_label: str,
+    status: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    clean_name = normalize_text(name, casefold=False)[:160]
+    if not clean_name:
+        return
+    clean_type = normalize_text(candidate_type).lower() or "other"
+    key = _entity_candidate_key(clean_name, clean_type)
+    confidence = normalize_text(confidence_label).lower() or "medium"
+    if confidence not in ACTIONABLE_CONFIDENCE_LABELS:
+        confidence = "medium"
+    await db.execute(
+        """
+        INSERT INTO entity_candidates (
+          tenant_id, user_id, session_id, run_id, candidate_key, name, candidate_type, summary,
+          source, provenance, confidence_score, confidence_label, status, metadata,
+          created_at, updated_at
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14::jsonb,NOW(),NOW())
+        ON CONFLICT (tenant_id, user_id, candidate_key)
+        DO UPDATE SET
+          session_id=EXCLUDED.session_id,
+          run_id=EXCLUDED.run_id,
+          summary=COALESCE(EXCLUDED.summary, entity_candidates.summary),
+          source=EXCLUDED.source,
+          provenance=COALESCE(entity_candidates.provenance, '{}'::jsonb) || EXCLUDED.provenance,
+          confidence_score=GREATEST(entity_candidates.confidence_score, EXCLUDED.confidence_score),
+          confidence_label=CASE
+            WHEN entity_candidates.confidence_score >= EXCLUDED.confidence_score THEN entity_candidates.confidence_label
+            ELSE EXCLUDED.confidence_label
+          END,
+          status=CASE
+            WHEN entity_candidates.status IN ('resolved','dismissed','superseded') THEN entity_candidates.status
+            ELSE EXCLUDED.status
+          END,
+          metadata=COALESCE(entity_candidates.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+          updated_at=NOW()
+        """,
+        tenant_id,
+        user_id,
+        session_id,
+        run_id,
+        key,
+        clean_name,
+        clean_type,
+        normalize_text(summary, casefold=False)[:240] if normalize_text(summary, casefold=False) else None,
+        normalize_text(source) or "chat",
+        provenance or {},
+        _actionable_confidence_score(confidence),
+        confidence,
+        normalize_text(status) or "detected",
+        metadata or {},
+    )
+
+
+async def run_pass2c_entity_candidates(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    messages: Sequence[Dict[str, Any]],
+    settings: Optional[Settings] = None,
+) -> DerivedPassResult:
+    s = settings or get_settings()
+    input_hash = _input_hash(tenant_id=tenant_id, user_id=user_id, session_id=session_id, pass_name=PASS2C_ENTITY_CANDIDATES, messages=messages, settings=s)
+    run_id = await _start_run(db=db, tenant_id=tenant_id, user_id=user_id, session_id=session_id, pass_name=PASS2C_ENTITY_CANDIDATES, input_hash=input_hash, input_watermark=session_id, settings=s)
+    existing = await _succeeded_run(db, run_id)
+    if existing:
+        return DerivedPassResult(run_id=run_id, pass_name=PASS2C_ENTITY_CANDIDATES, output_hash=str(existing["output_hash"]))
+    try:
+        source = "llm"
+        entity_candidates: List[Dict[str, Any]] = []
+        llm_candidates = await run_pass2c_entity_candidates_llm(messages=list(messages), model=s.derived_pipeline_model_version) if bool(s.derived_pipeline_llm_enabled) else None
+        if llm_candidates is None:
+            source = "llm_unavailable"
+            if bool(s.derived_pipeline_llm_enabled):
+                await _quarantine(
+                    db=db,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    pass_name=PASS2C_ENTITY_CANDIDATES,
+                    session_id=session_id,
+                    reason_code=QUARANTINE_PARSE_FAILURE,
+                    payload={"message": "Pass 2c LLM output was missing or invalid JSON.", "fallback": "disabled"},
+                    run_id=run_id,
+                )
+        else:
+            entity_candidates = llm_candidates
+        payload = {"entity_candidates": entity_candidates, "source": source}
+        for item in entity_candidates:
+            name = normalize_text(item.get("name"), casefold=False)
+            if not name:
+                continue
+            refs = _source_turn_refs(session_id=session_id, messages=messages, text_hint=name)
+            provenance = item.get("provenance") if isinstance(item.get("provenance"), dict) else {}
+            if refs:
+                provenance = {**provenance, "source_turn_refs": refs}
+            await _upsert_entity_candidate(
+                db=db,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=session_id,
+                run_id=run_id,
+                name=name,
+                candidate_type=normalize_text(item.get("candidate_type")).lower() or "other",
+                summary=normalize_text(item.get("summary"), casefold=False) or None,
+                source=normalize_text(item.get("source")) or "chat",
+                provenance=provenance,
+                confidence_label=normalize_text(item.get("confidence")).lower() or "medium",
+                status=normalize_text(item.get("status")).lower() or "detected",
+                metadata={"source": "pass2c.entity_candidate", "run_source": source},
+            )
+        output_hash = stable_short_hash(payload, length=24)
+        await _complete_run(db, run_id, output_hash)
+        await _update_checkpoint(db=db, tenant_id=tenant_id, user_id=user_id, pipeline_name=PASS2C_ENTITY_CANDIDATES, run_id=run_id, input_watermark=session_id, output_hash=output_hash)
+        return DerivedPassResult(run_id=run_id, pass_name=PASS2C_ENTITY_CANDIDATES, output_hash=output_hash)
+    except Exception as exc:
+        await _fail_run(db, run_id, "pass2c_entity_candidates_failed", str(exc))
+        raise
 
 
 async def run_pass1_triage(
@@ -1743,7 +3331,7 @@ async def run_pass1_triage(
     if existing:
         classification = await db.fetchone(
             """
-            SELECT run_entity_pass, run_threads_pass
+            SELECT run_entity_pass, run_threads_pass, raw_triage_output
             FROM session_classifications
             WHERE session_id=$1 AND user_id=$2
             """,
@@ -1756,6 +3344,8 @@ async def run_pass1_triage(
             output_hash=str(existing["output_hash"]),
             run_entity_pass=bool(classification.get("run_entity_pass")),
             run_threads_pass=bool(classification.get("run_threads_pass")),
+            run_actionable_pass=_to_bool(((classification.get("raw_triage_output") or {}) if isinstance(classification.get("raw_triage_output"), dict) else {}).get("run_actionable_pass")),
+            run_session_changes_pass=_to_bool(((classification.get("raw_triage_output") or {}) if isinstance(classification.get("raw_triage_output"), dict) else {}).get("run_session_changes_pass")),
             should_run_identity=await should_run_pass4_identity(db=db, user_id=user_id, settings=s),
             should_run_living_context=await should_run_pass5_living_context(db=db, user_id=user_id, settings=s),
         )
@@ -1772,13 +3362,13 @@ async def run_pass1_triage(
                     session_id=session_id,
                     reason_code=QUARANTINE_PARSE_FAILURE,
                     payload={
-                        "message": "Pass 1 LLM output was missing or not valid JSON; deterministic fallback used.",
-                        "fallback": "heuristic",
+                        "message": "Pass 1 LLM output was missing or not valid JSON; no-op fallback used to avoid heuristic extraction.",
+                        "fallback": "noop",
                     },
                     run_id=run_id,
                 )
-            parsed = _heuristic_pass1(messages)
-            source = "heuristic_fallback"
+            parsed = _heuristic_pass1(messages, reference_time=reference_time)
+            source = "noop_fallback"
         payload = _normalize_pass1_payload(parsed)
         payload["source"] = source
         session_date = reference_time or _utcnow()
@@ -1817,8 +3407,8 @@ async def run_pass1_triage(
             session_date,
             payload["is_memory_worthy"],
             payload["session_kind"],
-            payload["memory_deltas"][0] if payload["memory_deltas"] else None,
-            payload["entity_mentions"],
+            payload["tension_signal"],
+            [],
             payload["run_entity_pass"],
             payload["run_threads_pass"],
             payload["identity_relevant"],
@@ -1829,153 +3419,6 @@ async def run_pass1_triage(
             payload,
             payload["context_relevant"],
         )
-        assertions: List[int] = []
-        for statement in payload["memory_deltas"]:
-            refs = _source_turn_refs(session_id=session_id, messages=messages, text_hint=statement)
-            assertion_id = await _write_assertion(
-                db=db,
-                tenant_id=tenant_id,
-                user_id=user_id,
-                pass_name=PASS1_TRIAGE,
-                surface="memory_delta",
-                statement_text=statement,
-                run_id=run_id,
-                source_session_ids=[session_id],
-                source_turn_refs=refs,
-                salience=0.55,
-                importance=0.55,
-                confidence_extraction=0.72 if source == "llm" else 0.45,
-                confidence_validity=0.65 if source == "llm" else 0.45,
-            )
-            if assertion_id:
-                assertions.append(assertion_id)
-            event_type = _event_type_for_statement(statement)
-            if event_type:
-                await _write_memory_event(
-                    db=db,
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    event_type=event_type,
-                    title=statement[:180],
-                    description=statement,
-                    source_session_ids=[session_id],
-                    source_turn_refs=refs,
-                    run_id=run_id,
-                    metadata={"source": "pass1.memory_delta"},
-                )
-            reason_code = _low_confidence_reason(statement, "memory_delta")
-            if reason_code:
-                await _write_low_confidence_item(
-                    db=db,
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    surface="memory_delta",
-                    statement_text=statement,
-                    question_text=_low_confidence_question(reason_code, statement),
-                    confidence=0.45 if source == "llm" else 0.35,
-                    source_session_ids=[session_id],
-                    source_turn_refs=refs,
-                    run_id=run_id,
-                    metadata={"source": "pass1.memory_delta", "reason_code": reason_code},
-                )
-        for statement in payload["identity_signals"]:
-            refs = _source_turn_refs(session_id=session_id, messages=messages, text_hint=statement)
-            await _write_assertion(
-                db=db,
-                tenant_id=tenant_id,
-                user_id=user_id,
-                pass_name=PASS1_TRIAGE,
-                surface="identity_signal",
-                statement_text=statement,
-                slot_key=None,
-                run_id=run_id,
-                source_session_ids=[session_id],
-                source_turn_refs=refs,
-                salience=0.7,
-                importance=0.75,
-                confidence_extraction=0.72 if source == "llm" else 0.45,
-                confidence_validity=0.62 if source == "llm" else 0.42,
-            )
-            reason_code = _low_confidence_reason(statement, "identity_signal")
-            if reason_code:
-                await _write_low_confidence_item(
-                    db=db,
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    surface="identity_signal",
-                    statement_text=statement,
-                    question_text=_low_confidence_question(reason_code, statement),
-                    confidence=0.45 if source == "llm" else 0.35,
-                    source_session_ids=[session_id],
-                    source_turn_refs=refs,
-                    run_id=run_id,
-                    metadata={"source": "pass1.identity_signal", "reason_code": reason_code},
-                )
-        for statement in payload["thread_signals"]:
-            refs = _source_turn_refs(session_id=session_id, messages=messages, text_hint=statement)
-            await _write_assertion(
-                db=db,
-                tenant_id=tenant_id,
-                user_id=user_id,
-                pass_name=PASS1_TRIAGE,
-                surface="thread_signal",
-                statement_text=statement,
-                run_id=run_id,
-                source_session_ids=[session_id],
-                source_turn_refs=refs,
-                salience=0.65,
-                importance=0.65,
-                confidence_extraction=0.72 if source == "llm" else 0.45,
-                confidence_validity=0.58 if source == "llm" else 0.4,
-            )
-            reason_code = _low_confidence_reason(statement, "thread_signal")
-            if reason_code:
-                await _write_low_confidence_item(
-                    db=db,
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    surface="thread_signal",
-                    statement_text=statement,
-                    question_text=_low_confidence_question(reason_code, statement),
-                    confidence=0.45 if source == "llm" else 0.35,
-                    source_session_ids=[session_id],
-                    source_turn_refs=refs,
-                    run_id=run_id,
-                    metadata={"source": "pass1.thread_signal", "reason_code": reason_code},
-                )
-        if payload.get("tension_signal"):
-            refs = _source_turn_refs(session_id=session_id, messages=messages, text_hint=payload["tension_signal"])
-            await _write_assertion(
-                db=db,
-                tenant_id=tenant_id,
-                user_id=user_id,
-                pass_name=PASS1_TRIAGE,
-                surface="living_context_statement",
-                statement_text=payload["tension_signal"],
-                run_id=run_id,
-                source_session_ids=[session_id],
-                source_turn_refs=refs,
-                salience=0.7,
-                importance=0.65,
-                confidence_extraction=0.72 if source == "llm" else 0.45,
-                confidence_validity=0.58 if source == "llm" else 0.4,
-                metadata={"kind": "tension_signal"},
-            )
-            reason_code = _low_confidence_reason(payload["tension_signal"], "tension_signal")
-            if reason_code:
-                await _write_low_confidence_item(
-                    db=db,
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    surface="tension_signal",
-                    statement_text=payload["tension_signal"],
-                    question_text=_low_confidence_question(reason_code, payload["tension_signal"]),
-                    confidence=0.45 if source == "llm" else 0.35,
-                    source_session_ids=[session_id],
-                    source_turn_refs=refs,
-                    run_id=run_id,
-                    metadata={"source": "pass1.tension_signal", "reason_code": reason_code},
-                )
 
         await _complete_run(db, run_id, output_hash)
         await _update_checkpoint(
@@ -1997,6 +3440,8 @@ async def run_pass1_triage(
             output_hash=output_hash,
             run_entity_pass=payload["run_entity_pass"],
             run_threads_pass=payload["run_threads_pass"],
+            run_actionable_pass=payload["run_actionable_pass"],
+            run_session_changes_pass=payload["run_session_changes_pass"],
             should_run_identity=should_identity,
             should_run_living_context=should_context,
         )
@@ -2428,6 +3873,58 @@ async def _find_existing_thread_for_topic(
     return None
 
 
+async def _discover_session_entity_mentions(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    messages: Sequence[Dict[str, Any]],
+    settings: Settings,
+    legacy_mentions: Sequence[Any] | None = None,
+) -> List[str]:
+    candidate_rows = await db.fetch(
+        """
+        SELECT name
+        FROM entity_candidates
+        WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3
+          AND status IN ('detected','needs_review','resolved')
+        ORDER BY updated_at DESC
+        LIMIT 24
+        """,
+        tenant_id,
+        user_id,
+        session_id,
+    )
+    candidate_names = _text_list([row.get("name") for row in (candidate_rows or []) if isinstance(row, dict)], limit=20)
+    if candidate_names:
+        return candidate_names
+    mentions = _text_list(legacy_mentions, limit=20)
+    if mentions:
+        return mentions
+    if not bool(settings.derived_pipeline_llm_enabled):
+        return []
+    discovered = await discover_entity_mentions(
+        messages=list(messages),
+        model=settings.derived_pipeline_model_version,
+    )
+    mentions = _text_list(discovered, limit=20)
+    if not mentions:
+        return []
+    await db.execute(
+        """
+        UPDATE session_classifications
+        SET entity_mentions=$3::text[],
+            processed_at=NOW()
+        WHERE session_id=$1 AND user_id=$2
+        """,
+        session_id,
+        user_id,
+        mentions,
+    )
+    return mentions
+
+
 async def run_pass1_5_entities(
     *,
     db: Database,
@@ -2443,7 +3940,15 @@ async def run_pass1_5_entities(
         session_id,
         user_id,
     )
-    mentions = _text_list((classification or {}).get("entity_mentions"), limit=20)
+    mentions = await _discover_session_entity_mentions(
+        db=db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        session_id=session_id,
+        messages=messages,
+        settings=s,
+        legacy_mentions=(classification or {}).get("entity_mentions"),
+    )
     input_hash = _input_hash(
         tenant_id=tenant_id,
         user_id=user_id,
@@ -2805,6 +4310,21 @@ async def run_pass1_5_entities(
                         metadata={"entity_name": canonical},
                     )
         output_hash = stable_short_hash({"mentions": mentions}, length=24)
+        if mentions:
+            await db.execute(
+                """
+                UPDATE entity_candidates
+                SET status='resolved',
+                    updated_at=NOW(),
+                    metadata=COALESCE(metadata, '{}'::jsonb) || $4::jsonb
+                WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3
+                  AND status IN ('detected','needs_review')
+                """,
+                tenant_id,
+                user_id,
+                session_id,
+                {"resolved_by": PASS1_5_ENTITIES},
+            )
         await _complete_run(db, run_id, output_hash)
         await _update_checkpoint(
             db=db,
@@ -2837,7 +4357,16 @@ async def run_pass3_threads(
         user_id,
     )
     raw = (classification or {}).get("raw_triage_output") if classification else {}
-    session_entity_mentions = _text_list((classification or {}).get("entity_mentions"), limit=6)
+    session_entity_mentions = await _discover_session_entity_mentions(
+        db=db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        session_id=session_id,
+        messages=messages,
+        settings=s,
+        legacy_mentions=(classification or {}).get("entity_mentions"),
+    )
+    session_entity_mentions = _text_list(session_entity_mentions, limit=6)
     thread_signals = _text_list((raw or {}).get("thread_signals"), limit=8) if isinstance(raw, dict) else []
     input_hash = _input_hash(
         tenant_id=tenant_id,
@@ -2845,7 +4374,7 @@ async def run_pass3_threads(
         session_id=session_id,
         pass_name=PASS3_THREADS,
         messages=messages,
-        extra={"thread_signals": thread_signals},
+        extra={"thread_signals": thread_signals, "entity_mentions": session_entity_mentions},
         settings=s,
     )
     run_id = await _start_run(
@@ -3450,7 +4979,9 @@ async def _recent_classifications(
     where = " AND ".join(clauses)
     return await db.fetch(
         f"""
-        SELECT session_id, session_date, raw_triage_output, tension_signal
+        SELECT session_id, session_date, session_kind, emotional_weight,
+               identity_relevant, context_relevant, run_entity_pass, run_threads_pass,
+               one_line_summary, entity_mentions, raw_triage_output, tension_signal
         FROM session_classifications
         WHERE {where}
         ORDER BY session_date DESC NULLS LAST, processed_at DESC NULLS LAST
@@ -3464,7 +4995,9 @@ async def _living_context_session_window(db: Database, *, user_id: str) -> List[
     async def fetch_window(days: int) -> List[Dict[str, Any]]:
         return await db.fetch(
             """
-            SELECT session_id, session_date, raw_triage_output, tension_signal
+            SELECT session_id, session_date, session_kind, emotional_weight,
+                   identity_relevant, context_relevant, run_entity_pass, run_threads_pass,
+                   one_line_summary, entity_mentions, raw_triage_output, tension_signal
             FROM session_classifications
             WHERE user_id=$1
               AND is_memory_worthy IS TRUE
@@ -4382,11 +5915,14 @@ async def build_pass4_identity_packet(
         session_id = normalize_text(row.get("session_id"))
         if not session_id:
             continue
-        raw = row.get("raw_triage_output") if isinstance(row.get("raw_triage_output"), dict) else {}
         row["user_excerpt"] = await _session_user_excerpt(db=db, session_id=session_id, max_chars=1000)
         row["routing_hints"] = {
-            "memory_deltas": _text_list(raw.get("memory_deltas"), limit=2),
-            "identity_signals": _text_list(raw.get("identity_signals"), limit=1),
+            "identity_relevant": bool(row.get("identity_relevant")),
+            "run_entity_pass": bool(row.get("run_entity_pass")),
+            "run_threads_pass": bool(row.get("run_threads_pass")),
+            "session_kind": normalize_text(row.get("session_kind"), casefold=False) or None,
+            "emotional_weight": normalize_text(row.get("emotional_weight"), casefold=False) or None,
+            "tension_signal": normalize_text(row.get("tension_signal"), casefold=False) or None,
         }
     persistent_goals_raw = await db.fetch(
         """
@@ -4463,11 +5999,13 @@ async def build_pass5_living_packet(
         session_id = normalize_text(row.get("session_id"))
         if not session_id:
             continue
-        raw = row.get("raw_triage_output") if isinstance(row.get("raw_triage_output"), dict) else {}
         row["user_excerpt"] = await _session_user_excerpt(db=db, session_id=session_id, max_chars=1800)
         row["routing_hints"] = {
-            "memory_deltas": _text_list(raw.get("memory_deltas"), limit=4),
-            "thread_signals": _text_list(raw.get("thread_signals"), limit=4),
+            "context_relevant": bool(row.get("context_relevant")),
+            "run_threads_pass": bool(row.get("run_threads_pass")),
+            "session_kind": normalize_text(row.get("session_kind"), casefold=False) or None,
+            "emotional_weight": normalize_text(row.get("emotional_weight"), casefold=False) or None,
+            "tension_signal": normalize_text(row.get("tension_signal"), casefold=False) or None,
         }
     open_thread_rows = await db.fetch(
         """
@@ -4610,7 +6148,6 @@ async def run_pass4_identity(
         row
         for row in rows
         if _to_bool(row.get("identity_relevant"))
-        or _text_list(((row.get("raw_triage_output") if isinstance(row.get("raw_triage_output"), dict) else {}) or {}).get("memory_deltas"), limit=4)
     ]
     identity_packet = await build_pass4_identity_packet(db=db, tenant_id=tenant_id, user_id=user_id, rows=rows)
     rows = identity_packet["recent_identity_sessions"]
@@ -4641,48 +6178,6 @@ async def run_pass4_identity(
         return DerivedPassResult(run_id=run_id, pass_name=PASS4_IDENTITY, output_hash=str(existing["output_hash"]))
     try:
         assertions: List[Dict[str, Any]] = []
-        for row in rows:
-            raw = row.get("raw_triage_output") if isinstance(row.get("raw_triage_output"), dict) else {}
-            for signal in _text_list(raw.get("identity_signals"), limit=8):
-                refs = await _source_turn_refs_from_session(db=db, session_id=row["session_id"], text_hint=signal)
-                assertion_id = await _write_assertion(
-                    db=db,
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    pass_name=PASS4_IDENTITY,
-                    surface="identity_trait",
-                    statement_text=signal,
-                    run_id=run_id,
-                    source_session_ids=[row["session_id"]],
-                    source_turn_refs=refs,
-                    salience=0.75,
-                    importance=0.8,
-                    confidence_extraction=0.72,
-                    confidence_validity=0.6,
-                )
-                if assertion_id:
-                    assertions.append(
-                        {
-                            "assertion_id": assertion_id,
-                            "statement_text": signal,
-                            "source_session_ids": [row["session_id"]],
-                        }
-                    )
-                reason_code = _low_confidence_reason(signal, "identity_trait")
-                if reason_code:
-                    await _write_low_confidence_item(
-                        db=db,
-                        tenant_id=tenant_id,
-                        user_id=user_id,
-                        surface="identity_trait",
-                        statement_text=signal,
-                        question_text=_low_confidence_question(reason_code, signal),
-                        confidence=0.42,
-                        source_session_ids=[row["session_id"]],
-                        source_turn_refs=refs,
-                        run_id=run_id,
-                        metadata={"source": "pass4.identity_signal", "reason_code": reason_code},
-                    )
         rich_output: Optional[Dict[str, Any]] = None
         if bool(s.derived_pipeline_llm_enabled) and rows:
             existing_profile = await db.fetchone(
@@ -4826,53 +6321,6 @@ async def run_pass5_living_context(
         return DerivedPassResult(run_id=run_id, pass_name=PASS5_LIVING_CONTEXT, output_hash=str(existing["output_hash"]))
     try:
         assertions: List[Dict[str, Any]] = []
-        for row in rows:
-            raw = row.get("raw_triage_output") if isinstance(row.get("raw_triage_output"), dict) else {}
-            statements = [s for s in _text_list(raw.get("memory_deltas"), limit=4) if not _is_greeting_or_presence_check(s)]
-            statements.extend(_text_list(raw.get("thread_signals"), limit=4))
-            tension = normalize_text(row.get("tension_signal"), casefold=False)
-            if tension:
-                statements.append(tension)
-            for statement in statements[:10]:
-                refs = await _source_turn_refs_from_session(db=db, session_id=row["session_id"], text_hint=statement)
-                assertion_id = await _write_assertion(
-                    db=db,
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    pass_name=PASS5_LIVING_CONTEXT,
-                    surface="living_context_statement",
-                    statement_text=statement,
-                    run_id=run_id,
-                    source_session_ids=[row["session_id"]],
-                    source_turn_refs=refs,
-                    salience=0.7,
-                    importance=0.65,
-                    confidence_extraction=0.72,
-                    confidence_validity=0.58,
-                )
-                if assertion_id:
-                    assertions.append(
-                        {
-                            "assertion_id": assertion_id,
-                            "statement_text": statement,
-                            "source_session_ids": [row["session_id"]],
-                        }
-                    )
-                reason_code = _low_confidence_reason(statement, "living_context_statement")
-                if reason_code:
-                    await _write_low_confidence_item(
-                        db=db,
-                        tenant_id=tenant_id,
-                        user_id=user_id,
-                        surface="living_context_statement",
-                        statement_text=statement,
-                        question_text=_low_confidence_question(reason_code, statement),
-                        confidence=0.42,
-                        source_session_ids=[row["session_id"]],
-                        source_turn_refs=refs,
-                        run_id=run_id,
-                        metadata={"source": "pass5.context_statement", "reason_code": reason_code},
-                    )
         rich_output: Optional[Dict[str, Any]] = None
         if bool(s.derived_pipeline_llm_enabled) and rows:
             existing_context = await db.fetchone("SELECT * FROM living_context WHERE user_id=$1", user_id)
@@ -5483,10 +6931,748 @@ async def run_entity_audit(
                     row["user_id"],
                     canonical_norm,
                 )
-                summary["demoted"] += 1
+            summary["demoted"] += 1
         if len(rows) < safe_batch_size:
             break
         offset += safe_batch_size
+    return summary
+
+
+def _compact_actionable_candidate_for_audit(row: Dict[str, Any]) -> Dict[str, Any]:
+    provenance = row.get("provenance") if isinstance(row.get("provenance"), dict) else {}
+    source_turn_refs = provenance.get("source_turn_refs") if isinstance(provenance.get("source_turn_refs"), list) else []
+    latest_turn = source_turn_refs[0] if source_turn_refs and isinstance(source_turn_refs[0], dict) else {}
+    return {
+        "candidate_id": row.get("candidate_id"),
+        "record_type": row.get("record_type"),
+        "candidate_subtype": row.get("candidate_subtype"),
+        "title": row.get("title"),
+        "summary": row.get("summary"),
+        "due_iso": row.get("due_iso").isoformat() if isinstance(row.get("due_iso"), datetime) else row.get("due_iso"),
+        "relevant_from_iso": row.get("relevant_from_iso").isoformat() if isinstance(row.get("relevant_from_iso"), datetime) else row.get("relevant_from_iso"),
+        "relevant_until_iso": row.get("relevant_until_iso").isoformat() if isinstance(row.get("relevant_until_iso"), datetime) else row.get("relevant_until_iso"),
+        "waiting_on": row.get("waiting_on"),
+        "needs_response": row.get("needs_response"),
+        "cadence_text": row.get("cadence_text"),
+        "confidence_label": row.get("confidence_label"),
+        "status": row.get("status"),
+        "message_hint": normalize_text(provenance.get("message_hint"), casefold=False)[:240] or None,
+        "source_turn_excerpt": normalize_text(latest_turn.get("text"), casefold=False)[:320] or None,
+    }
+
+
+def _compact_actionable_candidate_for_reconciliation(row: Dict[str, Any]) -> Dict[str, Any]:
+    provenance = row.get("provenance") if isinstance(row.get("provenance"), dict) else {}
+    return {
+        "candidate_id": row.get("candidate_id"),
+        "record_type": row.get("record_type"),
+        "candidate_subtype": row.get("candidate_subtype"),
+        "title": row.get("title"),
+        "summary": row.get("summary"),
+        "due_iso": row.get("due_iso").isoformat() if isinstance(row.get("due_iso"), datetime) else row.get("due_iso"),
+        "waiting_on": row.get("waiting_on"),
+        "needs_response": row.get("needs_response"),
+        "cadence_text": row.get("cadence_text"),
+        "status": row.get("status"),
+        "confidence_label": row.get("confidence_label"),
+        "resolved_object": normalize_text(provenance.get("resolved_object"), casefold=False)[:180] or None,
+        "related_entities": [
+            normalize_text(item, casefold=False)[:120]
+            for item in (provenance.get("related_entities") if isinstance(provenance.get("related_entities"), list) else [])
+            if normalize_text(item, casefold=False)
+        ][:6],
+        "message_hint": normalize_text(provenance.get("message_hint"), casefold=False)[:180] or None,
+    }
+
+
+def _turn_window(messages: List[Dict[str, Any]], *, center_index: int, prev_count: int = 4, next_count: int = 2) -> Dict[str, List[Dict[str, Any]]]:
+    start = max(0, center_index - prev_count)
+    end = min(len(messages), center_index + next_count + 1)
+    previous: List[Dict[str, Any]] = []
+    following: List[Dict[str, Any]] = []
+    original: Optional[Dict[str, Any]] = None
+    for idx in range(start, end):
+        row = messages[idx]
+        if not isinstance(row, dict):
+            continue
+        item = {
+            "turn_index": idx,
+            "role": normalize_text(row.get("role")) or None,
+            "timestamp": row.get("timestamp"),
+            "text": normalize_text(row.get("text") or row.get("content"), casefold=False)[:500] or None,
+        }
+        if idx < center_index:
+            previous.append(item)
+        elif idx == center_index:
+            original = item
+        else:
+            following.append(item)
+    return {
+        "previous_turns": previous[-prev_count:],
+        "original_turn": original,
+        "next_turns": following[:next_count],
+    }
+
+
+async def _build_actionable_audit_packet(
+    *,
+    db: Database,
+    tenant_id: str,
+    user_id: str,
+    row: Dict[str, Any],
+) -> Dict[str, Any]:
+    compact = _compact_actionable_candidate_for_audit(row)
+    session_id = normalize_text(row.get("session_id")) or None
+    provenance = row.get("provenance") if isinstance(row.get("provenance"), dict) else {}
+    refs = provenance.get("source_turn_refs") if isinstance(provenance.get("source_turn_refs"), list) else []
+    turn_index = None
+    if refs and isinstance(refs[0], dict):
+        try:
+            turn_index = int(refs[0].get("turn_index"))
+        except Exception:
+            turn_index = None
+
+    messages: List[Dict[str, Any]] = []
+    session_summary = None
+    if session_id:
+        transcript_row = await db.fetchone(
+            """
+            SELECT messages
+            FROM session_transcript
+            WHERE session_id=$1
+            LIMIT 1
+            """,
+            session_id,
+        )
+        raw_messages = (transcript_row or {}).get("messages")
+        if isinstance(raw_messages, list):
+            messages = [m for m in raw_messages if isinstance(m, dict)]
+        classification_row = await db.fetchone(
+            """
+            SELECT one_line_summary, tension_signal
+            FROM session_classifications
+            WHERE session_id=$1
+            LIMIT 1
+            """,
+            session_id,
+        )
+        if classification_row:
+            session_summary = normalize_text(
+                classification_row.get("one_line_summary"),
+                casefold=False,
+            ) or normalize_text(classification_row.get("tension_signal"), casefold=False) or None
+
+    context_window = {"previous_turns": [], "original_turn": None, "next_turns": []}
+    if messages and isinstance(turn_index, int) and 0 <= turn_index < len(messages):
+        context_window = _turn_window(messages, center_index=turn_index, prev_count=5, next_count=2)
+    elif messages:
+        user_refs = [idx for idx, msg in enumerate(messages) if normalize_text(msg.get("role")) == "user"]
+        if user_refs:
+            context_window = _turn_window(messages, center_index=user_refs[0], prev_count=5, next_count=2)
+
+    related_names: List[str] = []
+    for value in (
+        provenance.get("related_entities"),
+        compact.get("related_entities"),
+    ):
+        if isinstance(value, list):
+            for item in value:
+                name = normalize_text(item, casefold=False)
+                if name and name not in related_names:
+                    related_names.append(name)
+    related_entities: List[Dict[str, Any]] = []
+    if related_names:
+        profile_rows = await db.fetch(
+            """
+            SELECT canonical_name, type, relationship_to_user, profile_text, last_known_status
+            FROM entity_profiles
+            WHERE user_id=$1
+            ORDER BY updated_at DESC
+            LIMIT 80
+            """,
+            user_id,
+        )
+        candidate_rows = await db.fetch(
+            """
+            SELECT name, candidate_type, summary, status, confidence_label
+            FROM entity_candidates
+            WHERE tenant_id=$1 AND user_id=$2
+            ORDER BY updated_at DESC
+            LIMIT 80
+            """,
+            tenant_id,
+            user_id,
+        )
+        for name in related_names[:6]:
+            matched_profile = next(
+                (
+                    {
+                        "name": normalize_text(p.get("canonical_name"), casefold=False),
+                        "type": normalize_text(p.get("type")),
+                        "relationship_to_user": normalize_text(p.get("relationship_to_user")),
+                        "profile_text": normalize_text(p.get("profile_text"), casefold=False)[:240] or None,
+                        "last_known_status": normalize_text(p.get("last_known_status"), casefold=False)[:180] or None,
+                    }
+                    for p in profile_rows
+                    if normalize_text(p.get("canonical_name")).lower() == normalize_text(name).lower()
+                ),
+                None,
+            )
+            matched_candidate = next(
+                (
+                    {
+                        "name": normalize_text(c.get("name"), casefold=False),
+                        "candidate_type": normalize_text(c.get("candidate_type")),
+                        "summary": normalize_text(c.get("summary"), casefold=False)[:180] or None,
+                        "status": normalize_text(c.get("status")),
+                        "confidence_label": normalize_text(c.get("confidence_label")),
+                    }
+                    for c in candidate_rows
+                    if normalize_text(c.get("name")).lower() == normalize_text(name).lower()
+                ),
+                None,
+            )
+            if matched_profile or matched_candidate:
+                related_entities.append({"name": name, "profile": matched_profile, "candidate": matched_candidate})
+
+    original_turn = context_window.get("original_turn")
+    reference_dt = _parse_optional_dt((original_turn or {}).get("timestamp")) or _parse_optional_dt((provenance or {}).get("ingested_at")) or _utcnow()
+    temporal_context = build_temporal_context(reference_time=reference_dt, timezone_name="UTC")
+
+    return {
+        **compact,
+        "session_id": session_id,
+        "session_summary": session_summary,
+        "original_source_message": original_turn,
+        "previous_turns": context_window.get("previous_turns") or [],
+        "next_turns": context_window.get("next_turns") or [],
+        "current_provenance": provenance,
+        "related_entities": related_entities,
+        "temporal_context": temporal_context,
+    }
+
+
+def _normalized_session_change_row_for_current_rules(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    payload = {
+        "session_changes": [
+            {
+                "kind": row.get("kind"),
+                "title": row.get("title"),
+                "summary": row.get("summary"),
+                "effective_iso": row.get("effective_iso").isoformat() if isinstance(row.get("effective_iso"), datetime) else row.get("effective_iso"),
+                "source": row.get("source"),
+                "provenance": row.get("provenance") if isinstance(row.get("provenance"), dict) else {},
+                "confidence": row.get("confidence_label"),
+                "status": row.get("status"),
+            }
+        ]
+    }
+    normalized = _normalize_session_changes_payload(payload)
+    return normalized[0] if normalized else None
+
+
+def _normalized_entity_candidate_row_for_current_rules(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    payload = {
+        "entity_candidates": [
+            {
+                "name": row.get("name"),
+                "candidate_type": row.get("candidate_type"),
+                "summary": row.get("summary"),
+                "source": row.get("source"),
+                "provenance": row.get("provenance") if isinstance(row.get("provenance"), dict) else {},
+                "confidence": row.get("confidence_label"),
+                "status": row.get("status"),
+            }
+        ]
+    }
+    normalized = _normalize_entity_candidates_payload(payload)
+    return normalized[0] if normalized else None
+
+
+async def run_actionable_candidate_audit(
+    *,
+    db: Database,
+    tenant_id: str = "default",
+    user_id: Optional[str] = None,
+    settings: Optional[Settings] = None,
+) -> Dict[str, int]:
+    s = settings or get_settings()
+    if user_id:
+        users = [user_id]
+    else:
+        rows = await db.fetch(
+            """
+            SELECT DISTINCT user_id
+            FROM actionable_candidates
+            WHERE tenant_id=$1
+              AND status IN ('detected','needs_review')
+            LIMIT 200
+            """,
+            tenant_id,
+        )
+        users = [normalize_text(row.get("user_id")) for row in rows if normalize_text(row.get("user_id"))]
+    summary = {"dismissed": 0, "reviewed": 0, "staled": 0, "flagged": 0}
+    for uid in users:
+        rows = await db.fetch(
+            """
+            SELECT candidate_id, record_type, title, summary, due_iso, relevant_from_iso, relevant_until_iso,
+                   candidate_subtype, waiting_on, needs_response, cadence_text,
+                   suggested_action, linked_external_id, linked_external_type, source, provenance,
+                   confidence_score, confidence_label, status, metadata
+            FROM actionable_candidates
+            WHERE tenant_id=$1 AND user_id=$2
+              AND status IN ('detected','needs_review')
+            ORDER BY updated_at DESC
+            LIMIT 40
+            """,
+            tenant_id,
+            uid,
+        )
+        if not rows:
+            continue
+        audit_rows: List[Dict[str, Any]] = []
+        for row in rows:
+            row = dict(row)
+            audit_rows.append(
+                await _build_actionable_audit_packet(
+                    db=db,
+                    tenant_id=tenant_id,
+                    user_id=uid,
+                    row=row,
+                )
+            )
+        if not bool(s.derived_pipeline_llm_enabled):
+            continue
+        actions = await audit_actionable_candidates(candidates=audit_rows, model=s.derived_pipeline_model_version) or []
+        for action in actions:
+            if float(action.get("confidence") or 0.0) < 0.8:
+                summary["flagged"] += 1
+                continue
+            candidate_id = int(action["candidate_id"])
+            kind = normalize_text(action.get("action")).upper()
+            rewritten_title = normalize_text(action.get("normalized_title"), casefold=False)[:180] if normalize_text(action.get("normalized_title"), casefold=False) else None
+            rewritten_summary = normalize_text(action.get("normalized_summary"), casefold=False)[:320] if normalize_text(action.get("normalized_summary"), casefold=False) else None
+            candidate_subtype = normalize_text(action.get("candidate_subtype")).lower() or None
+            if candidate_subtype not in ACTIONABLE_CANDIDATE_SUBTYPES:
+                candidate_subtype = None
+            waiting_on = normalize_text(action.get("waiting_on"), casefold=False)[:180] if normalize_text(action.get("waiting_on"), casefold=False) else None
+            needs_response = action.get("needs_response") if isinstance(action.get("needs_response"), bool) else None
+            cadence_text = normalize_text(action.get("cadence_text"), casefold=False)[:120] if normalize_text(action.get("cadence_text"), casefold=False) else None
+            audit_provenance_patch = {
+                "resolved_object": normalize_text(action.get("resolved_object"), casefold=False)[:180] if normalize_text(action.get("resolved_object"), casefold=False) else None,
+                "related_entities": [
+                    normalize_text(item, casefold=False)[:120]
+                    for item in (action.get("related_entities") if isinstance(action.get("related_entities"), list) else [])
+                    if normalize_text(item, casefold=False)
+                ][:8],
+            }
+            audit_metadata_patch = {
+                "audit_action": normalize_text(kind).lower(),
+                "audit_reason": action.get("reason"),
+            }
+            if isinstance(action.get("hide_from_daily"), bool):
+                audit_metadata_patch["daily_relevant"] = False if action.get("hide_from_daily") else None
+            if isinstance(action.get("hide_from_review"), bool):
+                audit_metadata_patch["hide_from_review"] = bool(action.get("hide_from_review"))
+
+            if kind in {"KEEP", "REWRITE"}:
+                if rewritten_title or rewritten_summary or candidate_subtype or waiting_on or needs_response is not None or cadence_text or any(audit_provenance_patch.values()):
+                    await db.execute(
+                        """
+                        UPDATE actionable_candidates
+                        SET title=COALESCE($4, title),
+                            summary=COALESCE($5, summary),
+                            candidate_subtype=COALESCE($6, candidate_subtype),
+                            waiting_on=COALESCE($7, waiting_on),
+                            needs_response=COALESCE($8, needs_response),
+                            cadence_text=COALESCE($9, cadence_text),
+                            provenance=COALESCE(provenance, '{}'::jsonb) || $10::jsonb,
+                            metadata=COALESCE(metadata, '{}'::jsonb) || $11::jsonb,
+                            updated_at=NOW()
+                        WHERE tenant_id=$1 AND user_id=$2 AND candidate_id=$3
+                        """,
+                        tenant_id,
+                        uid,
+                        candidate_id,
+                        rewritten_title,
+                        rewritten_summary,
+                        candidate_subtype,
+                        waiting_on,
+                        needs_response,
+                        cadence_text,
+                        audit_provenance_patch,
+                        audit_metadata_patch,
+                    )
+                continue
+            if kind == "NEEDS_CONTEXT":
+                await db.execute(
+                    """
+                    UPDATE actionable_candidates
+                    SET status='needs_review',
+                        metadata=COALESCE(metadata, '{}'::jsonb) || $4::jsonb,
+                        updated_at=NOW()
+                    WHERE tenant_id=$1 AND user_id=$2 AND candidate_id=$3
+                      AND status IN ('detected','needs_review')
+                    """,
+                    tenant_id,
+                    uid,
+                    candidate_id,
+                    audit_metadata_patch,
+                )
+                summary["reviewed"] += 1
+                continue
+            if kind == "MERGE":
+                target_candidate_id = action.get("target_candidate_id")
+                if not target_candidate_id or int(target_candidate_id) == candidate_id:
+                    summary["flagged"] += 1
+                    continue
+                await db.execute(
+                    """
+                    UPDATE actionable_candidates
+                    SET status='dismissed',
+                        metadata=COALESCE(metadata, '{}'::jsonb) || $4::jsonb,
+                        updated_at=NOW()
+                    WHERE tenant_id=$1 AND user_id=$2 AND candidate_id=$3
+                      AND status IN ('detected','needs_review')
+                    """,
+                    tenant_id,
+                    uid,
+                    candidate_id,
+                    {**audit_metadata_patch, "merge_target_candidate_id": int(target_candidate_id)},
+                )
+                summary["dismissed"] += 1
+                continue
+            if kind == "SUPERSEDE":
+                target_candidate_id = action.get("target_candidate_id")
+                if target_candidate_id and int(target_candidate_id) != candidate_id:
+                    await db.execute(
+                        """
+                        UPDATE actionable_candidates
+                        SET status='superseded',
+                            metadata=COALESCE(metadata, '{}'::jsonb) || $4::jsonb,
+                            updated_at=NOW()
+                        WHERE tenant_id=$1 AND user_id=$2 AND candidate_id=$3
+                          AND status IN ('detected','needs_review','confirmed')
+                        """,
+                        tenant_id,
+                        uid,
+                        int(target_candidate_id),
+                        {**audit_metadata_patch, "superseded_by_candidate_id": candidate_id},
+                    )
+                await db.execute(
+                    """
+                    UPDATE actionable_candidates
+                    SET status='needs_review',
+                        title=COALESCE($4, title),
+                        summary=COALESCE($5, summary),
+                        candidate_subtype=COALESCE($6, candidate_subtype),
+                        waiting_on=COALESCE($7, waiting_on),
+                        needs_response=COALESCE($8, needs_response),
+                        cadence_text=COALESCE($9, cadence_text),
+                        provenance=COALESCE(provenance, '{}'::jsonb) || $10::jsonb,
+                        metadata=COALESCE(metadata, '{}'::jsonb) || $11::jsonb,
+                        updated_at=NOW()
+                    WHERE tenant_id=$1 AND user_id=$2 AND candidate_id=$3
+                      AND status IN ('detected','needs_review','confirmed')
+                    """,
+                    tenant_id,
+                    uid,
+                    candidate_id,
+                    rewritten_title,
+                    rewritten_summary,
+                    candidate_subtype,
+                    waiting_on,
+                    needs_response,
+                    cadence_text,
+                    audit_provenance_patch,
+                    audit_metadata_patch,
+                )
+                summary["reviewed"] += 1
+                continue
+            if kind == "NEEDS_REVIEW":
+                await db.execute(
+                    """
+                    UPDATE actionable_candidates
+                    SET status='needs_review',
+                        title=COALESCE($4, title),
+                        summary=COALESCE($5, summary),
+                        candidate_subtype=COALESCE($6, candidate_subtype),
+                        waiting_on=COALESCE($7, waiting_on),
+                        needs_response=COALESCE($8, needs_response),
+                        cadence_text=COALESCE($9, cadence_text),
+                        provenance=COALESCE(provenance, '{}'::jsonb) || $10::jsonb,
+                        metadata=COALESCE(metadata, '{}'::jsonb) || $11::jsonb,
+                        updated_at=NOW()
+                    WHERE tenant_id=$1 AND user_id=$2 AND candidate_id=$3
+                      AND status IN ('detected','needs_review')
+                    """,
+                    tenant_id,
+                    uid,
+                    candidate_id,
+                    rewritten_title,
+                    rewritten_summary,
+                    candidate_subtype,
+                    waiting_on,
+                    needs_response,
+                    cadence_text,
+                    audit_provenance_patch,
+                    audit_metadata_patch,
+                )
+                summary["reviewed"] += 1
+            elif kind == "DISMISS":
+                await db.execute(
+                    """
+                    UPDATE actionable_candidates
+                    SET status='dismissed',
+                        title=COALESCE($4, title),
+                        summary=COALESCE($5, summary),
+                        provenance=COALESCE(provenance, '{}'::jsonb) || $6::jsonb,
+                        metadata=COALESCE(metadata, '{}'::jsonb) || $7::jsonb,
+                        updated_at=NOW()
+                    WHERE tenant_id=$1 AND user_id=$2 AND candidate_id=$3
+                      AND status IN ('detected','needs_review')
+                    """,
+                    tenant_id,
+                    uid,
+                    candidate_id,
+                    rewritten_title,
+                    rewritten_summary,
+                    audit_provenance_patch,
+                    audit_metadata_patch,
+                )
+                summary["dismissed"] += 1
+            elif kind == "STALE":
+                await db.execute(
+                    """
+                    UPDATE actionable_candidates
+                    SET status='stale',
+                        title=COALESCE($4, title),
+                        summary=COALESCE($5, summary),
+                        provenance=COALESCE(provenance, '{}'::jsonb) || $6::jsonb,
+                        metadata=COALESCE(metadata, '{}'::jsonb) || $7::jsonb,
+                        updated_at=NOW()
+                    WHERE tenant_id=$1 AND user_id=$2 AND candidate_id=$3
+                      AND status IN ('detected','needs_review')
+                    """,
+                    tenant_id,
+                    uid,
+                    candidate_id,
+                    rewritten_title,
+                    rewritten_summary,
+                    audit_provenance_patch,
+                    audit_metadata_patch,
+                )
+                summary["staled"] += 1
+    return summary
+
+
+async def run_session_change_audit(
+    *,
+    db: Database,
+    tenant_id: str = "default",
+    user_id: Optional[str] = None,
+    settings: Optional[Settings] = None,
+) -> Dict[str, int]:
+    s = settings or get_settings()
+    if user_id:
+        users = [user_id]
+    else:
+        rows = await db.fetch(
+            """
+            SELECT DISTINCT user_id
+            FROM session_changes
+            WHERE tenant_id=$1
+              AND status IN ('detected','needs_review')
+            LIMIT 200
+            """,
+            tenant_id,
+        )
+        users = [normalize_text(row.get("user_id")) for row in rows if normalize_text(row.get("user_id"))]
+    summary = {"dismissed": 0, "reviewed": 0, "staled": 0, "flagged": 0}
+    for uid in users:
+        rows = await db.fetch(
+            """
+            SELECT change_id, kind, title, summary, effective_iso, source, provenance,
+                   confidence_score, confidence_label, status, metadata
+            FROM session_changes
+            WHERE tenant_id=$1 AND user_id=$2
+              AND status IN ('detected','needs_review')
+            ORDER BY updated_at DESC
+            LIMIT 120
+            """,
+            tenant_id,
+            uid,
+        )
+        if not rows:
+            continue
+        candidate_rows = [dict(row) for row in rows]
+        audit_rows: List[Dict[str, Any]] = []
+        for row in candidate_rows:
+            normalized_row = _normalized_session_change_row_for_current_rules(row)
+            if normalized_row:
+                if (
+                    normalize_text(row.get("title"), casefold=False) != normalize_text(normalized_row.get("title"), casefold=False)
+                    or normalize_text(row.get("summary"), casefold=False) != normalize_text(normalized_row.get("summary"), casefold=False)
+                ):
+                    await db.execute(
+                        """
+                        UPDATE session_changes
+                        SET title=$4,
+                            summary=$5,
+                            metadata=COALESCE(metadata, '{}'::jsonb) || $6::jsonb,
+                            updated_at=NOW()
+                        WHERE tenant_id=$1 AND user_id=$2 AND change_id=$3
+                        """,
+                        tenant_id,
+                        uid,
+                        row["change_id"],
+                        normalize_text(normalized_row.get("title"), casefold=False)[:180],
+                        normalize_text(normalized_row.get("summary"), casefold=False)[:320] or None,
+                        {"audit_action": "normalized_to_current_rules"},
+                    )
+                audit_rows.append({**row, **normalized_row})
+            else:
+                audit_rows.append(dict(row))
+        if not bool(s.derived_pipeline_llm_enabled):
+            continue
+        actions = await audit_session_changes(candidates=audit_rows, model=s.derived_pipeline_model_version) or []
+        for action in actions:
+            if float(action.get("confidence") or 0.0) < 0.85:
+                summary["flagged"] += 1
+                continue
+            change_id = int(action["change_id"])
+            kind = normalize_text(action.get("action")).upper()
+            if kind == "KEEP":
+                continue
+            next_status = {"NEEDS_REVIEW": "needs_review", "DISMISS": "dismissed", "STALE": "stale"}.get(kind)
+            if not next_status:
+                continue
+            await db.execute(
+                """
+                UPDATE session_changes
+                SET status=$4,
+                    metadata=COALESCE(metadata, '{}'::jsonb) || $5::jsonb,
+                    updated_at=NOW()
+                WHERE tenant_id=$1 AND user_id=$2 AND change_id=$3
+                  AND status IN ('detected','needs_review')
+                """,
+                tenant_id,
+                uid,
+                change_id,
+                next_status,
+                {"audit_action": next_status, "audit_reason": action.get("reason")},
+            )
+            if next_status == "needs_review":
+                summary["reviewed"] += 1
+            elif next_status == "stale":
+                summary["staled"] += 1
+            else:
+                summary["dismissed"] += 1
+    return summary
+
+
+async def run_entity_candidate_audit(
+    *,
+    db: Database,
+    tenant_id: str = "default",
+    user_id: Optional[str] = None,
+    settings: Optional[Settings] = None,
+) -> Dict[str, int]:
+    s = settings or get_settings()
+    if user_id:
+        users = [user_id]
+    else:
+        rows = await db.fetch(
+            """
+            SELECT DISTINCT user_id
+            FROM entity_candidates
+            WHERE tenant_id=$1
+              AND status IN ('detected','needs_review')
+            LIMIT 200
+            """,
+            tenant_id,
+        )
+        users = [normalize_text(row.get("user_id")) for row in rows if normalize_text(row.get("user_id"))]
+    summary = {"dismissed": 0, "reviewed": 0, "staled": 0, "flagged": 0}
+    for uid in users:
+        rows = await db.fetch(
+            """
+            SELECT candidate_id, name, candidate_type, summary, source, provenance,
+                   confidence_score, confidence_label, status, metadata
+            FROM entity_candidates
+            WHERE tenant_id=$1 AND user_id=$2
+              AND status IN ('detected','needs_review')
+            ORDER BY updated_at DESC
+            LIMIT 120
+            """,
+            tenant_id,
+            uid,
+        )
+        if not rows:
+            continue
+        candidate_rows = [dict(row) for row in rows]
+        audit_rows: List[Dict[str, Any]] = []
+        for row in candidate_rows:
+            normalized_row = _normalized_entity_candidate_row_for_current_rules(row)
+            if normalized_row:
+                if (
+                    normalize_text(row.get("name"), casefold=False) != normalize_text(normalized_row.get("name"), casefold=False)
+                    or normalize_text(row.get("summary"), casefold=False) != normalize_text(normalized_row.get("summary"), casefold=False)
+                ):
+                    await db.execute(
+                        """
+                        UPDATE entity_candidates
+                        SET name=$4,
+                            summary=$5,
+                            metadata=COALESCE(metadata, '{}'::jsonb) || $6::jsonb,
+                            updated_at=NOW()
+                        WHERE tenant_id=$1 AND user_id=$2 AND candidate_id=$3
+                        """,
+                        tenant_id,
+                        uid,
+                        row["candidate_id"],
+                        normalize_text(normalized_row.get("name"), casefold=False)[:160],
+                        normalize_text(normalized_row.get("summary"), casefold=False)[:240] or None,
+                        {"audit_action": "normalized_to_current_rules"},
+                    )
+                audit_rows.append({**row, **normalized_row})
+            else:
+                audit_rows.append(dict(row))
+        if not bool(s.derived_pipeline_llm_enabled):
+            continue
+        actions = await audit_entity_candidates(candidates=audit_rows, model=s.derived_pipeline_model_version) or []
+        for action in actions:
+            if float(action.get("confidence") or 0.0) < 0.85:
+                summary["flagged"] += 1
+                continue
+            candidate_id = int(action["candidate_id"])
+            kind = normalize_text(action.get("action")).upper()
+            if kind == "KEEP":
+                continue
+            next_status = {"NEEDS_REVIEW": "needs_review", "DISMISS": "dismissed", "STALE": "superseded"}.get(kind)
+            if not next_status:
+                continue
+            await db.execute(
+                """
+                UPDATE entity_candidates
+                SET status=$4,
+                    metadata=COALESCE(metadata, '{}'::jsonb) || $5::jsonb,
+                    updated_at=NOW()
+                WHERE tenant_id=$1 AND user_id=$2 AND candidate_id=$3
+                  AND status IN ('detected','needs_review')
+                """,
+                tenant_id,
+                uid,
+                candidate_id,
+                next_status,
+                {"audit_action": next_status, "audit_reason": action.get("reason")},
+            )
+            if next_status == "needs_review":
+                summary["reviewed"] += 1
+            elif next_status == "superseded":
+                summary["staled"] += 1
+            else:
+                summary["dismissed"] += 1
     return summary
 
 
@@ -5744,6 +7930,30 @@ async def _upsert_shadow_candidates(
     return inserted_or_updated
 
 
+async def _contextual_tier3_entities_for_user(*, db: Database, user_id: str) -> set[str]:
+    rows = await db.fetch(
+        """
+        SELECT canonical_name, canonical_name_normalized, relationship_to_user, profile_text, last_known_status,
+               key_facts, importance_score, salience_score, distinct_session_count
+        FROM entity_profiles
+        WHERE user_id=$1
+          AND status='active'
+        """,
+        user_id,
+    )
+    blocked: set[str] = set()
+    for row in rows or []:
+        if entity_relationship_tier(dict(row)) != TIER_3_CONTEXTUAL:
+            continue
+        canonical = normalize_text(row.get("canonical_name"))
+        canonical_norm = normalize_text(row.get("canonical_name_normalized"))
+        if canonical:
+            blocked.add(canonical)
+        if canonical_norm:
+            blocked.add(canonical_norm)
+    return blocked
+
+
 async def _mark_shadow_candidates_stale(
     *,
     db: Database,
@@ -5790,12 +8000,13 @@ async def _refresh_follow_up_candidates_for_user(
     db: Database,
     tenant_id: str,
     user_id: str,
+    blocked_contextual_entities: Optional[set[str]] = None,
 ) -> Dict[str, int]:
     rows = await db.fetch(
         """
         SELECT thread_id, title, detail, priority, category, follow_up_after,
                source_session_ids, evidence_turn_refs, salience_score, importance_score,
-               last_mentioned_at
+               related_entities, thread_type, last_mentioned_at
         FROM open_threads
         WHERE user_id=$1
           AND status='open'
@@ -5804,12 +8015,30 @@ async def _refresh_follow_up_candidates_for_user(
         """,
         user_id,
     )
+    loop_rows = await db.fetch(
+        """
+        SELECT id, type, status, text, confidence, salience, time_horizon,
+               due_date, last_seen_at, updated_at, tags, hint, metadata
+        FROM loops
+        WHERE tenant_id=$1
+          AND user_id=$2
+          AND status IN ('active', 'needs_review', 'stale')
+        ORDER BY updated_at DESC NULLS LAST, salience DESC NULLS LAST
+        LIMIT 60
+        """,
+        tenant_id,
+        user_id,
+    )
     now = _utcnow()
     candidates: List[Dict[str, Any]] = []
     for row in rows:
         priority = normalize_text(row.get("priority"))
         importance = float(row.get("importance_score") or 0.0)
         salience = float(row.get("salience_score") or 0.0)
+        category = normalize_text(row.get("category")) or "other"
+        # Suppress weak/stale open-thread noise (often old grief/worry artifacts).
+        if category in {"relationship", "worry", "other"} and salience <= 0.55 and importance <= 0.55 and not row.get("follow_up_after"):
+            continue
         detail = _truncate_text(row.get("detail"), limit=260)
         due_at = row.get("follow_up_after")
         if not isinstance(due_at, datetime):
@@ -5824,6 +8053,9 @@ async def _refresh_follow_up_candidates_for_user(
         title = _truncate_text(row.get("title"), limit=120) or "Follow-up needed"
         reason = detail or f"Open {normalize_text(row.get('category')) or 'general'} thread remains unresolved."
         suggested_prompt = f"Quick check-in on {title.lower()}: any update?"
+        primary_entity = _primary_related_entity(row.get("related_entities"))
+        if primary_entity and primary_entity in (blocked_contextual_entities or set()):
+            continue
         candidates.append(
             {
                 "candidate_key": f"thread:{normalize_text(row.get('thread_id'))}",
@@ -5838,13 +8070,74 @@ async def _refresh_follow_up_candidates_for_user(
                 "source_session_ids": _text_list(row.get("source_session_ids"), limit=12),
                 "source_turn_refs": row.get("evidence_turn_refs") if isinstance(row.get("evidence_turn_refs"), list) else [],
                 "metadata": {
-                    "category": normalize_text(row.get("category")) or "other",
+                    "category": category,
                     "priority": priority or "medium",
+                    "primary_entity": primary_entity or None,
+                    "thread_type": normalize_text(row.get("thread_type")) or "situational",
+                },
+            }
+        )
+    for row in loop_rows:
+        if not _is_high_value_health_loop(dict(row)):
+            continue
+        loop_id = normalize_text(row.get("id"))
+        if not loop_id:
+            continue
+        loop_text = _truncate_text(row.get("text"), limit=140)
+        if not loop_text:
+            continue
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        reason = _truncate_text(metadata.get("reason"), limit=260) or f"Health habit to follow through: {loop_text}."
+        salience_raw = float(row.get("salience") or 0.0)
+        salience = min(1.0, max(0.0, salience_raw / 5.0))
+        confidence = _confidence_float(row.get("confidence"), default=0.72)
+        text_blob = normalize_text(f"{loop_text} {reason}")
+        high_risk_boost = 0.08 if any(term in text_blob for term in ("kidney", "injury", "knee")) else 0.0
+        hydration_boost = 0.06 if any(term in text_blob for term in ("water", "hydration", "electrolyte")) else 0.0
+        mobility_boost = 0.05 if any(term in text_blob for term in ("walk", "walking", "run", "running", "exercise", "steps")) else 0.0
+        score = min(1.0, 0.45 + salience * 0.30 + confidence * 0.18 + high_risk_boost + hydration_boost + mobility_boost)
+        due_at = row.get("due_date") if isinstance(row.get("due_date"), datetime) else now
+        suggested_prompt = f"Quick health check-in: how is \"{loop_text}\" going?"
+        candidates.append(
+            {
+                "candidate_key": f"loop:{loop_id}",
+                "title": loop_text,
+                "reason": reason,
+                "suggested_prompt": suggested_prompt,
+                "source_surface": "health_loop",
+                "source_ref": loop_id,
+                "priority_score": score,
+                "confidence": min(0.98, max(0.35, confidence)),
+                "due_at": due_at,
+                "source_session_ids": [],
+                "source_turn_refs": [],
+                "metadata": {
+                    "category": "health_habit",
+                    "priority": "high" if score >= 0.75 else "medium",
+                    "loop_type": normalize_text(row.get("type")) or "habit",
+                    "loop_status": normalize_text(row.get("status")) or "active",
+                    "time_horizon": normalize_text(row.get("time_horizon")) or "ongoing",
                 },
             }
         )
     candidates.sort(key=lambda item: (float(item.get("priority_score") or 0.0), float(item.get("confidence") or 0.0)), reverse=True)
-    candidates = candidates[:PROACTIVE_SHADOW_MAX_CANDIDATES_PER_QUEUE]
+    deduped: List[Dict[str, Any]] = []
+    seen_relational_entity: set[str] = set()
+    for item in candidates:
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        category = normalize_text(metadata.get("category"))
+        primary_entity = normalize_text(metadata.get("primary_entity"))
+        if primary_entity and category in PROACTIVE_SHADOW_RELATIONAL_CATEGORIES:
+            relational_key = f"{primary_entity}:relational"
+            if relational_key in seen_relational_entity:
+                continue
+            seen_relational_entity.add(relational_key)
+        if any(_shadow_token_overlap(item.get("title"), existing.get("title")) >= 0.72 for existing in deduped):
+            continue
+        deduped.append(item)
+        if len(deduped) >= PROACTIVE_SHADOW_MAX_CANDIDATES_PER_QUEUE:
+            break
+    candidates = deduped
     active_keys = [c["candidate_key"] for c in candidates if c.get("candidate_key")]
     upserted = await _upsert_shadow_candidates(
         db=db,
@@ -5939,59 +8232,151 @@ async def _refresh_recent_change_candidates_for_user(
     tenant_id: str,
     user_id: str,
     lookback_days: int,
+    blocked_contextual_entities: Optional[set[str]] = None,
 ) -> Dict[str, int]:
     safe_lookback_days = max(1, int(lookback_days or PROACTIVE_SHADOW_ASSERTION_LOOKBACK_DAYS))
-    rows = await db.fetch(
+    thread_rows = await db.fetch(
         """
-        SELECT assertion_id, surface, statement_text, salience, importance,
-               confidence_validity, source_session_ids, source_turn_refs, updated_at
-        FROM derived_assertions
-        WHERE tenant_id=$1
-          AND user_id=$2
-          AND lifecycle_state='active'
-          AND surface IN ('memory_delta','thread_signal','identity_signal','living_context_statement')
-          AND updated_at >= NOW() - ($3::text || ' days')::interval
-        ORDER BY updated_at DESC, importance DESC NULLS LAST, salience DESC NULLS LAST
-        LIMIT 80
+        SELECT thread_id, title, detail, category, priority, source_session_ids, evidence_turn_refs,
+               salience_score, importance_score, related_entities, last_updated_at, last_mentioned_at
+        FROM open_threads
+        WHERE user_id=$1
+          AND status='open'
+          AND (
+            COALESCE(last_updated_at, last_mentioned_at, created_at) >= NOW() - ($2::text || ' days')::interval
+            OR COALESCE(last_mentioned_at, last_updated_at, created_at) >= NOW() - ($2::text || ' days')::interval
+          )
+        ORDER BY COALESCE(last_updated_at, last_mentioned_at, created_at) DESC,
+                 importance_score DESC NULLS LAST, salience_score DESC NULLS LAST
+        LIMIT 60
         """,
-        tenant_id,
         user_id,
         str(safe_lookback_days),
     )
+    entity_rows = await db.fetch(
+        """
+        SELECT canonical_name, canonical_name_normalized, relationship_to_user, last_known_status,
+               source_session_ids, importance_score, salience_score, confidence,
+               last_updated_at, last_seen_at
+        FROM entity_profiles
+        WHERE user_id=$1
+          AND status='active'
+          AND COALESCE(last_updated_at, last_seen_at, created_at) >= NOW() - ($2::text || ' days')::interval
+          AND COALESCE(confidence, 0.0) >= $3
+        ORDER BY COALESCE(last_updated_at, last_seen_at, created_at) DESC,
+                 importance_score DESC NULLS LAST, salience_score DESC NULLS LAST
+        LIMIT 40
+        """,
+        user_id,
+        str(safe_lookback_days),
+        float(PROACTIVE_SHADOW_MIN_RECENT_CHANGE_VALIDITY),
+    )
     now = _utcnow()
     candidates: List[Dict[str, Any]] = []
-    for row in rows:
-        assertion_id = int(row.get("assertion_id") or 0)
-        if assertion_id <= 0:
+    seen_recent_keys: set[str] = set()
+    seen_relational_entities: set[str] = set()
+
+    for row in thread_rows:
+        title = _truncate_text(row.get("title"), limit=160)
+        detail = _truncate_text(row.get("detail"), limit=220)
+        if not title:
             continue
-        statement = _truncate_text(row.get("statement_text"), limit=200)
-        if not statement:
+        primary_entity = _primary_related_entity(row.get("related_entities"))
+        if primary_entity and primary_entity in (blocked_contextual_entities or set()):
             continue
-        salience = float(row.get("salience") or 0.0)
-        importance = float(row.get("importance") or 0.0)
-        validity = float(row.get("confidence_validity") or 0.55)
-        recency_bonus = 0.12 if isinstance(row.get("updated_at"), datetime) and row.get("updated_at") >= now - timedelta(days=1) else 0.0
-        score = min(1.0, 0.20 + salience * 0.32 + importance * 0.32 + validity * 0.16 + recency_bonus)
-        suggested_prompt = f"You mentioned \"{statement}\" recently. Is this still current?"
+        category = normalize_text(row.get("category")) or "other"
+        if primary_entity and category in PROACTIVE_SHADOW_RELATIONAL_CATEGORIES:
+            relational_key = f"{primary_entity}:recent_relational"
+            if relational_key in seen_relational_entities:
+                continue
+            seen_relational_entities.add(relational_key)
+        thread_id = normalize_text(row.get("thread_id"))
+        if not thread_id:
+            continue
+        key = f"thread:{thread_id}"
+        if key in seen_recent_keys:
+            continue
+        if any(_shadow_token_overlap(title, existing.get("title")) >= 0.72 for existing in candidates):
+            continue
+        seen_recent_keys.add(key)
+        salience = float(row.get("salience_score") or 0.0)
+        importance = float(row.get("importance_score") or 0.0)
+        score = min(1.0, 0.22 + salience * 0.34 + importance * 0.34 + (_priority_rank(row.get("priority")) * 0.06))
+        confidence = min(0.98, 0.56 + (importance * 0.20) + (salience * 0.16))
+        reason = detail or "Recent change in an active thread worth checking."
+        suggested_prompt = f"Last time we discussed {title.lower()}. Any update since then?"
         candidates.append(
             {
-                "candidate_key": f"assertion:{assertion_id}",
-                "title": statement,
-                "reason": f"Recent {normalize_text(row.get('surface')) or 'memory'} change worth continuity follow-up.",
+                "candidate_key": f"thread_change:{thread_id}",
+                "title": title,
+                "reason": reason,
                 "suggested_prompt": suggested_prompt,
-                "source_surface": normalize_text(row.get("surface")) or "derived_assertion",
-                "source_ref": str(assertion_id),
+                "source_surface": "open_thread_change",
+                "source_ref": thread_id,
                 "priority_score": score,
-                "confidence": min(0.98, max(0.35, validity)),
+                "confidence": confidence,
                 "due_at": now,
                 "source_session_ids": _text_list(row.get("source_session_ids"), limit=12),
-                "source_turn_refs": row.get("source_turn_refs") if isinstance(row.get("source_turn_refs"), list) else [],
+                "source_turn_refs": row.get("evidence_turn_refs") if isinstance(row.get("evidence_turn_refs"), list) else [],
                 "metadata": {
                     "salience": salience,
                     "importance": importance,
+                    "category": category,
+                    "primary_entity": primary_entity or None,
                 },
             }
         )
+
+    for row in entity_rows:
+        canonical = _truncate_text(row.get("canonical_name"), limit=100)
+        canonical_norm = normalize_text(row.get("canonical_name_normalized")) or normalize_text(canonical)
+        if not canonical:
+            continue
+        if canonical_norm and canonical_norm in (blocked_contextual_entities or set()):
+            continue
+        relationship = normalize_text(row.get("relationship_to_user"))
+        status_text = _truncate_text(row.get("last_known_status"), limit=200)
+        if _is_low_leverage_recent_change_statement(status_text, "relationship"):
+            status_text = ""
+        if relationship and relationship not in {"active_project", "user_project", "owned_project", "core_project", "primary_project"}:
+            relational_key = f"{canonical_norm}:recent_relational"
+            if relational_key in seen_relational_entities:
+                continue
+            seen_relational_entities.add(relational_key)
+        key = f"entity:{canonical_norm}:{relationship or 'other'}"
+        if key in seen_recent_keys:
+            continue
+        title = f"Status update: {canonical}"
+        reason = status_text or f"Recent update for {canonical}."
+        if any(_shadow_token_overlap(title, existing.get("title")) >= 0.72 for existing in candidates):
+            continue
+        seen_recent_keys.add(key)
+        salience = float(row.get("salience_score") or 0.0)
+        importance = float(row.get("importance_score") or 0.0)
+        confidence = float(row.get("confidence") or 0.65)
+        score = min(1.0, 0.18 + salience * 0.34 + importance * 0.34 + min(0.14, confidence * 0.14))
+        suggested_prompt = f"Any update on {canonical} since we last discussed them?"
+        candidates.append(
+            {
+                "candidate_key": f"entity_change:{canonical_norm}",
+                "title": title,
+                "reason": reason,
+                "suggested_prompt": suggested_prompt,
+                "source_surface": "entity_status_change",
+                "source_ref": canonical_norm or canonical,
+                "priority_score": score,
+                "confidence": min(0.98, max(0.35, confidence)),
+                "due_at": now,
+                "source_session_ids": _text_list(row.get("source_session_ids"), limit=12),
+                "source_turn_refs": [],
+                "metadata": {
+                    "salience": salience,
+                    "importance": importance,
+                    "relationship_to_user": relationship or None,
+                },
+            }
+        )
+
     candidates.sort(key=lambda item: float(item.get("priority_score") or 0.0), reverse=True)
     candidates = candidates[:PROACTIVE_SHADOW_MAX_CANDIDATES_PER_QUEUE]
     active_keys = [c["candidate_key"] for c in candidates if c.get("candidate_key")]
@@ -6116,10 +8501,12 @@ async def run_proactive_shadow_candidates(
         "recent_change_candidates_active": 0,
     }
     for uid in users:
+        blocked_contextual_entities = await _contextual_tier3_entities_for_user(db=db, user_id=uid)
         follow_up = await _refresh_follow_up_candidates_for_user(
             db=db,
             tenant_id=tenant_id,
             user_id=uid,
+            blocked_contextual_entities=blocked_contextual_entities,
         )
         clarification = await _refresh_clarification_candidates_for_user(
             db=db,
@@ -6131,6 +8518,7 @@ async def run_proactive_shadow_candidates(
             tenant_id=tenant_id,
             user_id=uid,
             lookback_days=lookback_days,
+            blocked_contextual_entities=blocked_contextual_entities,
         )
         summary["users_processed"] += 1
         summary["follow_up_candidates_upserted"] += int(follow_up.get("upserted") or 0)
@@ -6153,6 +8541,9 @@ async def run_conservative_memory_audits(
 ) -> Dict[str, Dict[str, int]]:
     thread_summary = await run_thread_audit(db=db, tenant_id=tenant_id, settings=settings)
     entity_summary = await run_entity_audit(db=db, tenant_id=tenant_id)
+    actionable_summary = await run_actionable_candidate_audit(db=db, tenant_id=tenant_id, settings=settings)
+    session_change_summary = await run_session_change_audit(db=db, tenant_id=tenant_id, settings=settings)
+    entity_candidate_summary = await run_entity_candidate_audit(db=db, tenant_id=tenant_id, settings=settings)
     retrospective_summary = await run_retrospective_worker_v1(
         db=db,
         tenant_id=tenant_id,
@@ -6161,6 +8552,9 @@ async def run_conservative_memory_audits(
     return {
         "threads": thread_summary,
         "entities": entity_summary,
+        "actionable_candidates": actionable_summary,
+        "session_changes": session_change_summary,
+        "entity_candidates": entity_candidate_summary,
         "retrospective": retrospective_summary,
     }
 

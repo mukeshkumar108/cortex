@@ -18,6 +18,7 @@ from src.derived_pipeline import (
     build_pass4_identity_packet,
     build_pass5_living_packet,
     run_pass1_5_entities,
+    run_pass2_actionable,
     run_pass1_triage,
     run_pass3_threads,
     run_pass4_identity,
@@ -25,6 +26,9 @@ from src.derived_pipeline import (
     run_proactive_shadow_candidates,
     run_retrospective_worker_v1,
     run_entity_audit,
+    run_actionable_candidate_audit,
+    run_session_change_audit,
+    run_entity_candidate_audit,
     run_silence_detection,
     run_thread_audit,
     run_conservative_memory_audits,
@@ -36,6 +40,7 @@ from src.derived_passes.pass1_triage import PASS1_PROMPT
 from src.derived_passes.pass3_threads import THREAD_EXTRACTION_PROMPT
 from src.derived_passes.synthesis_quality import conservative_rewrite_text, synthesis_quality_flags
 from src.main import app, db, _build_handover_packet, _execute_post_ingest_hook, build_always_on_memory_packet, session_startbrief
+from src import session
 
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "derived_pipeline" / "basic_six_pass.json"
@@ -246,7 +251,7 @@ def test_synthesis_quality_rewrites_mixed_clause_sentence_and_keeps_factual_tail
 
 
 @pytest.mark.asyncio
-async def test_pass1_writes_traceable_assertions_and_is_idempotent():
+async def test_pass1_is_idempotent_and_noops_without_llm():
     async with app.router.lifespan_context(app):
         settings = get_settings()
         settings.derived_pipeline_llm_enabled = False
@@ -287,10 +292,8 @@ async def test_pass1_writes_traceable_assertions_and_is_idempotent():
         )
 
         assert first.output_hash == second.output_hash
-        fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
-        assert first.output_hash == fixture["expected"]["pass1"]["output_hash"]
-        assert first.run_entity_pass is True
-        assert first.run_threads_pass is True
+        assert first.run_entity_pass is False
+        assert first.run_threads_pass is False
 
         classification = await db.fetchone(
             """
@@ -302,8 +305,10 @@ async def test_pass1_writes_traceable_assertions_and_is_idempotent():
             session_id,
         )
         assert classification
-        assert classification["context_relevant"] is fixture["expected"]["pass1"]["context_relevant"]
-        assert classification["raw_triage_output"]["source"] == "heuristic_fallback"
+        assert classification["context_relevant"] is False
+        assert classification["raw_triage_output"]["source"] == "noop_fallback"
+        assert classification["raw_triage_output"]["run_entity_pass"] is False
+        assert classification["raw_triage_output"]["run_threads_pass"] is False
 
         assertions = await db.fetch(
             """
@@ -315,11 +320,7 @@ async def test_pass1_writes_traceable_assertions_and_is_idempotent():
             user_id,
             first.run_id,
         )
-        assert assertions
-        assert {row["surface"] for row in assertions} >= set(fixture["expected"]["pass1"]["surfaces"])
-        assert all(row["source_session_ids"] == [session_id] for row in assertions)
-        assert all(isinstance(row["source_turn_refs"], list) and row["source_turn_refs"] for row in assertions)
-        assert any(row["memory_layer"] == "LML" for row in assertions)
+        assert assertions == []
 
         runs = await db.fetch(
             """
@@ -335,7 +336,7 @@ async def test_pass1_writes_traceable_assertions_and_is_idempotent():
 
 
 @pytest.mark.asyncio
-async def test_immediate_and_deferred_passes_update_serving_tables_with_evidence():
+async def test_disabled_llm_pipeline_does_not_fabricate_downstream_state():
     async with app.router.lifespan_context(app):
         settings = get_settings()
         settings.derived_pipeline_llm_enabled = False
@@ -365,73 +366,23 @@ async def test_immediate_and_deferred_passes_update_serving_tables_with_evidence
             reference_time=datetime.now(timezone.utc),
             settings=settings,
         )
-        assert pass1.should_run_identity is True
-        assert pass1.should_run_living_context is True
+        assert pass1.should_run_identity is False
+        assert pass1.should_run_living_context is False
 
-        await run_pass1_5_entities(
-            db=db,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            session_id=session_id,
-            messages=messages,
-            settings=settings,
-        )
-        await run_pass3_threads(
-            db=db,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            session_id=session_id,
-            messages=messages,
-            settings=settings,
-        )
-        await run_pass4_identity(db=db, tenant_id=tenant_id, user_id=user_id, settings=settings)
-        await run_pass5_living_context(db=db, tenant_id=tenant_id, user_id=user_id, settings=settings)
-
-        entity = await db.fetchone(
-            """
-            SELECT canonical_name, source_session_ids
-            FROM entity_profiles
-            WHERE user_id=$1 AND canonical_name_normalized='riley'
-            """,
+        entity_count = await db.fetchval(
+            "SELECT COUNT(*)::int FROM entity_profiles WHERE user_id=$1",
             user_id,
         )
-        assert entity
-        fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
-        assert entity["canonical_name"] in fixture["expected"]["pass1_5_entities"]["entities"]
-        assert entity["source_session_ids"] == [session_id]
-
-        thread = await db.fetchone(
-            """
-            SELECT lifecycle_state, evidence_turn_refs, confidence_extraction
-            FROM open_threads
-            WHERE user_id=$1
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
+        thread_count = await db.fetchval(
+            "SELECT COUNT(*)::int FROM open_threads WHERE user_id=$1",
             user_id,
         )
-        assert thread
-        assert thread["lifecycle_state"] == fixture["expected"]["pass3_threads"]["lifecycle_state"]
-        assert isinstance(thread["evidence_turn_refs"], list) and thread["evidence_turn_refs"]
-        assert float(thread["confidence_extraction"]) > 0
-
         identity = await db.fetchone("SELECT assertions FROM identity_profile WHERE user_id=$1", user_id)
         living = await db.fetchone("SELECT assertions FROM living_context WHERE user_id=$1", user_id)
-        assert identity and isinstance(identity["assertions"], list)
-        assert living and isinstance(living["assertions"], list)
-
-        checkpoints = await db.fetch(
-            """
-            SELECT pipeline_name, identity_signal_count_since_last, context_delta_count_since_last
-            FROM pipeline_checkpoints
-            WHERE user_id=$1 AND pipeline_name = ANY($2::text[])
-            """,
-            user_id,
-            [PASS1_TRIAGE, PASS4_IDENTITY, PASS5_LIVING_CONTEXT],
-        )
-        by_name = {row["pipeline_name"]: row for row in checkpoints}
-        assert by_name[PASS4_IDENTITY]["identity_signal_count_since_last"] == 0
-        assert by_name[PASS5_LIVING_CONTEXT]["context_delta_count_since_last"] == 0
+        assert int(entity_count or 0) == 0
+        assert int(thread_count or 0) == 0
+        assert identity is None
+        assert living is None
 
 
 @pytest.mark.asyncio
@@ -487,11 +438,7 @@ async def test_phase2_primitives_are_written_selectively_and_silence_is_daily_jo
             user_id,
             pass1.run_id,
         )
-        assert event
-        assert event["event_type"] == "anniversary"
-        assert "Riley" in event["title"]
-        assert event["source_session_ids"] == [session_id]
-        assert isinstance(event["source_turn_refs"], list) and event["source_turn_refs"]
+        assert event is None
 
         low_conf = await db.fetchone(
             """
@@ -504,10 +451,7 @@ async def test_phase2_primitives_are_written_selectively_and_silence_is_daily_jo
             user_id,
             pass1.run_id,
         )
-        assert low_conf
-        assert low_conf["surface"] == "memory_delta"
-        assert low_conf["source_session_ids"] == [session_id]
-        assert isinstance(low_conf["source_turn_refs"], list) and low_conf["source_turn_refs"]
+        assert low_conf is None
 
         await db.execute(
             """
@@ -607,7 +551,7 @@ async def test_phase2_primitives_are_written_selectively_and_silence_is_daily_jo
 
 
 @pytest.mark.asyncio
-async def test_low_confidence_items_capture_ambiguous_meaning_and_surface_lightly(monkeypatch):
+async def test_pass1_does_not_persist_low_confidence_extractions(monkeypatch):
     async with app.router.lifespan_context(app):
         settings = get_settings()
         settings.derived_pipeline_llm_enabled = True
@@ -630,15 +574,8 @@ async def test_low_confidence_items_capture_ambiguous_meaning_and_surface_lightl
             return {
                 "is_memory_worthy": True,
                 "session_kind": "personal",
-                "memory_deltas": ["User named several unresolved signals that should remain open questions."],
                 "entity_mentions": ["Riley", "Bluum", "Jordan", "HMRC"],
                 "thread_signals": ["Hold unresolved signals gently without treating them as facts."],
-                "identity_signals": [
-                    "Maybe Riley is becoming a partner again, but the relationship interpretation is unclear.",
-                    "The work tension around Bluum seems career-related but the source is ambiguous.",
-                    "Jordan might be family, but the exact family role is unclear.",
-                    "User seems to avoid HMRC letters; this is a partial behavioral inference.",
-                ],
                 "emotional_weight": "medium",
                 "emotional_note": "Careful and unresolved.",
                 "tension_signal": "The user might be avoiding work pressure, but this career tension is ambiguous.",
@@ -681,16 +618,7 @@ async def test_low_confidence_items_capture_ambiguous_meaning_and_surface_lightl
             user_id,
             pass1.run_id,
         )
-        reason_codes = {row["metadata"].get("reason_code") for row in rows}
-        assert {
-            "uncertain_relationship_interpretation",
-            "ambiguous_career_tension",
-            "unclear_family_role",
-            "partial_behavioral_inference",
-        } <= reason_codes
-        assert all(row["question_text"] for row in rows)
-        assert all(row["source_session_ids"] == [session_id] for row in rows)
-        assert all(isinstance(row["source_turn_refs"], list) and row["source_turn_refs"] for row in rows)
+        assert rows == []
 
         startbrief = await session_startbrief(
             tenantId=tenant_id,
@@ -701,10 +629,10 @@ async def test_low_confidence_items_capture_ambiguous_meaning_and_surface_lightl
         )
         start_payload = startbrief.model_dump()
         guidance = start_payload["ops_context"]["assistant_guidance"]
-        assert any(item.get("type") == "low_confidence" for item in guidance)
+        assert not any(item.get("type") == "low_confidence" for item in guidance)
 
         handover = await _build_handover_packet(user_id)
-        assert any(item.get("reason") == "low_confidence_queue" for item in handover["sophie_directives"])
+        assert not any(item.get("reason") == "low_confidence_queue" for item in handover["sophie_directives"])
         surfaced_text = json.dumps(
             {
                 "threads": handover.get("open_threads"),
@@ -763,7 +691,105 @@ async def test_pass1_hook_enqueues_async_followup_jobs_only():
             session_id,
         )
         hooks = {row["hook"] for row in queued}
-        assert {PASS1_5_ENTITIES, PASS3_THREADS, PASS4_IDENTITY, PASS5_LIVING_CONTEXT}.issubset(hooks)
+        triage_row = await db.fetchone(
+            """
+            SELECT raw_triage_output
+            FROM session_classifications
+            WHERE session_id=$1 AND user_id=$2
+            """,
+            session_id,
+            user_id,
+        ) or {}
+        raw = triage_row.get("raw_triage_output") if isinstance(triage_row, dict) else {}
+        run_actionable = bool((raw or {}).get("run_actionable_pass")) if isinstance(raw, dict) else False
+        identity_relevant = bool((raw or {}).get("identity_relevant")) if isinstance(raw, dict) else False
+        context_relevant = bool((raw or {}).get("context_relevant")) if isinstance(raw, dict) else False
+        required = set()
+        if run_actionable:
+            required.add(session.POST_INGEST_HOOK_PASS2_ACTIONABLE)
+        if bool((raw or {}).get("run_session_changes_pass")) if isinstance(raw, dict) else False:
+            required.add(session.POST_INGEST_HOOK_PASS2B_SESSION_CHANGES)
+        if bool((raw or {}).get("run_entity_pass")) if isinstance(raw, dict) else False:
+            required.add(session.POST_INGEST_HOOK_PASS2C_ENTITY_CANDIDATES)
+        if bool((raw or {}).get("run_threads_pass")) if isinstance(raw, dict) else False:
+            required.add(PASS3_THREADS)
+        if identity_relevant:
+            required.add(PASS4_IDENTITY)
+        if context_relevant:
+            required.add(PASS5_LIVING_CONTEXT)
+        assert required.issubset(hooks)
+
+
+@pytest.mark.asyncio
+async def test_pass1_triage_does_not_persist_actionable_candidates():
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.derived_pipeline_llm_enabled = False
+        settings.derived_pipeline_enabled = True
+        tenant_id = "default"
+        user_id = _unique("derived-user")
+        session_id = _unique("derived-session")
+        messages = [
+            {"role": "user", "text": "Remind me to call John tomorrow.", "timestamp": "2026-04-25T08:00:00Z"},
+        ]
+
+        await run_pass1_triage(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            messages=messages,
+            reference_time=datetime.now(timezone.utc),
+            settings=settings,
+        )
+
+        count = await db.fetchval(
+            """
+            SELECT COUNT(*)::int
+            FROM actionable_candidates
+            WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3
+            """,
+            tenant_id,
+            user_id,
+            session_id,
+        )
+        assert int(count or 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_pass2_actionable_requires_llm_and_does_not_use_heuristics():
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.derived_pipeline_llm_enabled = False
+        settings.derived_pipeline_enabled = True
+        tenant_id = "default"
+        user_id = _unique("derived-user")
+        session_id = _unique("derived-session")
+        messages = [
+            {"role": "user", "text": "Remind me to call John tomorrow.", "timestamp": "2026-04-25T08:00:00Z"},
+        ]
+
+        await run_pass2_actionable(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            messages=messages,
+            reference_time=datetime.now(timezone.utc),
+            settings=settings,
+        )
+
+        count = await db.fetchval(
+            """
+            SELECT COUNT(*)::int
+            FROM actionable_candidates
+            WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3
+            """,
+            tenant_id,
+            user_id,
+            session_id,
+        )
+        assert int(count or 0) == 0
 
 
 @pytest.mark.asyncio
@@ -1242,12 +1268,12 @@ async def test_pass4_and_pass5_write_rich_synthesis_fields(monkeypatch):
         assert identity["who_they_are"] == "A person rebuilding from integrity rather than approval."
         assert identity["current_chapter"] == "A period of reconstruction."
         assert identity["core_values"][0]["value"] == "integrity"
-        assert identity["assertions"]
+        assert identity["assertions"] == []
         assert living["current_focus"] == "Becoming consistent while holding relational pressure."
         assert living["primary_tension"] == "Wanting change while avoiding the deeper stakes."
         assert living["sophie_directives"][0]["directive"] == "do not flatten this into productivity advice"
         assert living["active_contradictions"][0]["topic"] == "consistency"
-        assert living["assertions"]
+        assert living["assertions"] == []
 
 
 @pytest.mark.asyncio
@@ -2596,9 +2622,94 @@ async def test_conservative_memory_audits_include_retrospective_summary():
             settings=settings,
         )
 
-        assert set(summary.keys()) == {"threads", "entities", "retrospective"}
+        assert set(summary.keys()) == {"threads", "entities", "actionable_candidates", "session_changes", "entity_candidates", "retrospective"}
         assert summary["retrospective"]["users_considered"] >= 1
         assert summary["retrospective"]["low_confidence_closed"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_actionable_candidate_audit_dismisses_placeholder_candidate(monkeypatch):
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.derived_pipeline_llm_enabled = True
+        user_id = _unique("actionable-audit-user")
+        await db.execute(
+            """
+            INSERT INTO actionable_candidates (
+                tenant_id, user_id, session_id, candidate_key, record_type, title, summary, source,
+                provenance, confidence_score, confidence_label, status, metadata
+            )
+            VALUES (
+                'default',$1,'s1','audit-key-1','task_candidate','We need to do that.','We need to do that.','chat',
+                '{}'::jsonb,0.6,'medium','detected','{}'::jsonb
+            )
+            """,
+            user_id,
+        )
+
+        async def _audit_stub(*, candidates, model):
+            assert candidates[0]["title"] == "We need to do that."
+            return [{"candidate_id": candidates[0]["candidate_id"], "action": "DISMISS", "reason": "placeholder without referent", "confidence": 0.95}]
+
+        monkeypatch.setattr(derived_pipeline, "audit_actionable_candidates", _audit_stub, raising=True)
+
+        summary = await run_actionable_candidate_audit(db=db, tenant_id="default", user_id=user_id, settings=settings)
+        row = await db.fetchone("SELECT status FROM actionable_candidates WHERE tenant_id='default' AND user_id=$1", user_id)
+        assert summary["dismissed"] >= 1
+        assert row["status"] == "dismissed"
+
+
+@pytest.mark.asyncio
+async def test_session_change_and_entity_candidate_audits_can_apply_llm_actions(monkeypatch):
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.derived_pipeline_llm_enabled = True
+        user_id = _unique("candidate-audit-user")
+        await db.execute(
+            """
+            INSERT INTO session_changes (
+                tenant_id, user_id, session_id, change_key, kind, title, summary, source,
+                provenance, confidence_score, confidence_label, status, metadata
+            )
+            VALUES (
+                'default',$1,'s1','change-key-1','focus_change','Project discussion','We discussed some project ideas.','chat',
+                '{}'::jsonb,0.6,'medium','detected','{}'::jsonb
+            )
+            """,
+            user_id,
+        )
+        await db.execute(
+            """
+            INSERT INTO entity_candidates (
+                tenant_id, user_id, session_id, candidate_key, name, candidate_type, summary, source,
+                provenance, confidence_score, confidence_label, status, metadata
+            )
+            VALUES (
+                'default',$1,'s1','entity-key-1','Someone','other','generic mention','chat',
+                '{}'::jsonb,0.4,'low','detected','{}'::jsonb
+            )
+            """,
+            user_id,
+        )
+
+        async def _session_audit_stub(*, candidates, model):
+            return [{"change_id": candidates[0]["change_id"], "action": "DISMISS", "reason": "discussion summary", "confidence": 0.95}]
+
+        async def _entity_audit_stub(*, candidates, model):
+            return [{"candidate_id": candidates[0]["candidate_id"], "action": "DISMISS", "reason": "generic non-entity", "confidence": 0.95}]
+
+        monkeypatch.setattr(derived_pipeline, "audit_session_changes", _session_audit_stub, raising=True)
+        monkeypatch.setattr(derived_pipeline, "audit_entity_candidates", _entity_audit_stub, raising=True)
+
+        session_summary = await run_session_change_audit(db=db, tenant_id="default", user_id=user_id, settings=settings)
+        entity_summary = await run_entity_candidate_audit(db=db, tenant_id="default", user_id=user_id, settings=settings)
+
+        session_row = await db.fetchone("SELECT status FROM session_changes WHERE tenant_id='default' AND user_id=$1", user_id)
+        entity_row = await db.fetchone("SELECT status FROM entity_candidates WHERE tenant_id='default' AND user_id=$1", user_id)
+        assert session_summary["dismissed"] >= 1
+        assert entity_summary["dismissed"] >= 1
+        assert session_row["status"] == "dismissed"
+        assert entity_row["status"] == "dismissed"
 
 
 @pytest.mark.asyncio
@@ -3166,7 +3277,11 @@ async def test_proactive_shadow_candidates_populate_all_three_queues():
         assert any((row.get("status") or "") == "shadow_open" for row in follow_up)
         assert any(str(row.get("candidate_key", "")).startswith("low_conf:") for row in clarification)
         assert any((row.get("status") or "") == "shadow_open" for row in clarification)
-        assert any(str(row.get("candidate_key", "")).startswith("assertion:") for row in recent_change)
+        assert any(
+            str(row.get("candidate_key", "")).startswith("thread_change:")
+            or str(row.get("candidate_key", "")).startswith("entity_change:")
+            for row in recent_change
+        )
         assert any((row.get("status") or "") == "shadow_open" for row in recent_change)
 
 
@@ -3176,6 +3291,141 @@ async def test_proactive_shadow_recent_change_lookback_includes_older_assertions
         tenant_id = "default"
         user_id = _unique("proactive-shadow-lookback-user")
         session_id = _unique("proactive-shadow-lookback-session")
+        await db.execute(
+            """
+            INSERT INTO open_threads (
+                thread_id, user_id, title, detail, status, priority, category, thread_type,
+                source_session_ids, evidence_turn_refs, distinct_session_count,
+                salience_score, importance_score, created_at, last_updated_at, last_mentioned_at
+            ) VALUES (
+                $1,$2,'Re-evaluating long-term work direction',
+                'User is re-evaluating long-term work direction.',
+                'open','medium','project','situational',$3::text[],$4::jsonb,1,
+                0.77,0.82, NOW() - interval '20 days', NOW() - interval '20 days', NOW() - interval '20 days'
+            )
+            """,
+            _unique("thread-lookback"),
+            user_id,
+            ["s20"],
+            [{"session_id": "s20", "turn_index": 0}],
+        )
+
+        seven_day = await run_proactive_shadow_candidates(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            max_users=1,
+            lookback_days=7,
+        )
+        assert seven_day["recent_change_candidates_active"] == 0
+
+        thirty_day = await run_proactive_shadow_candidates(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            max_users=1,
+            lookback_days=30,
+        )
+        assert thirty_day["recent_change_candidates_active"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_proactive_shadow_follow_up_excludes_tier3_contextual_entity_threads():
+    async with app.router.lifespan_context(app):
+        tenant_id = "default"
+        user_id = _unique("proactive-shadow-tier3-user")
+        contextual_name = "Bridge Person"
+        strong_name = "Ashley"
+
+        await db.execute(
+            """
+            INSERT INTO entity_profiles (
+                user_id, canonical_name, canonical_name_normalized, type, aliases, status,
+                relationship_to_user, profile_text, key_facts, open_questions, confidence,
+                mention_count, first_seen_at, last_seen_at, source_session_ids,
+                distinct_session_count, salience_score, importance_score
+            ) VALUES
+            (
+                $1,$2,$3,'person',$4::text[],'active','other',
+                'Acting as a bridge between user and partner family.',
+                '[]'::jsonb,'[]'::jsonb,0.9,3,NOW()-interval '20 days',NOW(),
+                $5::text[],2,0.7,0.7
+            ),
+            (
+                $1,$6,$7,'person',$8::text[],'active','girlfriend',
+                'Long-term girlfriend.',
+                '[]'::jsonb,'[]'::jsonb,0.9,6,NOW()-interval '20 days',NOW(),
+                $5::text[],4,0.9,0.9
+            )
+            """,
+            user_id,
+            contextual_name,
+            "bridge person",
+            [contextual_name],
+            ["s1"],
+            strong_name,
+            "ashley",
+            [strong_name],
+        )
+
+        await db.execute(
+            """
+            INSERT INTO open_threads (
+                thread_id, user_id, title, detail, status, priority, category, thread_type,
+                related_entities, source_session_ids, evidence_turn_refs,
+                distinct_session_count, salience_score, importance_score,
+                created_at, last_updated_at, last_mentioned_at
+            ) VALUES
+            (
+                $1,$2,'Bridge person check-in','Contextual bridge thread should be blocked.',
+                'open','high','relationship','situational',$3::text[],$4::text[],$5::jsonb,
+                1,0.9,0.9,NOW(),NOW(),NOW()
+            ),
+            (
+                $6,$2,'Ashley relationship check-in','Core relationship thread should remain.',
+                'open','high','relationship','situational',$7::text[],$4::text[],$5::jsonb,
+                1,0.9,0.9,NOW(),NOW(),NOW()
+            )
+            """,
+            _unique("thread-contextual"),
+            user_id,
+            [contextual_name],
+            ["s1"],
+            [{"session_id": "s1", "turn_index": 0}],
+            _unique("thread-strong"),
+            [strong_name],
+        )
+
+        summary = await run_proactive_shadow_candidates(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            max_users=1,
+            lookback_days=30,
+        )
+        assert summary["follow_up_candidates_active"] >= 1
+
+        rows = await db.fetch(
+            """
+            SELECT title
+            FROM follow_up_candidates
+            WHERE tenant_id=$1 AND user_id=$2 AND status='shadow_open'
+            ORDER BY candidate_id
+            """,
+            tenant_id,
+            user_id,
+        )
+        titles = [str(r.get("title") or "").lower() for r in rows]
+        assert any("ashley relationship check-in" in title for title in titles)
+        assert not any("bridge person check-in" in title for title in titles)
+
+
+@pytest.mark.asyncio
+async def test_proactive_shadow_recent_change_ignores_raw_assertions():
+    async with app.router.lifespan_context(app):
+        tenant_id = "default"
+        user_id = _unique("proactive-shadow-no-assertions-user")
+        session_id = _unique("proactive-shadow-no-assertions-session")
         run_row = await db.fetchone(
             """
             INSERT INTO pipeline_runs (
@@ -3202,36 +3452,73 @@ async def test_proactive_shadow_recent_change_lookback_includes_older_assertions
                 source_session_ids, source_turn_refs, run_id, metadata, created_at, updated_at
             ) VALUES (
                 $1,$2,$3,'memory_delta',
-                'User is re-evaluating long-term work direction.',
-                'active',0.77,0.82,0.70,0.75,$4::text[],$5::jsonb,$6,'{}'::jsonb,
-                NOW() - interval '20 days', NOW() - interval '20 days'
+                'User was born in England.',
+                'active',0.9,0.9,0.8,0.9,$4::text[],$5::jsonb,$6,'{}'::jsonb,NOW(),NOW()
             )
             """,
             tenant_id,
             user_id,
             PASS5_LIVING_CONTEXT,
-            ["s20"],
-            [{"session_id": "s20", "turn_index": 0}],
+            ["s1"],
+            [{"session_id": "s1", "turn_index": 0}],
             run_id,
         )
 
-        seven_day = await run_proactive_shadow_candidates(
-            db=db,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            max_users=1,
-            lookback_days=7,
-        )
-        assert seven_day["recent_change_candidates_active"] == 0
-
-        thirty_day = await run_proactive_shadow_candidates(
+        summary = await run_proactive_shadow_candidates(
             db=db,
             tenant_id=tenant_id,
             user_id=user_id,
             max_users=1,
             lookback_days=30,
         )
-        assert thirty_day["recent_change_candidates_active"] >= 1
+        assert summary["recent_change_candidates_active"] == 0
+
+
+@pytest.mark.asyncio
+async def test_proactive_shadow_follow_up_includes_high_value_health_loops():
+    async with app.router.lifespan_context(app):
+        tenant_id = "default"
+        user_id = _unique("proactive-shadow-loop-health-user")
+        loop_id = str(uuid.uuid4())
+
+        await db.execute(
+            """
+            INSERT INTO loops (
+                id, tenant_id, user_id, persona_id, type, status, text,
+                confidence, salience, time_horizon, metadata, updated_at, created_at
+            ) VALUES (
+                $1,$2,$3,'sophie','habit','needs_review','Drink 3 litres of water daily',
+                0.86,5,'ongoing',$4::jsonb,NOW(),NOW()
+            )
+            """,
+            loop_id,
+            tenant_id,
+            user_id,
+            {"domain": "health", "reason": "Kidney stone prevention habit."},
+        )
+
+        summary = await run_proactive_shadow_candidates(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            max_users=1,
+            lookback_days=30,
+        )
+        assert summary["follow_up_candidates_active"] >= 1
+
+        rows = await db.fetch(
+            """
+            SELECT candidate_key, source_surface, title
+            FROM follow_up_candidates
+            WHERE tenant_id=$1 AND user_id=$2 AND status='shadow_open'
+            ORDER BY candidate_id
+            """,
+            tenant_id,
+            user_id,
+        )
+        assert any(str(r.get("candidate_key", "")).startswith("loop:") for r in rows)
+        assert any((r.get("source_surface") or "") == "health_loop" for r in rows)
+        assert any("water" in str(r.get("title", "")).lower() for r in rows)
 
 
 @pytest.mark.asyncio

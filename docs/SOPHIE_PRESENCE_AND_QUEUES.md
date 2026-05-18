@@ -62,7 +62,7 @@ Every proactive moment should answer one of:
 
 ## 4. The Six Queues
 
-These queues are Postgres tables populated by Synapse pipeline runs and consumed by the presence engine. They are the structured intelligence that drives proactive behaviour.
+These queues are derived runtime tables populated by Synapse pipeline runs and consumed by the presence engine. They are structured attention artifacts, not canonical long-lived user-state primitives.
 
 ---
 

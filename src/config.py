@@ -118,6 +118,12 @@ class Settings(BaseSettings):
     proactive_shadow_candidates_interval_seconds: int = 3600
     proactive_shadow_candidates_max_users: int = 300
     proactive_shadow_recent_change_lookback_days: int = 30
+    google_workspace_mcp_url: Optional[str] = None
+    google_workspace_mcp_bearer_token: Optional[str] = None
+    google_workspace_mcp_user_email: Optional[str] = None
+    google_workspace_mcp_timeout_seconds: float = 20.0
+    google_workspace_mcp_retries: int = 1
+    google_calendar_import_enabled: bool = False
     retrieval_shadow_read_enabled: bool = False
     retrieval_shadow_read_sample_rate: float = 0.0
     retrieval_shadow_read_blocking: bool = False
@@ -128,6 +134,8 @@ class Settings(BaseSettings):
     v2_rollout_control_enabled: bool = True
     v2_rollout_eval_enabled: bool = True
     v2_rollout_eval_interval_seconds: int = 300
+    startbrief_realizer_enabled: bool = False
+    startbrief_realizer_validate_strict: bool = True
 
     # Identity cache
     identity_cache_ttl_hours: int = 6

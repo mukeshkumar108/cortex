@@ -186,7 +186,7 @@ JSON:"""
         prompt: str,
         max_tokens: int = 500,
         temperature: float = 0.7,
-        task: Literal["summary", "loops", "session_episode", "identity", "daily_analysis", "startbrief_bridge", "user_model_enrichment", "generic"] = "generic"
+        task: Literal["summary", "loops", "session_episode", "identity", "daily_analysis", "startbrief_bridge", "startbrief_realizer", "user_model_enrichment", "generic"] = "generic"
     ) -> Optional[str]:
         """
         Make a request to OpenRouter API with timeout.
@@ -212,6 +212,8 @@ JSON:"""
             elif task == "daily_analysis":
                 model = self.model_summary
             elif task == "startbrief_bridge":
+                model = self.model_summary
+            elif task == "startbrief_realizer":
                 model = self.model_summary
             elif task == "user_model_enrichment":
                 model = self.model_summary

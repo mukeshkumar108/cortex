@@ -4,6 +4,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from src.main import app, graphiti_client
+from src.config import get_settings
 from src import loops as loops_module
 from src.models import Loop
 
@@ -758,16 +759,390 @@ async def test_startbrief_structured_truth_packet_uses_graphiti_first_entity_hin
     graphiti_client.get_recent_session_summary_nodes = _stub_recent_session_summary_nodes
     monkeypatch.setattr(loops_module, "get_top_loops_for_startbrief", _stub_get_top_loops, raising=True)
     monkeypatch.setattr("src.main.db.fetchone", _stub_db_fetchone, raising=False)
-    monkeypatch.setattr("src.main._fetch_user_model_rows_for_scope", _stub_fetch_user_model_rows_for_scope, raising=True)
-    monkeypatch.setattr("src.main._build_entity_candidates", _stub_build_entity_candidates, raising=True)
+
+
+@pytest.mark.asyncio
+async def test_startbrief_returns_ranked_loops_when_valid_open_threads_exist(monkeypatch):
+    now_dt = datetime(2026, 2, 10, 9, 0, tzinfo=timezone.utc)
+    now = now_dt.isoformat().replace("+00:00", "Z")
+    summaries = [_base_summary((now_dt - timedelta(hours=1)).isoformat().replace("+00:00", "Z"), session_id="s-ranked-loops")]
+
+    async def _stub_recent_summaries(*_args, **_kwargs):
+        return summaries
+
+    async def _stub_get_top_loops(*_args, **_kwargs):
+        return [
+            _loop("Finalize Sophie checkpoint", salience=6, horizon="today", now_iso=now),
+            _loop("Review Ashley schedule", salience=5, horizon="today", now_iso=now),
+        ]
+
+    async def _stub_db_fetchone(query, *_args, **_kwargs):
+        if "FROM identity_profile" in query:
+            return {"current_chapter": "building phase", "what_they_want": "ship with quality"}
+        if "count(*) AS sessions_today" in query:
+            return {"sessions_today": 1}
+        return None
+
+    monkeypatch.setattr("src.main._load_recent_session_summaries_from_classifications", _stub_recent_summaries, raising=True)
+    monkeypatch.setattr(loops_module, "get_top_loops_for_startbrief", _stub_get_top_loops, raising=True)
+    monkeypatch.setattr("src.main.db.fetchone", _stub_db_fetchone, raising=False)
 
     async with app.router.lifespan_context(app):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             data = await _make_request(client, now)
-            assert data["narrative"] is None
-            assert len(data["entity_hints"]) == 5
-            assert data["entity_hints"][0]["importance"] == "high"
-            assert data["ops_context"]["user_model_hints"] == []
-            assert data["ops_context"]["yesterday_themes"] == []
-            assert data["ops_context"]["recent_changes"]
-            assert "mukesh" in data["handover_text"].lower()
+            loop_ranking = data["evidence"]["loop_ranking"]
+            assert len(loop_ranking) >= 1
+            assert float(loop_ranking[0]["score"]) >= float(loop_ranking[-1]["score"])
+            traces = [x for x in (data["evidence"].get("selection_trace") or []) if x.get("type") == "loop"]
+            assert traces
+            assert traces[0].get("why", {}).get("passed_threshold") is True
+
+
+@pytest.mark.asyncio
+async def test_startbrief_returns_ranked_claims_when_claim_identity_living_inputs_exist(monkeypatch):
+    now_dt = datetime(2026, 2, 10, 9, 0, tzinfo=timezone.utc)
+    now = now_dt.isoformat().replace("+00:00", "Z")
+    summaries = [
+        _base_summary((now_dt - timedelta(hours=1)).isoformat().replace("+00:00", "Z"), session_id="s-claim-1"),
+        _base_summary((now_dt - timedelta(hours=3)).isoformat().replace("+00:00", "Z"), session_id="s-claim-2"),
+    ]
+
+    async def _stub_recent_summaries(*_args, **_kwargs):
+        return summaries
+
+    async def _stub_get_top_loops(*_args, **_kwargs):
+        return [_loop("Complete roadmap checkpoint", salience=6, horizon="today", now_iso=now)]
+
+    async def _stub_db_fetchone(query, *_args, **_kwargs):
+        if "FROM identity_profile" in query:
+            return {"current_chapter": "synapse v2 hardening", "what_they_want": "tight memory serving"}
+        if "count(*) AS sessions_today" in query:
+            return {"sessions_today": 1}
+        return None
+
+    monkeypatch.setattr("src.main._load_recent_session_summaries_from_classifications", _stub_recent_summaries, raising=True)
+    monkeypatch.setattr(loops_module, "get_top_loops_for_startbrief", _stub_get_top_loops, raising=True)
+    monkeypatch.setattr("src.main.db.fetchone", _stub_db_fetchone, raising=False)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            data = await _make_request(client, now)
+            claim_ranking = data["evidence"]["claim_ranking"]
+            assert len(claim_ranking) >= 1
+            traces = [x for x in (data["evidence"].get("selection_trace") or []) if x.get("type") == "claim"]
+            assert traces
+            assert "components" in traces[0].get("why", {})
+
+
+@pytest.mark.asyncio
+async def test_startbrief_stale_or_contradicted_items_rank_lower(monkeypatch):
+    now_dt = datetime(2026, 2, 10, 9, 0, tzinfo=timezone.utc)
+    now = now_dt.isoformat().replace("+00:00", "Z")
+    fresh = _base_summary((now_dt - timedelta(hours=1)).isoformat().replace("+00:00", "Z"), session_id="s-fresh")
+    fresh["summary_text"] = "They reconciled and are back together with Ashley."
+    fresh["attributes"]["summary_facts"] = fresh["summary_text"]
+    stale_conflicted = _base_summary((now_dt - timedelta(hours=8)).isoformat().replace("+00:00", "Z"), session_id="s-stale")
+    stale_conflicted["summary_text"] = "He broke up with Ashley and is uncertain about reconciling."
+    stale_conflicted["attributes"]["summary_facts"] = stale_conflicted["summary_text"]
+
+    async def _stub_recent_summaries(*_args, **_kwargs):
+        return [stale_conflicted, fresh]
+
+    async def _stub_get_top_loops(*_args, **_kwargs):
+        return [_loop("Protect focus blocks this week", salience=6, horizon="today", now_iso=now)]
+
+    async def _stub_fetch_user_model_rows_for_scope(*_args, **_kwargs):
+        return [{"model": {"key_relationships": [{"name": "Ashley", "status": "active"}]}}]
+
+    async def _stub_db_fetchone(query, *_args, **_kwargs):
+        if "FROM identity_profile" in query:
+            return {"current_chapter": "stability sprint", "what_they_want": "reduce drift"}
+        if "count(*) AS sessions_today" in query:
+            return {"sessions_today": 1}
+        return None
+
+    monkeypatch.setattr("src.main._load_recent_session_summaries_from_classifications", _stub_recent_summaries, raising=True)
+    monkeypatch.setattr("src.main._fetch_user_model_rows_for_scope", _stub_fetch_user_model_rows_for_scope, raising=True)
+    monkeypatch.setattr(loops_module, "get_top_loops_for_startbrief", _stub_get_top_loops, raising=True)
+    monkeypatch.setattr("src.main.db.fetchone", _stub_db_fetchone, raising=False)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            data = await _make_request(client, now)
+            claim_ranking = data["evidence"]["claim_ranking"]
+            assert len(claim_ranking) >= 2
+            assert float(claim_ranking[0]["score"]) > float(claim_ranking[1]["score"])
+            assert float(claim_ranking[1].get("contradiction_penalty") or 0.0) < 0.0
+
+
+@pytest.mark.asyncio
+async def test_startbrief_empty_state_returns_safe_minimal_startbrief(monkeypatch):
+    now_dt = datetime(2026, 2, 10, 9, 0, tzinfo=timezone.utc)
+    now = now_dt.isoformat().replace("+00:00", "Z")
+
+    async def _stub_recent_summaries(*_args, **_kwargs):
+        return []
+
+    async def _stub_get_top_loops(*_args, **_kwargs):
+        return []
+
+    async def _stub_db_fetchone(query, *_args, **_kwargs):
+        if "count(*) AS sessions_today" in query:
+            return {"sessions_today": 0}
+        return None
+
+    monkeypatch.setattr("src.main._load_recent_session_summaries_from_classifications", _stub_recent_summaries, raising=True)
+    monkeypatch.setattr(loops_module, "get_top_loops_for_startbrief", _stub_get_top_loops, raising=True)
+    monkeypatch.setattr("src.main.db.fetchone", _stub_db_fetchone, raising=False)
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            data = await _make_request(client, now)
+            assert data["handover_text"]
+            assert isinstance(data["evidence"].get("claim_ranking"), list)
+            assert isinstance(data["evidence"].get("loop_ranking"), list)
+            assert (data["evidence"].get("selection_trace") or []) == []
+
+
+@pytest.mark.asyncio
+async def test_startbrief_realizer_grounded_uses_selected_evidence(monkeypatch):
+    settings = get_settings()
+    prev_enabled = settings.startbrief_realizer_enabled
+    prev_strict = settings.startbrief_realizer_validate_strict
+    settings.startbrief_realizer_enabled = True
+    settings.startbrief_realizer_validate_strict = True
+    try:
+        now_dt = datetime(2026, 2, 10, 9, 0, tzinfo=timezone.utc)
+        now = now_dt.isoformat().replace("+00:00", "Z")
+        summaries = [_base_summary((now_dt - timedelta(hours=1)).isoformat().replace("+00:00", "Z"), session_id="s-realizer-1")]
+
+        async def _stub_recent_summaries(*_args, **_kwargs):
+            return summaries
+
+        async def _stub_get_top_loops(*_args, **_kwargs):
+            return [_loop("Finalize Sophie checkpoint", salience=6, horizon="today", now_iso=now)]
+
+        async def _stub_db_fetchone(query, *_args, **_kwargs):
+            if "FROM identity_profile" in query:
+                return {"current_chapter": "build phase", "what_they_want": "ship carefully"}
+            if "count(*) AS sessions_today" in query:
+                return {"sessions_today": 1}
+            return None
+
+        async def _stub_realize(**kwargs):
+            rows = kwargs.get("evidence_rows") or []
+            loop_id = next((r.get("evidence_id") for r in rows if r.get("type") == "loop"), None)
+            claim_id = next((r.get("evidence_id") for r in rows if r.get("type") == "claim"), None)
+            return {
+                "handover_lines": [
+                    {"line": "The active thread is to finalize the Sophie checkpoint.", "evidence_ids": [loop_id]},
+                    {"line": "They narrowed the next focus in the same thread.", "evidence_ids": [claim_id]},
+                ],
+                "ops_context_lines": [
+                    {"line": "Checkpoint execution remains active.", "evidence_ids": [loop_id]},
+                ],
+            }
+
+        monkeypatch.setattr("src.main._load_recent_session_summaries_from_classifications", _stub_recent_summaries, raising=True)
+        monkeypatch.setattr(loops_module, "get_top_loops_for_startbrief", _stub_get_top_loops, raising=True)
+        monkeypatch.setattr("src.main.db.fetchone", _stub_db_fetchone, raising=False)
+        monkeypatch.setattr("src.main._realize_startbrief_from_selected_evidence", _stub_realize, raising=True)
+
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                data = await _make_request(client, now)
+                assert data["evidence"]["realizer"]["used"] is True
+                assert data["evidence"]["realizer"]["valid"] is True
+                assert data["evidence"]["realizer"]["line_refs"]
+                assert "finalize the sophie checkpoint" in data["handover_text"].lower()
+    finally:
+        settings.startbrief_realizer_enabled = prev_enabled
+        settings.startbrief_realizer_validate_strict = prev_strict
+
+
+@pytest.mark.asyncio
+async def test_startbrief_realizer_rejects_unsupported_generated_claim(monkeypatch):
+    settings = get_settings()
+    prev_enabled = settings.startbrief_realizer_enabled
+    prev_strict = settings.startbrief_realizer_validate_strict
+    settings.startbrief_realizer_enabled = True
+    settings.startbrief_realizer_validate_strict = True
+    try:
+        now_dt = datetime(2026, 2, 10, 9, 0, tzinfo=timezone.utc)
+        now = now_dt.isoformat().replace("+00:00", "Z")
+        summaries = [_base_summary((now_dt - timedelta(hours=1)).isoformat().replace("+00:00", "Z"), session_id="s-realizer-2")]
+
+        async def _stub_recent_summaries(*_args, **_kwargs):
+            return summaries
+
+        async def _stub_get_top_loops(*_args, **_kwargs):
+            return [_loop("Finalize Sophie checkpoint", salience=6, horizon="today", now_iso=now)]
+
+        async def _stub_db_fetchone(query, *_args, **_kwargs):
+            if "FROM identity_profile" in query:
+                return {"current_chapter": "build phase", "what_they_want": "ship carefully"}
+            if "count(*) AS sessions_today" in query:
+                return {"sessions_today": 1}
+            return None
+
+        async def _stub_realize(**kwargs):
+            rows = kwargs.get("evidence_rows") or []
+            loop_id = next((r.get("evidence_id") for r in rows if r.get("type") == "loop"), None)
+            return {
+                "handover_lines": [
+                    {"line": "The user booked flights to Tokyo next month.", "evidence_ids": [loop_id]},
+                ],
+                "ops_context_lines": [],
+            }
+
+        monkeypatch.setattr("src.main._load_recent_session_summaries_from_classifications", _stub_recent_summaries, raising=True)
+        monkeypatch.setattr(loops_module, "get_top_loops_for_startbrief", _stub_get_top_loops, raising=True)
+        monkeypatch.setattr("src.main.db.fetchone", _stub_db_fetchone, raising=False)
+        monkeypatch.setattr("src.main._realize_startbrief_from_selected_evidence", _stub_realize, raising=True)
+
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                data = await _make_request(client, now)
+                assert data["evidence"]["realizer"]["used"] is False
+                assert "unsupported_fact" in (data["evidence"]["realizer"]["errors"] or [])
+                assert "top active loop" in data["handover_text"].lower()
+    finally:
+        settings.startbrief_realizer_enabled = prev_enabled
+        settings.startbrief_realizer_validate_strict = prev_strict
+
+
+@pytest.mark.asyncio
+async def test_startbrief_realizer_rejects_malformed_time_phrase(monkeypatch):
+    settings = get_settings()
+    prev_enabled = settings.startbrief_realizer_enabled
+    prev_strict = settings.startbrief_realizer_validate_strict
+    settings.startbrief_realizer_enabled = True
+    settings.startbrief_realizer_validate_strict = True
+    try:
+        now_dt = datetime(2026, 2, 10, 9, 0, tzinfo=timezone.utc)
+        now = now_dt.isoformat().replace("+00:00", "Z")
+        summaries = [_base_summary((now_dt - timedelta(hours=1)).isoformat().replace("+00:00", "Z"), session_id="s-realizer-3")]
+
+        async def _stub_recent_summaries(*_args, **_kwargs):
+            return summaries
+
+        async def _stub_get_top_loops(*_args, **_kwargs):
+            return [_loop("Finalize Sophie checkpoint", salience=6, horizon="today", now_iso=now)]
+
+        async def _stub_db_fetchone(query, *_args, **_kwargs):
+            if "FROM identity_profile" in query:
+                return {"current_chapter": "build phase", "what_they_want": "ship carefully"}
+            if "count(*) AS sessions_today" in query:
+                return {"sessions_today": 1}
+            return None
+
+        async def _stub_realize(**kwargs):
+            rows = kwargs.get("evidence_rows") or []
+            loop_id = next((r.get("evidence_id") for r in rows if r.get("type") == "loop"), None)
+            return {
+                "handover_lines": [
+                    {"line": "It has been about about 4 hours since last spoke.", "evidence_ids": [loop_id]},
+                ],
+                "ops_context_lines": [],
+            }
+
+        monkeypatch.setattr("src.main._load_recent_session_summaries_from_classifications", _stub_recent_summaries, raising=True)
+        monkeypatch.setattr(loops_module, "get_top_loops_for_startbrief", _stub_get_top_loops, raising=True)
+        monkeypatch.setattr("src.main.db.fetchone", _stub_db_fetchone, raising=False)
+        monkeypatch.setattr("src.main._realize_startbrief_from_selected_evidence", _stub_realize, raising=True)
+
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                data = await _make_request(client, now)
+                assert data["evidence"]["realizer"]["used"] is False
+                assert "awkward_time_phrase" in (data["evidence"]["realizer"]["errors"] or [])
+    finally:
+        settings.startbrief_realizer_enabled = prev_enabled
+        settings.startbrief_realizer_validate_strict = prev_strict
+
+
+@pytest.mark.asyncio
+async def test_startbrief_realizer_fallback_on_failure(monkeypatch):
+    settings = get_settings()
+    prev_enabled = settings.startbrief_realizer_enabled
+    prev_strict = settings.startbrief_realizer_validate_strict
+    settings.startbrief_realizer_enabled = True
+    settings.startbrief_realizer_validate_strict = True
+    try:
+        now_dt = datetime(2026, 2, 10, 9, 0, tzinfo=timezone.utc)
+        now = now_dt.isoformat().replace("+00:00", "Z")
+        summaries = [_base_summary((now_dt - timedelta(hours=1)).isoformat().replace("+00:00", "Z"), session_id="s-realizer-4")]
+
+        async def _stub_recent_summaries(*_args, **_kwargs):
+            return summaries
+
+        async def _stub_get_top_loops(*_args, **_kwargs):
+            return [_loop("Finalize Sophie checkpoint", salience=6, horizon="today", now_iso=now)]
+
+        async def _stub_db_fetchone(query, *_args, **_kwargs):
+            if "FROM identity_profile" in query:
+                return {"current_chapter": "build phase", "what_they_want": "ship carefully"}
+            if "count(*) AS sessions_today" in query:
+                return {"sessions_today": 1}
+            return None
+
+        async def _stub_realize(**_kwargs):
+            raise RuntimeError("realizer failure")
+
+        monkeypatch.setattr("src.main._load_recent_session_summaries_from_classifications", _stub_recent_summaries, raising=True)
+        monkeypatch.setattr(loops_module, "get_top_loops_for_startbrief", _stub_get_top_loops, raising=True)
+        monkeypatch.setattr("src.main.db.fetchone", _stub_db_fetchone, raising=False)
+        monkeypatch.setattr("src.main._realize_startbrief_from_selected_evidence", _stub_realize, raising=True)
+
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                data = await _make_request(client, now)
+                assert data["handover_text"]
+                assert data["evidence"]["realizer"]["used"] is False
+                assert "no_realization" in (data["evidence"]["realizer"]["errors"] or [])
+    finally:
+        settings.startbrief_realizer_enabled = prev_enabled
+        settings.startbrief_realizer_validate_strict = prev_strict
+
+
+@pytest.mark.asyncio
+async def test_startbrief_realizer_flag_off_preserves_behavior(monkeypatch):
+    settings = get_settings()
+    prev_enabled = settings.startbrief_realizer_enabled
+    prev_strict = settings.startbrief_realizer_validate_strict
+    settings.startbrief_realizer_enabled = False
+    settings.startbrief_realizer_validate_strict = True
+    try:
+        now_dt = datetime(2026, 2, 10, 9, 0, tzinfo=timezone.utc)
+        now = now_dt.isoformat().replace("+00:00", "Z")
+        summaries = [_base_summary((now_dt - timedelta(hours=1)).isoformat().replace("+00:00", "Z"), session_id="s-realizer-5")]
+
+        async def _stub_recent_summaries(*_args, **_kwargs):
+            return summaries
+
+        async def _stub_get_top_loops(*_args, **_kwargs):
+            return [_loop("Finalize Sophie checkpoint", salience=6, horizon="today", now_iso=now)]
+
+        async def _stub_db_fetchone(query, *_args, **_kwargs):
+            if "FROM identity_profile" in query:
+                return {"current_chapter": "build phase", "what_they_want": "ship carefully"}
+            if "count(*) AS sessions_today" in query:
+                return {"sessions_today": 1}
+            return None
+
+        async def _stub_realize(**_kwargs):
+            raise AssertionError("realizer should not be called when flag is off")
+
+        monkeypatch.setattr("src.main._load_recent_session_summaries_from_classifications", _stub_recent_summaries, raising=True)
+        monkeypatch.setattr(loops_module, "get_top_loops_for_startbrief", _stub_get_top_loops, raising=True)
+        monkeypatch.setattr("src.main.db.fetchone", _stub_db_fetchone, raising=False)
+        monkeypatch.setattr("src.main._realize_startbrief_from_selected_evidence", _stub_realize, raising=True)
+
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                data = await _make_request(client, now)
+                assert data["evidence"]["realizer"]["enabled"] is False
+                assert data["evidence"]["realizer"]["used"] is False
+    finally:
+        settings.startbrief_realizer_enabled = prev_enabled
+        settings.startbrief_realizer_validate_strict = prev_strict

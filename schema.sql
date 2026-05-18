@@ -795,6 +795,258 @@ CREATE TABLE IF NOT EXISTS recent_change_candidates (
 CREATE INDEX IF NOT EXISTS idx_recent_change_candidates_user_status
   ON recent_change_candidates (tenant_id, user_id, status, priority_score DESC, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS actionable_candidates (
+  candidate_id BIGSERIAL PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  user_id TEXT NOT NULL,
+  session_id TEXT,
+  run_id BIGINT REFERENCES pipeline_runs(run_id),
+  candidate_key TEXT NOT NULL,
+  record_type TEXT NOT NULL
+    CHECK (record_type IN ('event_candidate','task_candidate','reminder_candidate','commitment')),
+  candidate_subtype TEXT
+    CHECK (candidate_subtype IN ('todo','reminder','calendar_event','habit','follow_up','waiting_on','nudge')),
+  title TEXT NOT NULL,
+  summary TEXT,
+  due_iso TIMESTAMPTZ,
+  proposed_due_at TIMESTAMPTZ,
+  proposed_remind_at TIMESTAMPTZ,
+  relevant_from_iso TIMESTAMPTZ,
+  relevant_until_iso TIMESTAMPTZ,
+  waiting_on TEXT,
+  needs_response BOOLEAN,
+  cadence_text TEXT,
+  suggested_action TEXT,
+  linked_external_id TEXT,
+  linked_external_type TEXT,
+  source TEXT NOT NULL DEFAULT 'chat',
+  provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+  confidence_score DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+  confidence NUMERIC,
+  confidence_label TEXT NOT NULL DEFAULT 'medium'
+    CHECK (confidence_label IN ('low','medium','high')),
+  status TEXT NOT NULL DEFAULT 'detected'
+    CHECK (status IN ('detected','confirmed','dismissed','expired','needs_review','acted_on','superseded','stale')),
+  promoted_action_item_id UUID,
+  provenance_summary TEXT,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (tenant_id, user_id, candidate_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_actionable_candidates_user_status_due
+  ON actionable_candidates (tenant_id, user_id, status, due_iso NULLS LAST, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_actionable_candidates_user_type_status
+  ON actionable_candidates (tenant_id, user_id, record_type, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_actionable_candidates_user_status_relevance
+  ON actionable_candidates (tenant_id, user_id, status, relevant_from_iso NULLS LAST, relevant_until_iso NULLS LAST, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS action_items (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  user_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('todo','reminder','habit')),
+  title TEXT NOT NULL,
+  notes TEXT,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','done','cancelled','dismissed','archived')),
+  due_at TIMESTAMPTZ,
+  remind_at TIMESTAMPTZ,
+  recurrence_rule TEXT,
+  source_type TEXT NOT NULL DEFAULT 'direct_user' CHECK (source_type IN ('direct_user','candidate_promotion','external_import','system')),
+  source_ref JSONB,
+  confidence NUMERIC,
+  provenance_summary TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  completed_at TIMESTAMPTZ,
+  dismissed_at TIMESTAMPTZ,
+  cancelled_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_items_user_status_due
+  ON action_items (tenant_id, user_id, status, due_at NULLS LAST, remind_at NULLS LAST, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS action_updates (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  user_id TEXT NOT NULL,
+  target_action_item_id UUID NOT NULL REFERENCES action_items(id) ON DELETE CASCADE,
+  proposed_change TEXT NOT NULL CHECK (proposed_change IN ('mark_done','cancel','reschedule','snooze','dismiss')),
+  proposed_due_at TIMESTAMPTZ,
+  proposed_remind_at TIMESTAMPTZ,
+  evidence_summary TEXT,
+  confidence NUMERIC,
+  status TEXT NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed','applied','rejected','expired')),
+  source_type TEXT,
+  source_ref JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  applied_at TIMESTAMPTZ,
+  rejected_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_updates_user_status
+  ON action_updates (tenant_id, user_id, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS action_audit_log (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  user_id TEXT NOT NULL,
+  object_type TEXT NOT NULL CHECK (object_type IN ('action_item','action_candidate','action_update')),
+  object_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  old_value JSONB,
+  new_value JSONB,
+  actor TEXT NOT NULL CHECK (actor IN ('sophie','synapse','system','user','extractor')),
+  reason TEXT,
+  provenance_summary TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_audit_log_user_created
+  ON action_audit_log (tenant_id, user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS calendar_items (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  user_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT,
+  notes TEXT,
+  starts_at TIMESTAMPTZ NOT NULL,
+  ends_at TIMESTAMPTZ,
+  timezone TEXT NOT NULL DEFAULT 'UTC',
+  all_day BOOLEAN NOT NULL DEFAULT FALSE,
+  location TEXT,
+  participants JSONB NOT NULL DEFAULT '[]'::jsonb,
+  organizer JSONB,
+  rsvp_status TEXT NOT NULL DEFAULT 'unknown'
+    CHECK (rsvp_status IN ('unknown','needs_action','accepted','declined','tentative')),
+  status TEXT NOT NULL DEFAULT 'confirmed'
+    CHECK (status IN ('confirmed','cancelled','archived')),
+  source_kind TEXT NOT NULL DEFAULT 'manual'
+    CHECK (source_kind IN ('manual','chat','email','whatsapp','instagram','google_calendar','system','candidate_promotion')),
+  source_ref JSONB,
+  evidence_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
+  provenance_summary TEXT,
+  confidence NUMERIC,
+  external_provider TEXT,
+  external_id TEXT,
+  external_calendar_id TEXT,
+  external_etag TEXT,
+  external_updated_at TIMESTAMPTZ,
+  sync_status TEXT NOT NULL DEFAULT 'not_synced'
+    CHECK (sync_status IN ('not_synced','synced','pending_create','pending_update','pending_delete','conflict','imported')),
+  recurrence_rule TEXT,
+  recurrence_parent_id UUID REFERENCES calendar_items(id) ON DELETE SET NULL,
+  dedupe_key TEXT,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  cancelled_at TIMESTAMPTZ,
+  archived_at TIMESTAMPTZ,
+  CHECK (ends_at IS NULL OR ends_at > starts_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_calendar_items_user_range
+  ON calendar_items (tenant_id, user_id, starts_at, ends_at);
+
+CREATE INDEX IF NOT EXISTS idx_calendar_items_user_status_range
+  ON calendar_items (tenant_id, user_id, status, starts_at);
+
+CREATE INDEX IF NOT EXISTS idx_calendar_items_user_source
+  ON calendar_items (tenant_id, user_id, source_kind, updated_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS calendar_items_external_unique
+  ON calendar_items (tenant_id, user_id, external_provider, external_id)
+  WHERE external_provider IS NOT NULL AND external_id IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS calendar_items_dedupe_unique
+  ON calendar_items (tenant_id, user_id, dedupe_key)
+  WHERE dedupe_key IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS calendar_audit_log (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  user_id TEXT NOT NULL,
+  object_type TEXT NOT NULL CHECK (object_type IN ('calendar_item','calendar_sync')),
+  object_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  old_value JSONB,
+  new_value JSONB,
+  actor TEXT NOT NULL CHECK (actor IN ('sophie','synapse','system','user','external_provider')),
+  reason TEXT,
+  provenance_summary TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_calendar_audit_log_user_created
+  ON calendar_audit_log (tenant_id, user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS session_changes (
+  change_id BIGSERIAL PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  user_id TEXT NOT NULL,
+  session_id TEXT,
+  run_id BIGINT REFERENCES pipeline_runs(run_id),
+  change_key TEXT NOT NULL,
+  kind TEXT NOT NULL
+    CHECK (kind IN ('factual_update','state_change','decision_change','schedule_change','focus_change')),
+  title TEXT NOT NULL,
+  summary TEXT,
+  effective_iso TIMESTAMPTZ,
+  source TEXT NOT NULL DEFAULT 'chat',
+  provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+  confidence_score DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+  confidence_label TEXT NOT NULL DEFAULT 'medium'
+    CHECK (confidence_label IN ('low','medium','high')),
+  status TEXT NOT NULL DEFAULT 'detected'
+    CHECK (status IN ('detected','needs_review','confirmed','dismissed','superseded','stale')),
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (tenant_id, user_id, change_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_changes_user_status_effective
+  ON session_changes (tenant_id, user_id, status, effective_iso NULLS LAST, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_session_changes_user_kind_status
+  ON session_changes (tenant_id, user_id, kind, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS entity_candidates (
+  candidate_id BIGSERIAL PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  user_id TEXT NOT NULL,
+  session_id TEXT,
+  run_id BIGINT REFERENCES pipeline_runs(run_id),
+  candidate_key TEXT NOT NULL,
+  name TEXT NOT NULL,
+  candidate_type TEXT NOT NULL
+    CHECK (candidate_type IN ('person','project','place','other')),
+  summary TEXT,
+  source TEXT NOT NULL DEFAULT 'chat',
+  provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+  confidence_score DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+  confidence_label TEXT NOT NULL DEFAULT 'medium'
+    CHECK (confidence_label IN ('low','medium','high')),
+  status TEXT NOT NULL DEFAULT 'detected'
+    CHECK (status IN ('detected','needs_review','resolved','dismissed','superseded')),
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (tenant_id, user_id, candidate_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_candidates_user_status_updated
+  ON entity_candidates (tenant_id, user_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_entity_candidates_user_type_status
+  ON entity_candidates (tenant_id, user_id, candidate_type, status, updated_at DESC);
+
 -- Lightweight temporal reinforcement for derived memory.
 ALTER TABLE entity_profiles
   ADD COLUMN IF NOT EXISTS distinct_session_count INT NOT NULL DEFAULT 0;
