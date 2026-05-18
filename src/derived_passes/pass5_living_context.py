@@ -168,14 +168,16 @@ async def synthesize_living_context(
     import json
     session_payload = []
     for row in recent_sessions:
-        raw = row.get("raw_triage_output") if isinstance(row.get("raw_triage_output"), dict) else {}
         session_payload.append({
             "session_id": row.get("session_id"),
             "session_date": row.get("session_date"),
             "user_excerpt": row.get("user_excerpt"),
             "routing_hints": row.get("routing_hints") or {
-                "memory_deltas": as_list(raw.get("memory_deltas")),
-                "thread_signals": as_list(raw.get("thread_signals")),
+                "context_relevant": bool(row.get("context_relevant")),
+                "run_threads_pass": bool(row.get("run_threads_pass")),
+                "session_kind": clean_text(row.get("session_kind")) or None,
+                "emotional_weight": clean_text(row.get("emotional_weight")) or None,
+                "tension_signal": clean_text(row.get("tension_signal")) or None,
             },
         })
     prompt = LIVING_CONTEXT_PROMPT.format(

@@ -37,7 +37,7 @@ async def test_openrouter_model_routing(monkeypatch):
     monkeypatch.setenv("OPENROUTER_MODEL_SUMMARY", "amazon/nova-micro")
     monkeypatch.setenv("OPENROUTER_MODEL_LOOPS", "xiaomi/mimo-v2-flash")
     monkeypatch.setenv("OPENROUTER_MODEL_SESSION_EPISODE", "xiaomi/mimo-v2-flash")
-    monkeypatch.setenv("OPENROUTER_MODEL_FALLBACK", "mistral/ministral-3b")
+    monkeypatch.setenv("OPENROUTER_MODEL_FALLBACK", "mistralai/ministral-3b-2512")
     get_settings.cache_clear()
 
     def _client_factory(*_args, **_kwargs):
@@ -57,3 +57,5 @@ async def test_openrouter_model_routing(monkeypatch):
     assert models[1] == "xiaomi/mimo-v2-flash"
     assert models[2] == "xiaomi/mimo-v2-flash"
     assert models[3] == client.model
+    assert client.model_fallback == "mistralai/ministral-3b-2512"
+    assert client.model_fallback != "mistral/ministral-3b"

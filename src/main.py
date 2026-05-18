@@ -47,8 +47,23 @@ from .models import (
     UserModelPatchRequest,
     UserModelResponse,
     DailyAnalysisResponse,
+    ActionableCandidateItem,
+    DailyCandidatesResponse,
+    ReviewQueueResponse,
+    SessionChangeItem,
+    SessionChangesResponse,
+    EntityCandidateItem,
+    EntityCandidatesResponse,
     HabitDailyLogUpsertRequest,
     HabitDailyLogUpsertResponse,
+    ActionItemCreateRequest,
+    ActionItemStatusUpdateRequest,
+    ActionItemPatchRequest,
+    CandidatePromotionRequest,
+    DailyAgendaResponse,
+    CalendarItemCreateRequest,
+    CalendarItemPatchRequest,
+    GoogleCalendarImportRequest,
 )
 from .declared_profile_truth import (
     build_declared_profile_truth_change_summary,
@@ -98,12 +113,17 @@ from .claim_resolution import ClaimResolver
 from .derived_pipeline import (
     PASS1_5_ENTITIES,
     PASS1_TRIAGE,
+    PASS2B_SESSION_CHANGES,
+    PASS2C_ENTITY_CANDIDATES,
     PASS3_THREADS,
     PASS4_IDENTITY,
     PASS5_LIVING_CONTEXT,
     bump_memory_access,
     run_pass1_5_entities,
     run_pass1_triage,
+    run_pass2_actionable,
+    run_pass2b_session_changes,
+    run_pass2c_entity_candidates,
     run_pass3_threads,
     run_pass4_identity,
     run_pass5_living_context,
@@ -116,6 +136,30 @@ from .relationship_tiers import always_on_people_allowed, entity_relationship_ti
 from .retrieval_shadow import build_shadow_diff, persist_shadow_diff, persist_shadow_error
 from .invariants import InvariantManager
 from .rollout import RolloutController, ROUTE_LEGACY, ROUTE_SHADOW, ROUTE_V2
+from .action_state import (
+    ActionStateError,
+    archiveActionItem,
+    createActionItem,
+    listActionItems,
+    updateActionItem,
+    updateActionItemStatus,
+    markActionItemDone,
+    dismissActionItem,
+    cancelActionItem,
+    promoteCandidateToActionItem,
+    listDailyAgenda,
+    maybeAutoPromoteCandidate,
+)
+from .calendar_state import (
+    CalendarStateError,
+    archiveCalendarItem,
+    cancelCalendarItem,
+    createCalendarItem,
+    listCalendarItems,
+    updateCalendarItem,
+)
+from .day_brief import DayBriefError, buildDayBrief
+from .google_calendar_import import GoogleCalendarImportError, import_google_calendar_events
 
 # Configure logging
 logging.basicConfig(
@@ -399,7 +443,8 @@ async def _episodic_search(
           session_date,
           session_kind,
           emotional_weight,
-          raw_triage_output->'memory_deltas' AS deltas,
+          one_line_summary,
+          tension_signal,
           1 - (memory_delta_embedding <=> $1::vector) AS similarity
         FROM session_classifications
         WHERE user_id = $2
@@ -420,7 +465,7 @@ async def _episodic_search(
                 "session_date": row.get("session_date").isoformat() if isinstance(row.get("session_date"), datetime) else _normalize_text(row.get("session_date")),
                 "session_kind": _normalize_text(row.get("session_kind")),
                 "emotional_weight": _normalize_text(row.get("emotional_weight")),
-                "memory_deltas": row.get("deltas") if isinstance(row.get("deltas"), list) else [],
+                "summary": _normalize_text(row.get("one_line_summary")) or _normalize_text(row.get("tension_signal")),
                 "similarity": float(row.get("similarity") or 0.0),
             }
         )
@@ -2480,7 +2525,7 @@ async def _pg_get_entity_continuity_facts(
 
     session_rows = await db.fetch(
         """
-        SELECT session_date, raw_triage_output->'memory_deltas' AS deltas
+        SELECT session_date, one_line_summary, tension_signal, raw_triage_output->'thread_signals' AS thread_signals
         FROM session_classifications
         WHERE user_id = $1
           AND EXISTS (
@@ -2495,11 +2540,12 @@ async def _pg_get_entity_continuity_facts(
         canonical_name,
     )
     for row in session_rows or []:
-        deltas = row.get("deltas")
-        if not isinstance(deltas, list):
-            continue
-        for delta in deltas:
-            text = _normalize_text(delta)
+        candidates = [
+            _normalize_text(row.get("one_line_summary")),
+            _normalize_text(row.get("tension_signal")),
+            *[_normalize_text(item) for item in (row.get("thread_signals") if isinstance(row.get("thread_signals"), list) else [])],
+        ]
+        for text in candidates:
             if not text:
                 continue
             if canonical_name.lower() not in text.lower():
@@ -2743,7 +2789,7 @@ async def _pg_search_nodes(
     session_rows = await db.fetch(
         """
         SELECT session_id, session_date, one_line_summary, session_kind, emotional_weight,
-               tension_signal, raw_triage_output->'memory_deltas' AS deltas,
+               tension_signal,
                raw_triage_output->'thread_signals' AS thread_signals,
                entity_mentions, processed_at
         FROM session_classifications
@@ -2758,16 +2804,14 @@ async def _pg_search_nodes(
         node_type = "event"
         if not _allowed_node_type(node_type, allowed_types):
             continue
-        deltas = row.get("deltas")
-        if not isinstance(deltas, list):
-            deltas = []
-        summary = _normalize_text(row.get("one_line_summary")) or _normalize_text(deltas[0] if deltas else None) or _normalize_text(row.get("tension_signal"))
+        thread_signals = row.get("thread_signals") if isinstance(row.get("thread_signals"), list) else []
+        summary = _normalize_text(row.get("one_line_summary")) or _normalize_text(thread_signals[0] if thread_signals else None) or _normalize_text(row.get("tension_signal"))
         if not summary:
             continue
         search_blob = " ".join(
             [
                 summary,
-                " ".join([_normalize_text(x) for x in deltas[:4] if _normalize_text(x)]),
+                " ".join([_normalize_text(x) for x in thread_signals[:4] if _normalize_text(x)]),
                 _normalize_text(row.get("session_kind")),
                 _normalize_text(row.get("emotional_weight")),
                 _normalize_text(row.get("tension_signal")),
@@ -2786,8 +2830,7 @@ async def _pg_search_nodes(
             "session_id": _normalize_text(row.get("session_id")) or None,
             "session_kind": _normalize_text(row.get("session_kind")) or None,
             "emotional_weight": _normalize_text(row.get("emotional_weight")) or None,
-            "memory_deltas": deltas,
-            "thread_signals": row.get("thread_signals") if isinstance(row.get("thread_signals"), list) else [],
+            "thread_signals": thread_signals,
             "entity_mentions": row.get("entity_mentions") if isinstance(row.get("entity_mentions"), list) else [],
             "tension_signal": _normalize_text(row.get("tension_signal")) or None,
             "source": "session_classifications",
@@ -3169,7 +3212,7 @@ async def _pg_search_continuity_facts(
     session_rows = await db.fetch(
         """
         SELECT session_date, one_line_summary, emotional_weight, emotional_note, session_kind,
-               tension_signal, raw_triage_output->'memory_deltas' AS deltas
+               tension_signal, raw_triage_output->'thread_signals' AS thread_signals
         FROM session_classifications
         WHERE user_id = $1
           AND is_memory_worthy = true
@@ -3181,18 +3224,17 @@ async def _pg_search_continuity_facts(
         reference_time,
     )
     for row in session_rows or []:
-        deltas = row.get("deltas")
-        if isinstance(deltas, list):
-            for delta in deltas[:6]:
-                text = _normalize_text(delta)
-                if text:
-                    _append_fact(
-                        text,
-                        "postgres_session_classifications",
-                        row.get("session_date"),
-                        base_score=0.26,
-                        data_classification="mixed/unsafe",
-                    )
+        thread_signals = row.get("thread_signals") if isinstance(row.get("thread_signals"), list) else []
+        for signal in thread_signals[:6]:
+            text = _normalize_text(signal)
+            if text:
+                _append_fact(
+                    text,
+                    "postgres_session_classifications",
+                    row.get("session_date"),
+                    base_score=0.26,
+                    data_classification="mixed/unsafe",
+                )
         one_line = _normalize_text(row.get("one_line_summary"))
         if one_line:
             _append_fact(
@@ -3299,7 +3341,8 @@ async def _pg_get_recent_episodes(
           st.messages,
           sc.session_date,
           sc.one_line_summary,
-          sc.raw_triage_output->'memory_deltas' AS deltas
+          sc.tension_signal,
+          sc.raw_triage_output->'thread_signals' AS thread_signals
         FROM session_transcript st
         LEFT JOIN session_classifications sc
           ON sc.session_id = st.session_id
@@ -3318,14 +3361,12 @@ async def _pg_get_recent_episodes(
     episodes: List[Dict[str, Any]] = []
     for row in rows or []:
         session_id = _normalize_text(row.get("session_id"))
-        deltas = row.get("deltas")
-        if not isinstance(deltas, list):
-            deltas = []
-        summary = _normalize_text(row.get("one_line_summary")) or _normalize_text(deltas[0] if deltas else None)
+        thread_signals = row.get("thread_signals") if isinstance(row.get("thread_signals"), list) else []
+        summary = _normalize_text(row.get("one_line_summary")) or _normalize_text(thread_signals[0] if thread_signals else None) or _normalize_text(row.get("tension_signal"))
         content = _format_session_transcript_content(row.get("messages"))
         if not summary:
-            if deltas:
-                summary = _shorten_line(" ".join([_normalize_text(x) for x in deltas[:2] if _normalize_text(x)]), 220)
+            if thread_signals:
+                summary = _shorten_line(" ".join([_normalize_text(x) for x in thread_signals[:2] if _normalize_text(x)]), 220)
             if not summary:
                 summary = _shorten_line(content, 220)
         ref = row.get("session_date") or row.get("updated_at")
@@ -4547,7 +4588,7 @@ async def _load_recent_session_summaries_from_classifications(
           emotional_note,
           emotional_weight,
           tension_signal,
-          raw_triage_output->'memory_deltas' AS deltas,
+          raw_triage_output->'thread_signals' AS thread_signals,
           processed_at
         FROM session_classifications
         WHERE user_id = $1
@@ -4562,11 +4603,11 @@ async def _load_recent_session_summaries_from_classifications(
     for row in rows or []:
         if not isinstance(row, dict):
             continue
-        deltas = row.get("deltas") if isinstance(row.get("deltas"), list) else []
-        meaningful_deltas = [_normalize_text(delta) for delta in deltas if _normalize_text(delta) and not _is_trivial_memory_change(delta)]
+        thread_signals = row.get("thread_signals") if isinstance(row.get("thread_signals"), list) else []
+        meaningful_thread_signals = [_normalize_text(signal) for signal in thread_signals if _normalize_text(signal) and not _is_trivial_memory_change(signal)]
         summary_facts = (
             (_normalize_text(row.get("one_line_summary")) if not _is_trivial_memory_change(row.get("one_line_summary")) else "")
-            or (meaningful_deltas[0] if meaningful_deltas else "")
+            or (meaningful_thread_signals[0] if meaningful_thread_signals else "")
             or _normalize_text(row.get("tension_signal"))
         )
         moment = _normalize_text(row.get("emotional_note"))
@@ -9591,6 +9632,163 @@ async def _generate_startbrief_bridge_llm(
     return _normalize_text(response) or None
 
 
+_STARTBRIEF_REALIZER_FILLER_PATTERNS = (
+    r"\bimportant to note\b",
+    r"\bin summary\b",
+    r"\boverall\b",
+    r"\bin general\b",
+    r"\bkey takeaway\b",
+    r"\bready to proceed\b",
+)
+
+_STARTBRIEF_AWKWARD_TIME_PATTERNS = (
+    r"\babout\s+about\b",
+    r"\bsince last spoke\b(?!\.)",
+    r"\b\d+\s+hours\s+since\s+last\s+spoke\b",
+)
+
+
+def _startbrief_selected_evidence_bundle(
+    selected_summary_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+    selected_loop_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for summary_row, metrics in selected_summary_pairs:
+        sid = _normalize_text(summary_row.get("session_id")) or stable_short_hash(summary_row, length=10)
+        text = _summary_text_for_scoring(summary_row)
+        if not text:
+            continue
+        rows.append(
+            {
+                "evidence_id": f"claim:{sid}",
+                "type": "claim",
+                "text": text,
+                "score": round(float((metrics or {}).get("score") or 0.0), 4),
+            }
+        )
+    for idx, (loop_row, metrics) in enumerate(selected_loop_pairs):
+        loop_id = _normalize_text(loop_row.get("id")) or f"loop_{idx + 1}"
+        text = _normalize_text(loop_row.get("text"))
+        if not text:
+            continue
+        rows.append(
+            {
+                "evidence_id": f"loop:{loop_id}",
+                "type": "loop",
+                "text": text,
+                "score": round(float((metrics or {}).get("score") or 0.0), 4),
+            }
+        )
+    return rows
+
+
+async def _realize_startbrief_from_selected_evidence(
+    *,
+    depth_label: str,
+    time_of_day_label: str,
+    gap_human: Optional[str],
+    evidence_rows: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not evidence_rows:
+        return None
+    llm_client = get_llm_client()
+    prompt = (
+        "You are a strict startbrief realizer.\n"
+        "Use only EVIDENCE_ROWS. Do not add new facts, names, times, dates, emotions, goals, or relationships.\n"
+        "Return JSON only with keys:\n"
+        "- handover_lines: [{\"line\":\"...\",\"evidence_ids\":[\"...\"]}] (2-5 lines)\n"
+        "- ops_context_lines: [{\"line\":\"...\",\"evidence_ids\":[\"...\"]}] (0-3 lines)\n"
+        "Rules:\n"
+        "- Every generated line must cite one or more evidence_ids present in EVIDENCE_ROWS.\n"
+        "- Keep wording concrete and concise.\n"
+        "- No generic filler, no recommendations, no interpretation.\n"
+        "- Avoid explicit dates/times/years.\n"
+        f"- DEPTH_LABEL={depth_label}, TIME_OF_DAY={time_of_day_label}, GAP_HUMAN={_normalize_text(gap_human)}.\n"
+        f"EVIDENCE_ROWS={json.dumps(evidence_rows, ensure_ascii=True)}\n"
+    )
+    response = await llm_client._call_llm(
+        prompt=prompt,
+        max_tokens=350,
+        temperature=0.0,
+        task="startbrief_realizer",
+    )
+    parsed = _extract_json_text_object(response)
+    if not isinstance(parsed, dict):
+        return None
+    handover_lines = parsed.get("handover_lines")
+    ops_lines = parsed.get("ops_context_lines")
+    if not isinstance(handover_lines, list):
+        return None
+    return {
+        "handover_lines": [row for row in handover_lines if isinstance(row, dict)],
+        "ops_context_lines": [row for row in ops_lines if isinstance(row, dict)] if isinstance(ops_lines, list) else [],
+    }
+
+
+def _validate_startbrief_realization(
+    *,
+    realization: Dict[str, Any],
+    evidence_rows: List[Dict[str, Any]],
+    require_loops: bool,
+) -> List[str]:
+    errors: List[str] = []
+    allowed_ids = {str(row.get("evidence_id")) for row in evidence_rows if _normalize_text(row.get("evidence_id"))}
+    evidence_by_id = {
+        str(row.get("evidence_id")): _normalize_text(row.get("text"))
+        for row in evidence_rows
+        if _normalize_text(row.get("evidence_id")) and _normalize_text(row.get("text"))
+    }
+    evidence_terms = _query_terms(" ".join(_normalize_text(row.get("text")) for row in evidence_rows if _normalize_text(row.get("text"))))
+    loop_ids = {str(row.get("evidence_id")) for row in evidence_rows if _normalize_text(row.get("type")) == "loop"}
+
+    handover_lines = realization.get("handover_lines") if isinstance(realization.get("handover_lines"), list) else []
+    if not handover_lines:
+        errors.append("empty_realization")
+        return errors
+    used_loop_ids: set[str] = set()
+    full_text_parts: List[str] = []
+    for row in handover_lines:
+        line = _normalize_text((row or {}).get("line"))
+        refs = (row or {}).get("evidence_ids")
+        if not line:
+            errors.append("empty_line")
+            continue
+        full_text_parts.append(line)
+        if not isinstance(refs, list) or not refs:
+            errors.append("missing_evidence_refs")
+            continue
+        normalized_refs = [str(x) for x in refs if _normalize_text(x)]
+        if not normalized_refs:
+            errors.append("missing_evidence_refs")
+            continue
+        if any(ref not in allowed_ids for ref in normalized_refs):
+            errors.append("unknown_evidence_ref")
+        used_loop_ids.update(set(normalized_refs) & loop_ids)
+        ref_specific_overlap_ok = False
+        for ref in normalized_refs:
+            ref_text = evidence_by_id.get(ref)
+            if not ref_text:
+                continue
+            if _query_overlap_score(line, _query_terms(ref_text)) >= 0.22:
+                ref_specific_overlap_ok = True
+                break
+        if not ref_specific_overlap_ok:
+            errors.append("unsupported_fact")
+        overlap = _query_overlap_score(line, evidence_terms)
+        if overlap < 0.15:
+            errors.append("unsupported_fact")
+    combined = _normalize_text(" ".join(full_text_parts)).lower()
+    if require_loops and loop_ids and not used_loop_ids:
+        errors.append("dropped_high_priority_loops")
+    if any(re.search(p, combined) for p in _STARTBRIEF_REALIZER_FILLER_PATTERNS):
+        errors.append("generic_filler")
+    if re.search(r"\b20\d{2}\b|\b\d{1,2}:\d{2}\b", combined):
+        errors.append("invented_time_or_date")
+    if any(re.search(p, combined) for p in _STARTBRIEF_AWKWARD_TIME_PATTERNS):
+        errors.append("awkward_time_phrase")
+    return list(dict.fromkeys(errors))
+
+
 _STARTBRIEF_ADVICE_PATTERNS = (
     r"\bshould\b",
     r"\bcould\b",
@@ -12091,12 +12289,30 @@ async def _execute_post_ingest_hook(hook_name: str, payload: Dict[str, Any]) -> 
             settings=settings,
         )
         episode_uuid = _normalize_text(payload.get("episode_uuid")) or None
+        if result.run_actionable_pass:
+            await _enqueue_post_ingest_hook(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=session_id,
+                hook_name=session.POST_INGEST_HOOK_PASS2_ACTIONABLE,
+                reference_time=reference_time,
+                episode_uuid=episode_uuid,
+            )
+        if result.run_session_changes_pass:
+            await _enqueue_post_ingest_hook(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=session_id,
+                hook_name=session.POST_INGEST_HOOK_PASS2B_SESSION_CHANGES,
+                reference_time=reference_time,
+                episode_uuid=episode_uuid,
+            )
         if result.run_entity_pass:
             await _enqueue_post_ingest_hook(
                 tenant_id=tenant_id,
                 user_id=user_id,
                 session_id=session_id,
-                hook_name=session.POST_INGEST_HOOK_PASS1_5_ENTITIES,
+                hook_name=session.POST_INGEST_HOOK_PASS2C_ENTITY_CANDIDATES,
                 reference_time=reference_time,
                 episode_uuid=episode_uuid,
             )
@@ -12127,6 +12343,59 @@ async def _execute_post_ingest_hook(hook_name: str, payload: Dict[str, Any]) -> 
                 reference_time=reference_time,
                 episode_uuid=episode_uuid,
             )
+        return True
+
+    if hook_name == session.POST_INGEST_HOOK_PASS2_ACTIONABLE:
+        settings = get_settings()
+        if not bool(settings.derived_pipeline_enabled):
+            return True
+        await run_pass2_actionable(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            messages=messages_payload,
+            reference_time=reference_time,
+            settings=settings,
+        )
+        return True
+
+    if hook_name == session.POST_INGEST_HOOK_PASS2B_SESSION_CHANGES:
+        settings = get_settings()
+        if not bool(settings.derived_pipeline_enabled):
+            return True
+        await run_pass2b_session_changes(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            messages=messages_payload,
+            reference_time=reference_time,
+            settings=settings,
+        )
+        return True
+
+    if hook_name == session.POST_INGEST_HOOK_PASS2C_ENTITY_CANDIDATES:
+        settings = get_settings()
+        if not bool(settings.derived_pipeline_enabled):
+            return True
+        await run_pass2c_entity_candidates(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            messages=messages_payload,
+            settings=settings,
+        )
+        episode_uuid = _normalize_text(payload.get("episode_uuid")) or None
+        await _enqueue_post_ingest_hook(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            hook_name=session.POST_INGEST_HOOK_PASS1_5_ENTITIES,
+            reference_time=reference_time,
+            episode_uuid=episode_uuid,
+        )
         return True
 
     if hook_name == session.POST_INGEST_HOOK_PASS1_5_ENTITIES:
@@ -12507,6 +12776,47 @@ def _require_internal_token(token: str | None) -> None:
     if not settings.internal_token or not token or token != settings.internal_token:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+
+_BACKGROUND_LOOP_TASK_ATTRS: tuple[tuple[str, str], ...] = (
+    ("idle_close", "idle_close_task"),
+    ("outbox_drain", "outbox_drain_task"),
+    ("user_model_updater", "user_model_updater_task"),
+    ("user_model_enrichment", "user_model_enrichment_task"),
+    ("loop_staleness_janitor", "loop_staleness_janitor_task"),
+    ("derived_silence_detection", "derived_silence_detection_task"),
+    ("derived_memory_audit", "derived_memory_audit_task"),
+    ("proactive_shadow_candidates", "proactive_shadow_candidates_task"),
+    ("daily_analysis", "daily_analysis_task"),
+    ("daily_habit_dedupe", "daily_habit_dedupe_task"),
+    ("v2_invariant_checker", "v2_invariant_checker_task"),
+    ("v2_rollout_evaluator", "v2_rollout_evaluator_task"),
+)
+
+
+def _background_loop_task_status(app: FastAPI) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for loop_name, attr_name in _BACKGROUND_LOOP_TASK_ATTRS:
+        task = getattr(app.state, attr_name, None)
+        state = "not_started"
+        if task is not None:
+            if task.cancelled():
+                state = "cancelled"
+            elif task.done():
+                state = "done"
+            else:
+                state = "running"
+        items.append(
+            {
+                "name": loop_name,
+                "task_attr": attr_name,
+                "started": bool(task is not None),
+                "state": state,
+                "done": bool(task.done()) if task is not None else False,
+                "cancelled": bool(task.cancelled()) if task is not None else False,
+            }
+        )
+    return items
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -12528,7 +12838,11 @@ async def health():
 
 
 @app.post("/ingest", response_model=IngestResponse)
-async def ingest(request: IngestRequest, background_tasks: BackgroundTasks):
+async def ingest(
+    request: IngestRequest,
+    background_tasks: BackgroundTasks,
+    x_internal_token: str | None = Header(default=None),
+):
     """
     Ingest a conversation turn into the memory system.
 
@@ -12536,6 +12850,7 @@ async def ingest(request: IngestRequest, background_tasks: BackgroundTasks):
     - Adds messages to session buffer
     - Triggers background janitor (folding + outbox)
     """
+    _require_internal_token(x_internal_token)
     try:
         logger.info(f"Ingesting message from {request.tenantId}:{request.userId}")
         response = await process_ingest(request, graphiti_client, background_tasks)
@@ -13150,7 +13465,11 @@ async def _memory_query_v2_service(request: MemoryQueryV2Request) -> MemoryQuery
     response_model=MemoryQueryV2Response,
     response_model_exclude_none=True,
 )
-async def memory_query_v2(request: MemoryQueryV2Request):
+async def memory_query_v2(
+    request: MemoryQueryV2Request,
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
     controller = RolloutController(db)
     route = await controller.decide_route(tenant_id=request.tenantId, user_id=request.userId)
     if route != ROUTE_V2:
@@ -13386,10 +13705,14 @@ async def _safe_run_retrieval_shadow_diff(
     response_model=MemoryQueryResponse,
     response_model_exclude_none=True
 )
-async def memory_query(request: MemoryQueryRequest):
+async def memory_query(
+    request: MemoryQueryRequest,
+    x_internal_token: str | None = Header(default=None),
+):
     """
     Legacy compatibility endpoint.
     """
+    _require_internal_token(x_internal_token)
     # T11 transitional rule: route exclusively through v2 adapter; no mixed-authority legacy fallback.
     controller = RolloutController(db)
     rollout_route = await controller.decide_route(tenant_id=request.tenantId, user_id=request.userId)
@@ -13505,11 +13828,13 @@ async def memory_loops(
 @app.get("/user/model", response_model=UserModelResponse)
 async def get_user_model(
     tenantId: str,
-    userId: str
+    userId: str,
+    x_internal_token: str | None = Header(default=None),
 ):
     """
     Return persistent structured user model and domain completeness scores.
     """
+    _require_internal_token(x_internal_token)
     try:
         canonical_tenant, tenant_scope = _resolve_tenant_scope(tenantId)
         scoped_rows = await _fetch_user_model_rows_for_scope(tenant_scope=tenant_scope, user_id=userId)
@@ -13699,6 +14024,956 @@ async def get_daily_analysis(
         raise HTTPException(status_code=500, detail="Get daily analysis failed")
 
 
+def _actionable_candidate_item_from_row(row: Dict[str, Any]) -> ActionableCandidateItem:
+    due_value = row.get("due_iso")
+    relevant_from_value = row.get("relevant_from_iso")
+    relevant_until_value = row.get("relevant_until_iso")
+    due_iso = None
+    relevant_from_iso = None
+    relevant_until_iso = None
+    if isinstance(due_value, datetime):
+        due_iso = due_value.isoformat()
+    else:
+        due_iso = _normalize_text(due_value) or None
+    if isinstance(relevant_from_value, datetime):
+        relevant_from_iso = relevant_from_value.isoformat()
+    else:
+        relevant_from_iso = _normalize_text(relevant_from_value) or None
+    if isinstance(relevant_until_value, datetime):
+        relevant_until_iso = relevant_until_value.isoformat()
+    else:
+        relevant_until_iso = _normalize_text(relevant_until_value) or None
+    created = row.get("created_at")
+    updated = row.get("updated_at")
+    provenance = row.get("provenance") if isinstance(row.get("provenance"), dict) else {}
+    kind = _normalize_text(row.get("record_type"))
+    candidate_subtype = _normalize_text(row.get("candidate_subtype")) or None
+    status = _normalize_text(row.get("status")) or "detected"
+    source_type = _normalize_text(row.get("source")) or "chat"
+    source_id = _normalize_text(row.get("linked_external_id")) or _normalize_text(row.get("session_id")) or None
+    source_url = (
+        _normalize_text(provenance.get("sourceUrl"))
+        or _normalize_text(provenance.get("source_url"))
+        or _normalize_text(provenance.get("url"))
+        or None
+    )
+
+    now_utc = datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+    due_dt = _parse_optional_dt(due_iso)
+    priority = "low"
+    if status == "needs_review":
+        priority = "high"
+    elif isinstance(due_dt, datetime):
+        due_cmp = due_dt if due_dt.tzinfo else due_dt.replace(tzinfo=dt_timezone.utc)
+        if due_cmp <= now_utc + timedelta(days=1):
+            priority = "high"
+        elif due_cmp <= now_utc + timedelta(days=7):
+            priority = "medium"
+    elif kind in {"commitment", "reminder_candidate"}:
+        priority = "medium"
+
+    waiting_on = _normalize_text(row.get("waiting_on")) or None
+    needs_response_value = row.get("needs_response")
+    if isinstance(needs_response_value, bool):
+        needs_response = needs_response_value
+    else:
+        needs_response = True if status == "needs_review" and kind in {"event_candidate", "commitment"} else None
+    cadence_text = _normalize_text(row.get("cadence_text")) or None
+    user_confirmed = True if status == "confirmed" else None
+    created_iso = created.isoformat() if isinstance(created, datetime) else _normalize_text(created) or None
+    updated_iso = updated.isoformat() if isinstance(updated, datetime) else _normalize_text(updated) or None
+    return ActionableCandidateItem(
+        id=int(row.get("candidate_id") or 0),
+        kind=kind,
+        candidateSubtype=candidate_subtype,
+        title=_normalize_text(row.get("title")),
+        summary=_normalize_text(row.get("summary")) or None,
+        priority=priority,
+        dueIso=due_iso,
+        startIso=relevant_from_iso,
+        endIso=relevant_until_iso,
+        waitingOn=waiting_on,
+        needsResponse=needs_response,
+        cadenceText=cadence_text,
+        sourceType=source_type,
+        sourceId=source_id,
+        sourceUrl=source_url,
+        collectedAt=created_iso,
+        updatedAt=updated_iso,
+        provenance=provenance,
+        confidence=float(row.get("confidence_score")) if row.get("confidence_score") is not None else None,
+        confidenceLabel=_normalize_text(row.get("confidence_label")) or None,
+        userConfirmed=user_confirmed,
+        status=status,
+
+        # Legacy compatibility fields.
+        recordType=kind,
+        relevantFromIso=relevant_from_iso,
+        relevantUntilIso=relevant_until_iso,
+        suggestedAction=_normalize_text(row.get("suggested_action")) or None,
+        linkedExternalId=_normalize_text(row.get("linked_external_id")) or None,
+        linkedExternalType=_normalize_text(row.get("linked_external_type")) or None,
+        source=source_type,
+        sessionId=_normalize_text(row.get("session_id")) or None,
+        createdAt=created_iso,
+    )
+
+
+def _candidate_relevance_bounds(
+    row: Dict[str, Any],
+    *,
+    fallback_now: datetime,
+) -> tuple[datetime, datetime]:
+    due = _parse_optional_dt(row.get("due_iso"))
+    relevant_from = _parse_optional_dt(row.get("relevant_from_iso"))
+    relevant_until = _parse_optional_dt(row.get("relevant_until_iso"))
+    created = _parse_optional_dt(row.get("created_at"))
+    start = relevant_from or due or created or fallback_now
+    end = relevant_until or due or start
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=dt_timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=dt_timezone.utc)
+    if end < start:
+        end = start
+    return start, end
+
+
+def _candidate_is_relevant_in_window(
+    row: Dict[str, Any],
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    fallback_now: datetime,
+) -> bool:
+    start, end = _candidate_relevance_bounds(row, fallback_now=fallback_now)
+    return start <= window_end and end >= window_start
+
+
+def _candidate_is_explicitly_daily_relevant(row: Dict[str, Any]) -> bool:
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    provenance = row.get("provenance") if isinstance(row.get("provenance"), dict) else {}
+    for container in (metadata, provenance):
+        value = container.get("daily_relevant") if isinstance(container, dict) else None
+        if value is True:
+            return True
+    return False
+
+
+def _candidate_is_low_confidence_detected(row: Dict[str, Any]) -> bool:
+    status = _normalize_text(row.get("status")).lower()
+    if status != "detected":
+        return False
+    label = _normalize_text(row.get("confidence_label")).lower()
+    try:
+        score = float(row.get("confidence_score")) if row.get("confidence_score") is not None else 0.0
+    except Exception:
+        score = 0.0
+    return label in {"low", ""} or score < 0.8
+
+
+def _candidate_is_due_or_scheduled_for_daily(
+    row: Dict[str, Any],
+    *,
+    day_start: datetime,
+    day_end: datetime,
+    as_of: datetime,
+) -> bool:
+    due = _parse_optional_dt(row.get("due_iso"))
+    relevant_from = _parse_optional_dt(row.get("relevant_from_iso"))
+    relevant_until = _parse_optional_dt(row.get("relevant_until_iso"))
+    candidates = [value for value in (due, relevant_from, relevant_until) if isinstance(value, datetime)]
+    for value in candidates:
+        value_utc = value if value.tzinfo else value.replace(tzinfo=dt_timezone.utc)
+        if day_start <= value_utc <= day_end:
+            return True
+    if due is not None:
+        due_utc = due if due.tzinfo else due.replace(tzinfo=dt_timezone.utc)
+        if due_utc < as_of:
+            return True
+    return False
+
+
+def _include_candidate_in_daily_lens(
+    row: Dict[str, Any],
+    *,
+    day_start: datetime,
+    day_end: datetime,
+    as_of: datetime,
+) -> bool:
+    status = _normalize_text(row.get("status")).lower()
+    if status in {"dismissed", "acted_on", "superseded", "stale"}:
+        return False
+    if status in {"confirmed", "needs_review"}:
+        return _candidate_is_relevant_in_window(
+            row,
+            window_start=day_start,
+            window_end=day_end,
+            fallback_now=as_of,
+        ) or _candidate_is_due_or_scheduled_for_daily(row, day_start=day_start, day_end=day_end, as_of=as_of)
+    if status == "detected":
+        if _candidate_is_low_confidence_detected(row):
+            return False
+        if _candidate_is_due_or_scheduled_for_daily(row, day_start=day_start, day_end=day_end, as_of=as_of):
+            return True
+        if _candidate_is_explicitly_daily_relevant(row):
+            return True
+        return False
+    return False
+
+
+def _session_change_item_from_row(row: Dict[str, Any]) -> SessionChangeItem:
+    effective = row.get("effective_iso")
+    created = row.get("created_at")
+    updated = row.get("updated_at")
+    provenance = row.get("provenance") if isinstance(row.get("provenance"), dict) else {}
+    source_type = _normalize_text(row.get("source")) or "chat"
+    source_id = _normalize_text(row.get("session_id")) or None
+    source_url = (
+        _normalize_text(provenance.get("sourceUrl"))
+        or _normalize_text(provenance.get("source_url"))
+        or _normalize_text(provenance.get("url"))
+        or None
+    )
+    return SessionChangeItem(
+        id=int(row.get("change_id") or 0),
+        kind=_normalize_text(row.get("kind")),
+        title=_normalize_text(row.get("title")),
+        summary=_normalize_text(row.get("summary")) or None,
+        effectiveIso=effective.isoformat() if isinstance(effective, datetime) else _normalize_text(effective) or None,
+        sourceType=source_type,
+        sourceId=source_id,
+        sourceUrl=source_url,
+        collectedAt=created.isoformat() if isinstance(created, datetime) else _normalize_text(created) or None,
+        updatedAt=updated.isoformat() if isinstance(updated, datetime) else _normalize_text(updated) or None,
+        provenance=provenance,
+        confidence=float(row.get("confidence_score")) if row.get("confidence_score") is not None else None,
+        confidenceLabel=_normalize_text(row.get("confidence_label")) or None,
+        status=_normalize_text(row.get("status")) or "detected",
+        sessionId=source_id,
+    )
+
+
+def _entity_candidate_item_from_row(row: Dict[str, Any]) -> EntityCandidateItem:
+    created = row.get("created_at")
+    updated = row.get("updated_at")
+    provenance = row.get("provenance") if isinstance(row.get("provenance"), dict) else {}
+    source_type = _normalize_text(row.get("source")) or "chat"
+    source_id = _normalize_text(row.get("session_id")) or None
+    source_url = (
+        _normalize_text(provenance.get("sourceUrl"))
+        or _normalize_text(provenance.get("source_url"))
+        or _normalize_text(provenance.get("url"))
+        or None
+    )
+    return EntityCandidateItem(
+        id=int(row.get("candidate_id") or 0),
+        name=_normalize_text(row.get("name")),
+        candidateType=_normalize_text(row.get("candidate_type")) or "other",
+        summary=_normalize_text(row.get("summary")) or None,
+        sourceType=source_type,
+        sourceId=source_id,
+        sourceUrl=source_url,
+        collectedAt=created.isoformat() if isinstance(created, datetime) else _normalize_text(created) or None,
+        updatedAt=updated.isoformat() if isinstance(updated, datetime) else _normalize_text(updated) or None,
+        provenance=provenance,
+        confidence=float(row.get("confidence_score")) if row.get("confidence_score") is not None else None,
+        confidenceLabel=_normalize_text(row.get("confidence_label")) or None,
+        status=_normalize_text(row.get("status")) or "detected",
+        sessionId=source_id,
+    )
+
+
+@app.get("/daily-candidates", response_model=DailyCandidatesResponse)
+async def get_daily_candidates(
+    tenantId: str,
+    userId: str,
+    now: Optional[str] = None,
+    date: Optional[str] = None,
+    limit: Optional[int] = None,
+):
+    """
+    Date-scoped lens over actionable_candidates.
+    This is not the source of truth; actionable_candidates is canonical.
+    """
+    try:
+        safe_limit = max(1, min(int(limit if limit is not None else 12), 200))
+        if date:
+            try:
+                scoped_day = datetime.fromisoformat(date).date()
+            except Exception:
+                try:
+                    scoped_day = datetime.strptime(date, "%Y-%m-%d").date()
+                except Exception:
+                    raise HTTPException(status_code=400, detail="Invalid date; use YYYY-MM-DD")
+            as_of = datetime(scoped_day.year, scoped_day.month, scoped_day.day, 12, 0, tzinfo=dt_timezone.utc)
+        else:
+            as_of = _parse_reference_time_or_none(now) or datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=dt_timezone.utc)
+        day_start = as_of.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = as_of.replace(hour=23, minute=59, second=59, microsecond=999999)
+        horizon = as_of + timedelta(days=14)
+
+        rows = await db.fetch(
+            """
+            SELECT
+              candidate_id, session_id, record_type, candidate_subtype, title, summary, due_iso, source,
+              relevant_from_iso, relevant_until_iso, waiting_on, needs_response, cadence_text,
+              suggested_action, linked_external_id, linked_external_type,
+              provenance, confidence_score, confidence_label, status, metadata, created_at, updated_at
+            FROM actionable_candidates
+            WHERE tenant_id = $1
+              AND user_id = $2
+            ORDER BY
+              CASE status
+                WHEN 'needs_review' THEN 0
+                WHEN 'detected' THEN 1
+                WHEN 'confirmed' THEN 2
+                WHEN 'acted_on' THEN 3
+                ELSE 4
+              END,
+              due_iso ASC NULLS LAST,
+              updated_at DESC
+            LIMIT $3
+            """,
+            tenantId,
+            userId,
+            safe_limit,
+        )
+
+        relevant_rows = [
+            dict(row)
+            for row in (rows or [])
+            if isinstance(row, dict)
+            and _include_candidate_in_daily_lens(
+                dict(row),
+                day_start=day_start,
+                day_end=day_end,
+                as_of=as_of,
+            )
+        ]
+        all_items = [_actionable_candidate_item_from_row(row) for row in relevant_rows]
+        needs_review = [i for i in all_items if i.status in {"detected", "needs_review"}]
+        upcoming_commitments: List[ActionableCandidateItem] = []
+        for item in all_items:
+            if item.kind != "commitment" or item.status in {"dismissed", "acted_on", "superseded", "stale"}:
+                continue
+            due = _parse_optional_dt(item.dueIso)
+            if due is None:
+                upcoming_commitments.append(item)
+                continue
+            due_utc = due if due.tzinfo else due.replace(tzinfo=dt_timezone.utc)
+            if as_of <= due_utc <= horizon:
+                upcoming_commitments.append(item)
+        detected = [
+            i for i in all_items
+            if i.kind in {"event_candidate", "task_candidate", "reminder_candidate"} and i.status in {"detected", "needs_review"}
+        ]
+
+        return DailyCandidatesResponse(
+            tenantId=tenantId,
+            userId=userId,
+            asOf=as_of.isoformat(),
+            needsReview=needs_review[:safe_limit],
+            upcomingCommitments=upcoming_commitments[:safe_limit],
+            detected=detected[:safe_limit],
+            metadata={
+                "count": len(all_items),
+                "needsReviewCount": len(needs_review),
+                "upcomingCommitmentCount": len(upcoming_commitments),
+                "detectedCount": len(detected),
+                "horizonDays": 14,
+                "sourceOfTruth": "actionable_candidates",
+                "lens": "daily",
+                "windowStart": day_start.isoformat(),
+                "windowEnd": day_end.isoformat(),
+                "requestedDate": date,
+                "defaultLimit": 12,
+            },
+        )
+    except Exception as e:
+        logger.error(f"Get daily candidates failed: {e}")
+        raise HTTPException(status_code=500, detail="Get daily candidates failed")
+
+
+@app.get("/review-queue", response_model=ReviewQueueResponse)
+async def get_review_queue(
+    tenantId: str,
+    userId: str,
+    now: Optional[str] = None,
+    limit: int = 100,
+):
+    """
+    Lens over actionable_candidates for all items that currently need review.
+    Date-agnostic: includes future candidates.
+    """
+    try:
+        safe_limit = max(1, min(int(limit or 100), 300))
+        as_of = _parse_reference_time_or_none(now) or datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=dt_timezone.utc)
+        rows = await db.fetch(
+            """
+            SELECT
+              candidate_id, session_id, record_type, candidate_subtype, title, summary, due_iso, source,
+              relevant_from_iso, relevant_until_iso, waiting_on, needs_response, cadence_text,
+              suggested_action, linked_external_id, linked_external_type,
+              provenance, confidence_score, confidence_label, status, created_at, updated_at
+            FROM actionable_candidates
+            WHERE tenant_id = $1
+              AND user_id = $2
+              AND status = 'needs_review'
+            ORDER BY
+              due_iso ASC NULLS LAST,
+              updated_at DESC
+            LIMIT $3
+            """,
+            tenantId,
+            userId,
+            safe_limit,
+        )
+        items = [_actionable_candidate_item_from_row(dict(row)) for row in (rows or []) if isinstance(row, dict)]
+        by_type: Dict[str, List[ActionableCandidateItem]] = {
+            "event_candidate": [],
+            "task_candidate": [],
+            "reminder_candidate": [],
+            "commitment": [],
+        }
+        for item in items:
+            key = _normalize_text(item.kind)
+            if key not in by_type:
+                by_type[key] = []
+            by_type[key].append(item)
+        return ReviewQueueResponse(
+            tenantId=tenantId,
+            userId=userId,
+            asOf=as_of.isoformat(),
+            items=items,
+            byType=by_type,
+            metadata={
+                "count": len(items),
+                "sourceOfTruth": "actionable_candidates",
+                "lens": "review_queue",
+                "statusFilter": "needs_review",
+            },
+        )
+    except Exception as e:
+        logger.error(f"Get review queue failed: {e}")
+        raise HTTPException(status_code=500, detail="Get review queue failed")
+
+
+@app.post("/actions/items")
+async def create_action_item(
+    payload: ActionItemCreateRequest,
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    try:
+        return await createActionItem(
+            db,
+            {
+                "tenantId": payload.tenantId,
+                "userId": payload.userId,
+                "kind": payload.kind,
+                "title": payload.title,
+                "notes": payload.notes,
+                "dueAt": payload.dueAt,
+                "remindAt": payload.remindAt,
+                "recurrenceRule": payload.recurrenceRule,
+                "sourceType": payload.sourceType,
+                "sourceRef": payload.sourceRef,
+                "confidence": payload.confidence,
+                "provenanceSummary": payload.provenanceSummary,
+            },
+        )
+    except ActionStateError:
+        raise
+    except Exception as e:
+        logger.error("Create action item failed: %s", e)
+        raise HTTPException(status_code=500, detail="Create action item failed")
+
+
+@app.get("/actions/items")
+async def list_action_items(
+    tenantId: str,
+    userId: str,
+    status: Optional[str] = None,
+    kind: Optional[str] = None,
+    title: Optional[str] = None,
+    include_done: bool = False,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = 100,
+    offset: int = 0,
+):
+    try:
+        return await listActionItems(
+            db,
+            {
+                "tenantId": tenantId,
+                "userId": userId,
+                "status": status,
+                "kind": kind,
+                "title": title,
+                "include_done": include_done,
+                "date_from": date_from,
+                "date_to": date_to,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+    except ActionStateError:
+        raise
+    except Exception as e:
+        logger.error("List action items failed: %s", e)
+        raise HTTPException(status_code=500, detail="List action items failed")
+
+
+@app.patch("/actions/items/{action_item_id}/status")
+async def update_action_item_status(action_item_id: str, payload: ActionItemStatusUpdateRequest):
+    try:
+        return await updateActionItemStatus(
+            db,
+            tenant_id=payload.tenantId,
+            user_id=payload.userId,
+            action_item_id=action_item_id,
+            status=payload.status,
+            reason=payload.reason,
+        )
+    except ActionStateError:
+        raise
+    except Exception as e:
+        logger.error("Update action item status failed: %s", e)
+        raise HTTPException(status_code=500, detail="Update action item status failed")
+
+
+@app.patch("/actions/items/{action_item_id}")
+async def patch_action_item(action_item_id: str, payload: ActionItemPatchRequest):
+    try:
+        patch = payload.model_dump(exclude_none=True)
+        if "due_at" in patch and "dueAt" not in patch:
+            patch["dueAt"] = patch.pop("due_at")
+        else:
+            patch.pop("due_at", None)
+        if "remind_at" in patch and "remindAt" not in patch:
+            patch["remindAt"] = patch.pop("remind_at")
+        else:
+            patch.pop("remind_at", None)
+        return await updateActionItem(
+            db,
+            tenant_id=payload.tenantId,
+            user_id=payload.userId,
+            action_item_id=action_item_id,
+            patch=patch,
+            actor=(payload.actor or "user"),
+            reason=payload.reason,
+        )
+    except ActionStateError:
+        raise
+    except Exception as e:
+        logger.error("Patch action item failed: %s", e)
+        raise HTTPException(status_code=500, detail="Patch action item failed")
+
+
+@app.delete("/actions/items/{action_item_id}")
+async def delete_action_item(action_item_id: str, tenantId: str, userId: str, reason: Optional[str] = None, actor: str = "sophie"):
+    try:
+        return await archiveActionItem(
+            db,
+            tenant_id=tenantId,
+            user_id=userId,
+            action_item_id=action_item_id,
+            reason=reason,
+            actor=actor,
+        )
+    except ActionStateError:
+        raise
+    except Exception as e:
+        logger.error("Delete action item failed: %s", e)
+        raise HTTPException(status_code=500, detail="Delete action item failed")
+
+
+@app.post("/actions/items/{action_item_id}/done")
+async def mark_action_item_done(action_item_id: str, tenantId: str, userId: str, reason: Optional[str] = None, actor: str = "sophie"):
+    try:
+        return await updateActionItemStatus(
+            db,
+            tenant_id=tenantId,
+            user_id=userId,
+            action_item_id=action_item_id,
+            status="done",
+            reason=reason,
+            actor=actor,
+        )
+    except ActionStateError:
+        raise
+    except Exception as e:
+        logger.error("Mark action item done failed: %s", e)
+        raise HTTPException(status_code=500, detail="Mark action item done failed")
+
+
+@app.post("/actions/items/{action_item_id}/dismiss")
+async def dismiss_action_item(action_item_id: str, tenantId: str, userId: str, reason: Optional[str] = None, actor: str = "sophie"):
+    try:
+        return await updateActionItemStatus(
+            db,
+            tenant_id=tenantId,
+            user_id=userId,
+            action_item_id=action_item_id,
+            status="dismissed",
+            reason=reason,
+            actor=actor,
+        )
+    except ActionStateError:
+        raise
+    except Exception as e:
+        logger.error("Dismiss action item failed: %s", e)
+        raise HTTPException(status_code=500, detail="Dismiss action item failed")
+
+
+@app.post("/actions/items/{action_item_id}/cancel")
+async def cancel_action_item(action_item_id: str, tenantId: str, userId: str, reason: Optional[str] = None, actor: str = "sophie"):
+    try:
+        return await updateActionItemStatus(
+            db,
+            tenant_id=tenantId,
+            user_id=userId,
+            action_item_id=action_item_id,
+            status="cancelled",
+            reason=reason,
+            actor=actor,
+        )
+    except ActionStateError:
+        raise
+    except Exception as e:
+        logger.error("Cancel action item failed: %s", e)
+        raise HTTPException(status_code=500, detail="Cancel action item failed")
+
+
+@app.post("/actions/candidates/promote")
+async def promote_action_candidate(payload: CandidatePromotionRequest):
+    try:
+        return await promoteCandidateToActionItem(
+            db,
+            tenant_id=payload.tenantId,
+            user_id=payload.userId,
+            candidate_id=payload.candidateId,
+            overrides=payload.overrides or {},
+        )
+    except ActionStateError:
+        raise
+    except Exception as e:
+        logger.error("Promote action candidate failed: %s", e)
+        raise HTTPException(status_code=500, detail="Promote action candidate failed")
+
+
+@app.post("/actions/candidates/{candidate_id}/auto-promote")
+async def auto_promote_action_candidate(candidate_id: int, tenantId: str, userId: str):
+    try:
+        return await maybeAutoPromoteCandidate(
+            db,
+            tenant_id=tenantId,
+            user_id=userId,
+            candidate_id=candidate_id,
+        )
+    except ActionStateError:
+        raise
+    except Exception as e:
+        logger.error("Auto-promote action candidate failed: %s", e)
+        raise HTTPException(status_code=500, detail="Auto-promote action candidate failed")
+
+
+@app.get("/actions/daily-agenda", response_model=DailyAgendaResponse)
+async def get_daily_agenda(tenantId: str, userId: str, date: str, timezone: str = "UTC"):
+    try:
+        return await listDailyAgenda(
+            db,
+            tenant_id=tenantId,
+            user_id=userId,
+            day=date,
+            timezone_name=timezone,
+        )
+    except ActionStateError:
+        raise
+    except Exception as e:
+        logger.error("Get daily agenda failed: %s", e)
+        raise HTTPException(status_code=500, detail="Get daily agenda failed")
+
+
+@app.post("/calendar/items")
+async def create_calendar_item(payload: CalendarItemCreateRequest):
+    try:
+        return await createCalendarItem(db, payload.model_dump(exclude_none=True))
+    except CalendarStateError:
+        raise
+    except Exception as e:
+        logger.error("Create calendar item failed: %s", e)
+        raise HTTPException(status_code=500, detail="Create calendar item failed")
+
+
+@app.get("/calendar/items")
+async def list_calendar_items(
+    tenantId: str,
+    userId: str,
+    status: Optional[str] = None,
+    source_kind: Optional[str] = None,
+    external_provider: Optional[str] = None,
+    participant: Optional[str] = None,
+    include_cancelled: bool = False,
+    include_archived: bool = False,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = 100,
+    offset: int = 0,
+):
+    try:
+        return await listCalendarItems(
+            db,
+            {
+                "tenantId": tenantId,
+                "userId": userId,
+                "status": status,
+                "source_kind": source_kind,
+                "external_provider": external_provider,
+                "participant": participant,
+                "include_cancelled": include_cancelled,
+                "include_archived": include_archived,
+                "date_from": date_from,
+                "date_to": date_to,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+    except CalendarStateError:
+        raise
+    except Exception as e:
+        logger.error("List calendar items failed: %s", e)
+        raise HTTPException(status_code=500, detail="List calendar items failed")
+
+
+@app.patch("/calendar/items/{calendar_item_id}")
+async def patch_calendar_item(calendar_item_id: str, payload: CalendarItemPatchRequest):
+    try:
+        patch = payload.model_dump(exclude_none=True)
+        return await updateCalendarItem(
+            db,
+            tenant_id=payload.tenantId,
+            user_id=payload.userId,
+            calendar_item_id=calendar_item_id,
+            patch=patch,
+            actor=(payload.actor or "user"),
+            reason=payload.reason,
+        )
+    except CalendarStateError:
+        raise
+    except Exception as e:
+        logger.error("Patch calendar item failed: %s", e)
+        raise HTTPException(status_code=500, detail="Patch calendar item failed")
+
+
+@app.delete("/calendar/items/{calendar_item_id}")
+async def delete_calendar_item(calendar_item_id: str, tenantId: str, userId: str, reason: Optional[str] = None, actor: str = "sophie"):
+    try:
+        return await archiveCalendarItem(
+            db,
+            tenant_id=tenantId,
+            user_id=userId,
+            calendar_item_id=calendar_item_id,
+            reason=reason,
+            actor=actor,
+        )
+    except CalendarStateError:
+        raise
+    except Exception as e:
+        logger.error("Archive calendar item failed: %s", e)
+        raise HTTPException(status_code=500, detail="Archive calendar item failed")
+
+
+@app.post("/calendar/items/{calendar_item_id}/cancel")
+async def cancel_calendar_item(calendar_item_id: str, tenantId: str, userId: str, reason: Optional[str] = None, actor: str = "sophie"):
+    try:
+        return await cancelCalendarItem(
+            db,
+            tenant_id=tenantId,
+            user_id=userId,
+            calendar_item_id=calendar_item_id,
+            reason=reason,
+            actor=actor,
+        )
+    except CalendarStateError:
+        raise
+    except Exception as e:
+        logger.error("Cancel calendar item failed: %s", e)
+        raise HTTPException(status_code=500, detail="Cancel calendar item failed")
+
+
+@app.post("/integrations/google/calendar/import")
+async def import_google_calendar(
+    payload: GoogleCalendarImportRequest,
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    settings = get_settings()
+    if not settings.google_calendar_import_enabled:
+        raise HTTPException(status_code=503, detail="Google Calendar import is disabled")
+    try:
+        return await import_google_calendar_events(
+            db=db,
+            tenant_id=payload.tenantId,
+            user_id=payload.userId,
+            date_from=payload.dateFrom,
+            date_to=payload.dateTo,
+            google_email=payload.googleEmail,
+            settings=settings,
+        )
+    except GoogleCalendarImportError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("Google Calendar import failed: %s", e)
+        raise HTTPException(status_code=500, detail="Google Calendar import failed")
+
+
+@app.get("/day/brief")
+async def get_day_brief(
+    tenantId: str,
+    userId: str,
+    date: str,
+    timezone: str = "UTC",
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    try:
+        return await buildDayBrief(
+            db,
+            tenant_id=tenantId,
+            user_id=userId,
+            day=date,
+            timezone_name=timezone,
+        )
+    except (DayBriefError, ActionStateError):
+        raise
+    except Exception as e:
+        logger.error("Get day brief failed: %s", e)
+        raise HTTPException(status_code=500, detail="Get day brief failed")
+
+
+@app.get("/session-changes", response_model=SessionChangesResponse)
+async def get_session_changes(
+    tenantId: str,
+    userId: str,
+    now: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 100,
+):
+    try:
+        safe_limit = max(1, min(int(limit or 100), 300))
+        as_of = _parse_reference_time_or_none(now) or datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=dt_timezone.utc)
+        allowed_status = {"detected", "needs_review", "confirmed", "dismissed", "superseded", "stale"}
+        requested_status = _normalize_text(status).lower() if status else None
+        query = """
+            SELECT
+              change_id, session_id, kind, title, summary, effective_iso, source,
+              provenance, confidence_score, confidence_label, status, created_at, updated_at
+            FROM session_changes
+            WHERE tenant_id = $1
+              AND user_id = $2
+        """
+        params: List[Any] = [tenantId, userId]
+        if requested_status:
+            if requested_status not in allowed_status:
+                raise HTTPException(status_code=400, detail="Invalid status")
+            query += " AND status = $3"
+            params.append(requested_status)
+            query += " ORDER BY effective_iso DESC NULLS LAST, updated_at DESC LIMIT $4"
+            params.append(safe_limit)
+        else:
+            query += " ORDER BY effective_iso DESC NULLS LAST, updated_at DESC LIMIT $3"
+            params.append(safe_limit)
+        rows = await db.fetch(query, *params)
+        items = [_session_change_item_from_row(dict(row)) for row in (rows or []) if isinstance(row, dict)]
+        by_kind: Dict[str, List[SessionChangeItem]] = {}
+        for item in items:
+            by_kind.setdefault(item.kind, []).append(item)
+        return SessionChangesResponse(
+            tenantId=tenantId,
+            userId=userId,
+            asOf=as_of.isoformat(),
+            items=items,
+            byKind=by_kind,
+            metadata={
+                "count": len(items),
+                "sourceOfTruth": "session_changes",
+                "statusFilter": requested_status,
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get session changes failed: {e}")
+        raise HTTPException(status_code=500, detail="Get session changes failed")
+
+
+@app.get("/entity-candidates", response_model=EntityCandidatesResponse)
+async def get_entity_candidates(
+    tenantId: str,
+    userId: str,
+    now: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 100,
+):
+    try:
+        safe_limit = max(1, min(int(limit or 100), 300))
+        as_of = _parse_reference_time_or_none(now) or datetime.utcnow().replace(tzinfo=dt_timezone.utc)
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=dt_timezone.utc)
+        allowed_status = {"detected", "needs_review", "resolved", "dismissed", "superseded"}
+        requested_status = _normalize_text(status).lower() if status else None
+        query = """
+            SELECT
+              candidate_id, session_id, name, candidate_type, summary, source,
+              provenance, confidence_score, confidence_label, status, created_at, updated_at
+            FROM entity_candidates
+            WHERE tenant_id = $1
+              AND user_id = $2
+        """
+        params: List[Any] = [tenantId, userId]
+        if requested_status:
+            if requested_status not in allowed_status:
+                raise HTTPException(status_code=400, detail="Invalid status")
+            query += " AND status = $3"
+            params.append(requested_status)
+            query += " ORDER BY updated_at DESC LIMIT $4"
+            params.append(safe_limit)
+        else:
+            query += " ORDER BY updated_at DESC LIMIT $3"
+            params.append(safe_limit)
+        rows = await db.fetch(query, *params)
+        items = [_entity_candidate_item_from_row(dict(row)) for row in (rows or []) if isinstance(row, dict)]
+        by_type: Dict[str, List[EntityCandidateItem]] = {}
+        for item in items:
+            by_type.setdefault(item.candidateType, []).append(item)
+        return EntityCandidatesResponse(
+            tenantId=tenantId,
+            userId=userId,
+            asOf=as_of.isoformat(),
+            items=items,
+            byType=by_type,
+            metadata={
+                "count": len(items),
+                "sourceOfTruth": "entity_candidates",
+                "statusFilter": requested_status,
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get entity candidates failed: {e}")
+        raise HTTPException(status_code=500, detail="Get entity candidates failed")
+
+
 @app.get("/signals/pack")
 async def signals_pack(
     tenantId: str,
@@ -13707,7 +14982,9 @@ async def signals_pack(
     now: Optional[str] = None,
     capacity: Optional[str] = None,
     tacticAppetite: Optional[str] = None,
+    x_internal_token: str | None = Header(default=None),
 ):
+    _require_internal_token(x_internal_token)
     return await _build_signals_pack(
         tenantId=tenantId,
         userId=userId,
@@ -13861,12 +15138,19 @@ async def session_startbrief(
     now: Optional[str] = None,
     sessionId: Optional[str] = None,
     personaId: Optional[str] = None,
-    timezone: Optional[str] = None
+    timezone: Optional[str] = None,
+    x_internal_token: str | None = Header(default=None),
 ):
     """
     Minimal start-brief: short bridgeText + durable items.
     """
+    _require_internal_token(x_internal_token)
     try:
+        STARTBRIEF_TOPK_CLAIMS = 2
+        STARTBRIEF_TOPK_LOOPS = 2
+        STARTBRIEF_MIN_CLAIM_SCORE = 0.50
+        STARTBRIEF_MIN_LOOP_SCORE = 0.55
+
         tenantId = _normalize_text(_canonical_tenant_id(tenantId)) or tenantId
         logger.info(
             "startbrief input: tenant=%s user=%s session=%s persona=%s now=%s timezone=%s",
@@ -14037,6 +15321,22 @@ async def session_startbrief(
         else:
             depth_label = "multi_day"
 
+        user_model_data: Dict[str, Any] = {}
+        user_model_hints: List[str] = []
+        try:
+            _canonical, tenant_scope = _resolve_tenant_scope(tenantId)
+            scoped_rows = await _fetch_user_model_rows_for_scope(tenant_scope=tenant_scope, user_id=userId)
+            user_model_row = scoped_rows[0] if scoped_rows else None
+            if isinstance(user_model_row, dict):
+                user_model_data = _normalize_user_model(user_model_row.get("model"))
+                user_model_hints = _extract_high_confidence_user_model_hints(
+                    user_model_data,
+                    threshold=float(get_settings().user_model_high_confidence),
+                )
+        except Exception:
+            user_model_data = {}
+            user_model_hints = []
+
         identity_basics = {}
         chapter_hint = _normalize_text(identity_profile_row.get("current_chapter"))
         if chapter_hint:
@@ -14044,38 +15344,63 @@ async def session_startbrief(
         wants_hint = _normalize_text(identity_profile_row.get("what_they_want"))
         if wants_hint:
             identity_basics["what_they_want"] = _shorten_line(wants_hint, 180)
-        recent_changes = _build_recent_high_signal_changes(recent_session_summaries, loop_items, max_items=3)
+        ingredients = select_startbrief_ingredients(
+            reference_now=reference_now,
+            last_session_end=last_activity_time,
+            sessions_today_count=sessions_today_count,
+            time_of_day_label=time_of_day_label,
+            recent_session_summaries=recent_session_summaries,
+            yesterday_daily_analysis=yesterday_analysis,
+            top_active_loops=loop_items,
+            user_model_hints=user_model_hints,
+            user_model=user_model_data,
+        )
+        scored_claims_all = list(ingredients.get("all_summary_scores") or [])
+        scored_loops_all = list(ingredients.get("all_loop_scores") or [])
+
+        selected_summaries = list(ingredients.get("selected_summaries") or [])
+        selected_summary_scores = list(ingredients.get("selected_summary_scores") or [])
+        selected_loops = list(ingredients.get("selected_loops") or [])
+        selected_loop_scores = list(ingredients.get("selected_loop_scores") or [])
+
+        selected_summary_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        for idx, summary_row in enumerate(selected_summaries):
+            metrics = selected_summary_scores[idx] if idx < len(selected_summary_scores) else {}
+            if float((metrics or {}).get("score") or 0.0) < STARTBRIEF_MIN_CLAIM_SCORE:
+                continue
+            selected_summary_pairs.append((summary_row, metrics or {}))
+            if len(selected_summary_pairs) >= STARTBRIEF_TOPK_CLAIMS:
+                break
+        selected_loop_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        for idx, loop_row in enumerate(selected_loops):
+            metrics = selected_loop_scores[idx] if idx < len(selected_loop_scores) else {}
+            if float((metrics or {}).get("score") or 0.0) < STARTBRIEF_MIN_LOOP_SCORE:
+                continue
+            selected_loop_pairs.append((loop_row, metrics or {}))
+            if len(selected_loop_pairs) >= STARTBRIEF_TOPK_LOOPS:
+                break
+
+        selected_summary_rows = [pair[0] for pair in selected_summary_pairs]
+        selected_loop_rows = [pair[0] for pair in selected_loop_pairs]
+        recent_changes = _build_recent_high_signal_changes(selected_summary_rows, selected_loop_rows, max_items=3)
         local_time = reference_now.strftime("%H:%M")
         first_session_today = sessions_today_count == 0
-        handover_text = _compose_structured_handover_text(
+        deterministic_handover_text = _compose_structured_handover_text(
             depth_label=depth_label,
             time_of_day_label=time_of_day_label,
             time_gap_human=time_gap_human,
             identity_basics=identity_basics,
             entity_hints=entity_hints,
-            top_loops=loop_items,
+            top_loops=selected_loop_rows,
             recent_changes=recent_changes,
         )
+        handover_text = deterministic_handover_text
 
         ops_context = {
             "identity": identity_basics,
-            "top_loops_today": [
-                {
-                    "text": _normalize_text(loop.get("text")),
-                    "type": _normalize_text(loop.get("type")) or None,
-                    "time_horizon": _normalize_text(loop.get("timeHorizon")) or None,
-                    "salience": int(loop.get("salience") or 0) if loop.get("salience") is not None else None,
-                }
-                for loop in loop_items[:3]
-                if _normalize_text(loop.get("text"))
-            ],
+            **compose_ops_context(ingredients, selected_loop_rows),
             "recent_changes": recent_changes[:3],
             "assistant_guidance": [],
-            "user_model_hints": [],
-            "user_model_hint_rows": [],
-            "yesterday_themes": [],
-            "steering_note": None,
-            "daily_analysis": {"date": None, "confidence": None, "updated_at": None},
         }
         try:
             low_confidence_rows = await db.fetch(
@@ -14133,7 +15458,7 @@ async def session_startbrief(
             logger.warning("startbrief primitive guidance lookup failed: %s", e)
         used_summary_ids = [
             _normalize_text(s.get("session_id"))
-            for s in recent_session_summaries[:2]
+            for s in selected_summary_rows[:STARTBRIEF_TOPK_CLAIMS]
             if _normalize_text(s.get("session_id")) and not _is_placeholder_value(s.get("session_id"))
         ]
         evidence_ids = used_summary_ids or fetched_summary_ids[:2]
@@ -14164,6 +15489,120 @@ async def session_startbrief(
         except Exception as e:
             logger.warning("startbrief ingest freshness lookup failed: %s", e)
 
+        selected_item_trace: List[Dict[str, Any]] = []
+        for summary_row, metrics in selected_summary_pairs:
+            sid = _normalize_text(summary_row.get("session_id"))
+            selected_item_trace.append(
+                {
+                    "type": "claim",
+                    "id": sid or None,
+                    "text": _shorten_line(_summary_text_for_scoring(summary_row), 220),
+                    "score": round(float(metrics.get("score") or 0.0), 4),
+                    "selected": True,
+                    "why": {
+                        "passed_threshold": float(metrics.get("score") or 0.0) >= STARTBRIEF_MIN_CLAIM_SCORE,
+                        "top_k": STARTBRIEF_TOPK_CLAIMS,
+                        "components": {
+                            "recency": metrics.get("recency"),
+                            "salience": metrics.get("salience"),
+                            "importance": metrics.get("importance"),
+                            "confidence": metrics.get("confidence"),
+                            "contradiction_penalty": metrics.get("contradiction_penalty"),
+                        },
+                    },
+                }
+            )
+        for loop_row, metrics in selected_loop_pairs:
+            selected_item_trace.append(
+                {
+                    "type": "loop",
+                    "id": _normalize_text(loop_row.get("id")) or None,
+                    "text": _shorten_line(_normalize_text(loop_row.get("text")), 220),
+                    "score": round(float(metrics.get("score") or 0.0), 4),
+                    "selected": True,
+                    "why": {
+                        "passed_threshold": float(metrics.get("score") or 0.0) >= STARTBRIEF_MIN_LOOP_SCORE,
+                        "top_k": STARTBRIEF_TOPK_LOOPS,
+                        "components": {
+                            "recency": metrics.get("recency"),
+                            "salience": metrics.get("salience"),
+                            "importance": metrics.get("importance"),
+                            "confidence": metrics.get("confidence"),
+                            "contradiction_penalty": metrics.get("contradiction_penalty"),
+                        },
+                    },
+                }
+            )
+
+        realizer_meta: Dict[str, Any] = {
+            "enabled": bool(get_settings().startbrief_realizer_enabled),
+            "used": False,
+            "valid": False,
+            "errors": [],
+            "line_refs": [],
+            "mode": "deterministic_fallback",
+        }
+        if bool(get_settings().startbrief_realizer_enabled):
+            evidence_rows = _startbrief_selected_evidence_bundle(
+                selected_summary_pairs=selected_summary_pairs,
+                selected_loop_pairs=selected_loop_pairs,
+            )
+            realization: Optional[Dict[str, Any]] = None
+            try:
+                realization = await _realize_startbrief_from_selected_evidence(
+                    depth_label=depth_label,
+                    time_of_day_label=time_of_day_label,
+                    gap_human=time_gap_human,
+                    evidence_rows=evidence_rows,
+                )
+            except Exception as e:
+                logger.warning("startbrief realizer call failed: %s", e)
+                realization = None
+            if realization:
+                strict_validate = bool(get_settings().startbrief_realizer_validate_strict)
+                validation_errors = _validate_startbrief_realization(
+                    realization=realization,
+                    evidence_rows=evidence_rows,
+                    require_loops=True,
+                ) if strict_validate else []
+                if not validation_errors:
+                    handover_lines = [
+                        _normalize_text((row or {}).get("line"))
+                        for row in (realization.get("handover_lines") or [])
+                        if _normalize_text((row or {}).get("line"))
+                    ]
+                    realized_handover = _compress_handover_text(_join_sentence_parts(handover_lines), depth_label) if handover_lines else None
+                    if realized_handover:
+                        handover_text = realized_handover
+                        ops_lines = [
+                            _normalize_text((row or {}).get("line"))
+                            for row in (realization.get("ops_context_lines") or [])
+                            if _normalize_text((row or {}).get("line"))
+                        ][:3]
+                        if ops_lines:
+                            ops_context["recent_changes"] = ops_lines
+                        realizer_meta = {
+                            "enabled": True,
+                            "used": True,
+                            "valid": True,
+                            "errors": [],
+                            "line_refs": [
+                                {
+                                    "line": _normalize_text((row or {}).get("line")),
+                                    "evidence_ids": [str(x) for x in ((row or {}).get("evidence_ids") or []) if _normalize_text(x)],
+                                }
+                                for row in (realization.get("handover_lines") or [])
+                                if _normalize_text((row or {}).get("line"))
+                            ],
+                            "mode": "realized",
+                        }
+                    else:
+                        realizer_meta["errors"] = ["empty_realized_handover"]
+                else:
+                    realizer_meta["errors"] = validation_errors
+            else:
+                realizer_meta["errors"] = ["no_realization"]
+
         response = SessionStartBriefResponse(
             handover_text=_normalize_text(handover_text),
             narrative=None,
@@ -14183,8 +15622,8 @@ async def session_startbrief(
             evidence={
                 "session_summary_ids_used": evidence_ids[:2],
                 "session_summary_ids_fetched": fetched_summary_ids[:5],
-                "claim_ranking": [],
-                "loop_ranking": [],
+                "claim_ranking": scored_claims_all[:20],
+                "loop_ranking": scored_loops_all[:20],
                 "claim_ranking_defs": {
                     "salience": "Immediate intensity/urgency of a session claim (short-horizon prominence).",
                     "importance": "Durable relevance inferred from recurrence across recent sessions and alignment with active loops.",
@@ -14200,6 +15639,12 @@ async def session_startbrief(
                 "summary_content_quality": summary_content_quality,
                 "fallback_used": bool(summary_norm_stats.get("fallback_used")),
                 "fallback_success": bool(summary_norm_stats.get("fallback_success")),
+                "selection_trace": selected_item_trace[: (STARTBRIEF_TOPK_CLAIMS + STARTBRIEF_TOPK_LOOPS)],
+                "selection_policy": {
+                    "claims": {"top_k": STARTBRIEF_TOPK_CLAIMS, "min_score": STARTBRIEF_MIN_CLAIM_SCORE},
+                    "loops": {"top_k": STARTBRIEF_TOPK_LOOPS, "min_score": STARTBRIEF_MIN_LOOP_SCORE},
+                },
+                "realizer": realizer_meta,
                 "daily_analysis_date_used": None,
                 "freshness": ingest_freshness,
                 "canonical_provenance": _canonical_provenance_payload(
@@ -14759,12 +16204,16 @@ async def purge_user(
 
 
 @app.post("/session/close")
-async def close_session(request: SessionCloseRequest):
+async def close_session(
+    request: SessionCloseRequest,
+    x_internal_token: str | None = Header(default=None),
+):
     """
     Public session close endpoint.
 
     Orchestrator should call this after inactivity to flush raw transcript to Graphiti.
     """
+    _require_internal_token(x_internal_token)
     try:
         # Determine session to close
         session_id = request.sessionId
@@ -14799,10 +16248,14 @@ async def close_session(request: SessionCloseRequest):
 
 
 @app.post("/session/ingest", response_model=SessionIngestResponse)
-async def ingest_session(request: SessionIngestRequest):
+async def ingest_session(
+    request: SessionIngestRequest,
+    x_internal_token: str | None = Header(default=None),
+):
     """
     Session-only ingestion: durably enqueue full transcript for async processing.
     """
+    _require_internal_token(x_internal_token)
     try:
         started_at = request.startedAt
         ended_at = request.endedAt
@@ -15144,6 +16597,14 @@ async def debug_loops(
     except Exception as e:
         logger.error(f"Debug loops endpoint error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/internal/debug/background_loops")
+async def debug_background_loops(
+    x_internal_token: str | None = Header(default=None)
+):
+    _require_internal_token(x_internal_token)
+    return {"loops": _background_loop_task_status(app)}
 
 
 @app.post("/internal/debug/close_session")

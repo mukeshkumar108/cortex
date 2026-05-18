@@ -48,7 +48,7 @@ Builds a compact startup packet for Sophie from living context, open threads, en
 
 ## `POST /memory/search`
 
-Semantic recall over `session_classifications.memory_deltas`.
+Semantic recall over legacy session embeddings. This is not the source of truth for actionable state.
 
 ### Request
 
@@ -72,7 +72,7 @@ Semantic recall over `session_classifications.memory_deltas`.
       "session_date": "ISO8601",
       "session_kind": "personal|technical|mixed|transient",
       "emotional_weight": "none|low|medium|high",
-      "memory_deltas": [],
+      "summary": "optional summary or tension hint",
       "similarity": 0.52
     }
   ]
@@ -88,4 +88,3 @@ Semantic recall over `session_classifications.memory_deltas`.
 
 - Environment in docs may expose API on `:8000`.
 - If local orchestration maps to `:3000`, use that base URL accordingly.
-

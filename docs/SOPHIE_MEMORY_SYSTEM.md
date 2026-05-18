@@ -99,17 +99,22 @@ Living context is a primary primitive. It is the synthesis of everything else in
 
 ---
 
-### Memory Deltas
-What changed in this session. Not a summary — a signal. What was new, what shifted, what was said for the first time.
+### Actionable Candidates
+Attention-worthy items inferred from messy human language: tasks, reminders, commitments, and events.
 
-Memory deltas are input primitives. They are the raw material the synthesis passes work from. They do not persist as serving-layer outputs. They feed the system.
+This lane is conceptually the action/tool candidates lane. The current storage name remains `actionable_candidates`.
+
+They are stored as unconfirmed candidates in `actionable_candidates`. They can come from any source and can later be reviewed, reconciled, confirmed, dismissed, or acted on by later systems. `record_type` stays coarse, while `candidate_subtype` carries more specific shapes like `todo`, `calendar_event`, `habit`, `waiting_on`, and `nudge`.
 
 ---
 
 ## The Six Passes and What Each One Does
 
 **Pass 1 — Triage**
-Reads the new session transcript. Detects what matters. Flags identity signals, context deltas, entity mentions, emotional weight, tension signals. Writes memory deltas. This is the entry point for everything. Every subsequent pass depends on what Pass 1 finds.
+Reads the new session transcript. Decides whether it is memory-worthy and sets routing flags for downstream lanes. Pass 1 is triage only. It does not write actionable candidates, memory deltas, or identity-signal payloads.
+
+**Pass 2 — Action/tool candidates**
+Reads the raw session transcript when Pass 1 flags attention-worthy signal. Extracts possible tasks, reminders, commitments, events, habits, follow-ups, waiting-on states, and nudges into `actionable_candidates`. This lane is LLM-based and does not use keyword heuristics.
 
 **Pass 1.5 — Entity resolution**
 Updates entity profiles based on what Pass 1 found. Matches mentions to known entities. Creates new entities when needed. Updates relationship understanding. Every update is evidence-backed.

@@ -6,12 +6,17 @@ Synapse is:
 > An evidence-grounded context engine that transforms raw conversation history into the minimum useful context an LLM needs to behave with continuity and accuracy.
 
 ## 2. Core Principles
-- Evidence is the only ground truth.
-- Claims are the only canonical semantic memory.
-- Derived projections must never be treated as factual truth.
+- Synapse owns user-state and semantic intelligence.
+- Sophie decides what happens next and executes tools.
+- External systems own native operational artifacts.
+- Sophie-native actions may be canonical in Synapse as `action_items`.
+- For external artifacts, Synapse stores references, projections, and interpreted state rather than duplicated operational truth.
+- Private sources can influence behaviour, but must not become conversational evidence.
+- Raw private data is ephemeral; derived state is durable and minimized.
+- Every state object must carry provenance, confidence, timestamps, and freshness.
+- Uncertainty, conflict, and staleness must be explicit.
 - Retrieval must respect strict lane separation (`factual` / `episodic` / `continuity`).
 - System must be deterministic and auditable.
-- Given the same evidence, resolver version, policy version, and canonicalization rules, Synapse must produce the same claim state.
 
 ## 3. Canonical vs Derived
 ### Canonical
@@ -41,6 +46,19 @@ Derived outputs may guide ranking, continuity, and behavior, but they must never
 - **Signal**: claims and resolved entities derived from evidence.
 - **Interpretation**: derived projections for continuity and operator UX.
 - **Delivery**: runtime packets returned to assistants and clients.
+
+## 4a. First-Class Synapse Primitives
+- `action_items`
+- `action_candidates`
+- `action_updates`
+- `commitments`
+- `signals`
+- `open_threads`
+- `entity_profiles`
+- `identity_profile`
+- `living_context`
+
+Follow-ups are not first-class primitives. Follow-ups, nudges, check-ins, and review prompts are derived attention moments generated from existing primitives and must reference their source object(s).
 
 ## 5. Write Pipeline
 1. **Ingest**: persist turns and session boundaries.

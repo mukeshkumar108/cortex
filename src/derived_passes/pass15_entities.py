@@ -179,6 +179,53 @@ Return JSON only — no preamble, no markdown fences:
 }}
 """
 
+ENTITY_DISCOVERY_PROMPT = """You are identifying durable entity mentions from a user transcript for a personal AI assistant.
+
+Your job is only to identify named entities worth sending to a downstream entity-resolution pass.
+
+Include only named things that materially matter to the user's life or work:
+- people
+- projects/products/companies
+- places with ongoing relevance
+- other named things with durable memory value
+
+Skip:
+- generic nouns
+- one-off tools/frameworks/libraries/model names unless clearly central to the user's world
+- media titles mentioned casually
+- vague references like "someone" or "they"
+
+Only use USER turns.
+
+Return JSON only:
+{{
+  "entity_mentions": ["Riley", "Bluum"]
+}}
+
+If none, return:
+{{
+  "entity_mentions": []
+}}
+
+Transcript:
+{transcript_text}
+"""
+
+
+async def discover_entity_mentions(
+    *,
+    messages: List[Dict[str, Any]],
+    model: str,
+) -> Optional[List[str]]:
+    transcript_text = format_user_turns(messages)
+    if not transcript_text:
+        return None
+    prompt = ENTITY_DISCOVERY_PROMPT.format(transcript_text=transcript_text)
+    parsed = await call_json_llm(prompt=prompt, model=model, max_tokens=1000, temperature=0.1)
+    if not parsed:
+        return None
+    return text_list(parsed.get("entity_mentions"), limit=20)
+
 
 
 

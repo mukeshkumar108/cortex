@@ -422,6 +422,114 @@ class DailyAnalysisResponse(BaseModel):
     metadata: Dict[str, Any] = {}
 
 
+class ActionableCandidateItem(BaseModel):
+    id: int
+    kind: str
+    candidateSubtype: Optional[str] = None
+    title: str
+    summary: Optional[str] = None
+    priority: Optional[str] = None
+    dueIso: Optional[str] = None
+    startIso: Optional[str] = None
+    endIso: Optional[str] = None
+    waitingOn: Optional[str] = None
+    needsResponse: Optional[bool] = None
+    cadenceText: Optional[str] = None
+    sourceType: str = "chat"
+    sourceId: Optional[str] = None
+    sourceUrl: Optional[str] = None
+    collectedAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+    provenance: Dict[str, Any] = {}
+    confidence: Optional[float] = None
+    confidenceLabel: Optional[str] = None
+    userConfirmed: Optional[bool] = None
+    status: str
+
+    # Legacy compatibility fields; do not use for new consumers.
+    suggestedAction: Optional[str] = None
+    linkedExternalId: Optional[str] = None
+    linkedExternalType: Optional[str] = None
+    sessionId: Optional[str] = None
+    recordType: Optional[str] = None
+    relevantFromIso: Optional[str] = None
+    relevantUntilIso: Optional[str] = None
+    source: Optional[str] = None
+    createdAt: Optional[str] = None
+
+
+class DailyCandidatesResponse(BaseModel):
+    tenantId: str
+    userId: str
+    asOf: str
+    needsReview: List[ActionableCandidateItem] = []
+    upcomingCommitments: List[ActionableCandidateItem] = []
+    detected: List[ActionableCandidateItem] = []
+    metadata: Dict[str, Any] = {}
+
+
+class ReviewQueueResponse(BaseModel):
+    tenantId: str
+    userId: str
+    asOf: str
+    items: List[ActionableCandidateItem] = []
+    byType: Dict[str, List[ActionableCandidateItem]] = {}
+    metadata: Dict[str, Any] = {}
+
+
+class SessionChangeItem(BaseModel):
+    id: int
+    kind: str
+    title: str
+    summary: Optional[str] = None
+    effectiveIso: Optional[str] = None
+    sourceType: str = "chat"
+    sourceId: Optional[str] = None
+    sourceUrl: Optional[str] = None
+    collectedAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+    provenance: Dict[str, Any] = {}
+    confidence: Optional[float] = None
+    confidenceLabel: Optional[str] = None
+    status: str
+    sessionId: Optional[str] = None
+
+
+class SessionChangesResponse(BaseModel):
+    tenantId: str
+    userId: str
+    asOf: str
+    items: List[SessionChangeItem] = []
+    byKind: Dict[str, List[SessionChangeItem]] = {}
+    metadata: Dict[str, Any] = {}
+
+
+class EntityCandidateItem(BaseModel):
+    id: int
+    name: str
+    candidateType: str
+    summary: Optional[str] = None
+    sourceType: str = "chat"
+    sourceId: Optional[str] = None
+    sourceUrl: Optional[str] = None
+    collectedAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+    provenance: Dict[str, Any] = {}
+    confidence: Optional[float] = None
+    confidenceLabel: Optional[str] = None
+    status: str
+    sessionId: Optional[str] = None
+
+
+class EntityCandidatesResponse(BaseModel):
+    tenantId: str
+    userId: str
+    asOf: str
+    items: List[EntityCandidateItem] = []
+    byType: Dict[str, List[EntityCandidateItem]] = {}
+    metadata: Dict[str, Any] = {}
+
+
 class HabitDailyLogUpsertRequest(BaseModel):
     tenantId: str
     userId: str
@@ -479,3 +587,132 @@ class RuntimeSteeringPacket(BaseModel):
     steeringHints: List[str] = []
     constraints: Dict[str, Any] = {}
     metadata: Dict[str, Any] = {}
+
+class ActionItemCreateRequest(BaseModel):
+    tenantId: str
+    userId: str
+    kind: str
+    title: str
+    notes: Optional[str] = None
+    dueAt: Optional[datetime] = None
+    remindAt: Optional[datetime] = None
+    recurrenceRule: Optional[str] = None
+    sourceType: Optional[str] = None
+    sourceRef: Optional[Dict[str, Any]] = None
+    confidence: Optional[float] = None
+    provenanceSummary: Optional[str] = None
+
+
+class ActionItemStatusUpdateRequest(BaseModel):
+    tenantId: str
+    userId: str
+    status: str
+    reason: Optional[str] = None
+
+
+class ActionItemPatchRequest(BaseModel):
+    tenantId: str
+    userId: str
+    actor: Optional[str] = "user"
+    reason: Optional[str] = None
+    title: Optional[str] = None
+    notes: Optional[str] = None
+    kind: Optional[str] = None
+    dueAt: Optional[datetime] = None
+    due_at: Optional[datetime] = None
+    remindAt: Optional[datetime] = None
+    remind_at: Optional[datetime] = None
+    recurrenceRule: Optional[str] = None
+    status: Optional[str] = None
+
+
+class CandidatePromotionRequest(BaseModel):
+    tenantId: str
+    userId: str
+    candidateId: int
+    overrides: Optional[Dict[str, Any]] = None
+
+
+class DailyAgendaResponse(BaseModel):
+    date: str
+    timezone: str
+    dueToday: List[Dict[str, Any]] = []
+    remindersToday: List[Dict[str, Any]] = []
+    overdue: List[Dict[str, Any]] = []
+    pendingCandidates: List[Dict[str, Any]] = []
+    counts: Dict[str, int] = {}
+    suggestedActions: List[str] = []
+
+
+class CalendarItemCreateRequest(BaseModel):
+    tenantId: str
+    userId: str
+    title: str
+    description: Optional[str] = None
+    notes: Optional[str] = None
+    startsAt: datetime
+    endsAt: Optional[datetime] = None
+    timezone: Optional[str] = "UTC"
+    allDay: Optional[bool] = False
+    location: Optional[str] = None
+    participants: Optional[List[Dict[str, Any]]] = None
+    organizer: Optional[Dict[str, Any]] = None
+    rsvpStatus: Optional[str] = None
+    status: Optional[str] = None
+    sourceKind: Optional[str] = None
+    sourceRef: Optional[Dict[str, Any]] = None
+    evidenceRefs: Optional[List[Dict[str, Any]]] = None
+    provenanceSummary: Optional[str] = None
+    confidence: Optional[float] = None
+    externalProvider: Optional[str] = None
+    externalId: Optional[str] = None
+    externalCalendarId: Optional[str] = None
+    externalEtag: Optional[str] = None
+    externalUpdatedAt: Optional[datetime] = None
+    syncStatus: Optional[str] = None
+    recurrenceRule: Optional[str] = None
+    recurrenceParentId: Optional[str] = None
+    dedupeKey: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class CalendarItemPatchRequest(BaseModel):
+    tenantId: str
+    userId: str
+    actor: Optional[str] = "user"
+    reason: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    notes: Optional[str] = None
+    startsAt: Optional[datetime] = None
+    endsAt: Optional[datetime] = None
+    timezone: Optional[str] = None
+    allDay: Optional[bool] = None
+    location: Optional[str] = None
+    participants: Optional[List[Dict[str, Any]]] = None
+    organizer: Optional[Dict[str, Any]] = None
+    rsvpStatus: Optional[str] = None
+    status: Optional[str] = None
+    sourceKind: Optional[str] = None
+    sourceRef: Optional[Dict[str, Any]] = None
+    evidenceRefs: Optional[List[Dict[str, Any]]] = None
+    provenanceSummary: Optional[str] = None
+    confidence: Optional[float] = None
+    externalProvider: Optional[str] = None
+    externalId: Optional[str] = None
+    externalCalendarId: Optional[str] = None
+    externalEtag: Optional[str] = None
+    externalUpdatedAt: Optional[datetime] = None
+    syncStatus: Optional[str] = None
+    recurrenceRule: Optional[str] = None
+    recurrenceParentId: Optional[str] = None
+    dedupeKey: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class GoogleCalendarImportRequest(BaseModel):
+    tenantId: str = "default"
+    userId: str
+    dateFrom: str
+    dateTo: str
+    googleEmail: Optional[str] = None
