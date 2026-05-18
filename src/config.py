@@ -30,7 +30,8 @@ class Settings(BaseSettings):
     openrouter_model_loops: str = "xiaomi/mimo-v2-flash"
     openrouter_model_session_episode: str = "xiaomi/mimo-v2-flash"
     openrouter_model_identity: str = "amazon/nova-micro-v1"
-    openrouter_model_fallback: str = "mistral/ministral-3b"
+    # Keep this on a valid OpenRouter slug; "mistral/ministral-3b" is invalid.
+    openrouter_model_fallback: str = "mistralai/ministral-3b-2512"
     openrouter_reasoning_enabled: bool = False
     memory_semantic_enabled: bool = True
     memory_semantic_embedding_enabled: bool = True

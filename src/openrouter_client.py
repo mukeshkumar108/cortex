@@ -26,7 +26,8 @@ class OpenRouterClient:
         self.model_loops = getattr(self.settings, 'openrouter_model_loops', 'xiaomi/mimo-v2-flash')
         self.model_session_episode = getattr(self.settings, 'openrouter_model_session_episode', 'xiaomi/mimo-v2-flash')
         self.model_identity = getattr(self.settings, 'openrouter_model_identity', self.model_summary)
-        self.model_fallback = getattr(self.settings, 'openrouter_model_fallback', 'mistral/ministral-3b')
+        # Mirror config default and guard against the legacy invalid OpenRouter slug.
+        self.model_fallback = getattr(self.settings, 'openrouter_model_fallback', 'mistralai/ministral-3b-2512')
         self.reasoning_enabled = bool(getattr(self.settings, 'openrouter_reasoning_enabled', False))
         self.timeout = float(getattr(self.settings, 'llm_timeout', 10))
         self.base_url = "https://openrouter.ai/api/v1"
