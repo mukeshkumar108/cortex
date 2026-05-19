@@ -50,6 +50,7 @@ from .models import (
     ActionableCandidateItem,
     DailyCandidatesResponse,
     ReviewQueueResponse,
+    AttentionPreviewResponse,
     SessionChangeItem,
     SessionChangesResponse,
     EntityCandidateItem,
@@ -160,6 +161,7 @@ from .calendar_state import (
 )
 from .day_brief import DayBriefError, buildDayBrief
 from .google_calendar_import import GoogleCalendarImportError, import_google_calendar_events
+from .attention_preview import build_attention_preview
 
 # Configure logging
 logging.basicConfig(
@@ -17006,6 +17008,36 @@ async def debug_always_on_packet(
     except Exception as e:
         logger.error("Debug always-on packet failed: %s", e)
         raise HTTPException(status_code=500, detail="Debug always-on packet failed")
+
+
+@app.get("/internal/debug/attention", response_model=AttentionPreviewResponse)
+async def debug_attention_preview(
+    tenantId: str = "default",
+    userId: str | None = None,
+    companionId: str = "sophie",
+    limit: int = 20,
+    includeExpired: bool = False,
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    if not _normalize_text(userId):
+        raise HTTPException(status_code=400, detail="userId is required")
+    try:
+        tenant_id = _normalize_text(_canonical_tenant_id(tenantId)) or tenantId
+        payload = await build_attention_preview(
+            db,
+            tenant_id=tenant_id,
+            user_id=_normalize_text(userId),
+            companion_id=companionId,
+            limit=limit,
+            include_expired=includeExpired,
+        )
+        return AttentionPreviewResponse(**payload)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Debug attention preview failed: %s", e)
+        raise HTTPException(status_code=500, detail="Debug attention preview failed")
 
 
 @app.post("/internal/debug/proactive-shadow/rebuild")

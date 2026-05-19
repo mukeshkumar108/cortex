@@ -477,6 +477,44 @@ class ReviewQueueResponse(BaseModel):
     metadata: Dict[str, Any] = {}
 
 
+class AttentionPreviewItem(BaseModel):
+    id: str
+    tenant_id: str
+    user_id: str
+    companion_id: str
+    title: str
+    reason: str
+    attention_type: str
+    surface_mode: str
+    action_policy: str
+    priority: int
+    urgency: int
+    importance: int
+    confidence: float
+    sensitivity: str
+    earliest_surface_at: Optional[str] = None
+    ideal_surface_at: Optional[str] = None
+    latest_useful_at: Optional[str] = None
+    expires_at: Optional[str] = None
+    status: str
+    source_table: str
+    source_id: str
+    source_object_ids: List[str] = []
+    source_link_ids: List[str] = []
+    evidence_refs: List[Dict[str, Any]] = []
+    gaps: List[str] = []
+    missing_metadata: List[str] = []
+
+
+class AttentionPreviewResponse(BaseModel):
+    tenantId: str
+    userId: str
+    companionId: str
+    asOf: str
+    items: List[AttentionPreviewItem] = []
+    metadata: Dict[str, Any] = {}
+
+
 class SessionChangeItem(BaseModel):
     id: int
     kind: str
