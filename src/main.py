@@ -40,6 +40,7 @@ from .models import (
     SessionCloseRequest,
     SessionIngestRequest,
     SessionIngestResponse,
+    SessionHandoverPacketResponse,
     SessionBriefResponse,
     EntityProfileRequest,
     EntityProfileResponse,
@@ -162,6 +163,7 @@ from .calendar_state import (
 from .day_brief import DayBriefError, buildDayBrief
 from .google_calendar_import import GoogleCalendarImportError, import_google_calendar_events
 from .attention_preview import build_attention_preview
+from .fast_handover import get_latest_fast_handover_packet
 
 # Configure logging
 logging.basicConfig(
@@ -212,6 +214,38 @@ USER_PREFERENCE_PATTERNS = [
 
 def _normalize_text(value: Any) -> str:
     return canonicalize_text(value, casefold=False)
+
+
+def _session_handover_response_from_row(row: Optional[Dict[str, Any]], *, tenant_id: str, user_id: str) -> SessionHandoverPacketResponse:
+    if not row:
+        return SessionHandoverPacketResponse(
+            exists=False,
+            tenantId=tenant_id,
+            userId=user_id,
+            metadata={"readOnly": True},
+        )
+    return SessionHandoverPacketResponse(
+        exists=True,
+        tenantId=tenant_id,
+        userId=user_id,
+        sessionId=_normalize_text(row.get("session_id")) or None,
+        summary=_normalize_text(row.get("summary")) or None,
+        openQuestions=row.get("open_questions") if isinstance(row.get("open_questions"), list) else [],
+        unresolvedDecisions=row.get("unresolved_decisions") if isinstance(row.get("unresolved_decisions"), list) else [],
+        pendingActions=row.get("pending_actions") if isinstance(row.get("pending_actions"), list) else [],
+        recentStateNote=_normalize_text(row.get("recent_state_note")) or None,
+        importantPeople=row.get("important_people") if isinstance(row.get("important_people"), list) else [],
+        activeTopics=row.get("active_topics") if isinstance(row.get("active_topics"), list) else [],
+        doNotOverdo=row.get("do_not_overdo") if isinstance(row.get("do_not_overdo"), list) else [],
+        createdAt=row.get("created_at").isoformat() if isinstance(row.get("created_at"), datetime) else _normalize_text(row.get("created_at")) or None,
+        expiresAt=row.get("expires_at").isoformat() if isinstance(row.get("expires_at"), datetime) else _normalize_text(row.get("expires_at")) or None,
+        sourceTurnRefs=row.get("source_turn_refs") if isinstance(row.get("source_turn_refs"), list) else [],
+        status=_normalize_text(row.get("status")) or None,
+        metadata={
+            "readOnly": True,
+            "source": "session_handover_packets",
+        },
+    )
 
 
 def _relationship_anchor_rank(value: Any) -> int:
@@ -16541,6 +16575,29 @@ async def debug_session_ingest_status(
     except Exception as e:
         logger.error(f"Debug session ingest status error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/internal/debug/session-handover", response_model=SessionHandoverPacketResponse)
+async def debug_session_handover(
+    tenantId: str,
+    userId: str,
+    sessionId: str | None = None,
+    includeExpired: bool = False,
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    try:
+        row = await get_latest_fast_handover_packet(
+            db,
+            tenant_id=tenantId,
+            user_id=userId,
+            session_id=sessionId,
+            include_expired=bool(includeExpired),
+        )
+        return _session_handover_response_from_row(row, tenant_id=tenantId, user_id=userId)
+    except Exception as e:
+        logger.error("Debug session handover failed: %s", e)
+        raise HTTPException(status_code=500, detail="Debug session handover failed")
 
 
 @app.get("/internal/debug/loops")

@@ -383,6 +383,26 @@ class SessionIngestResponse(BaseModel):
     graphitiAdded: bool = False
 
 
+class SessionHandoverPacketResponse(BaseModel):
+    exists: bool = False
+    tenantId: Optional[str] = None
+    userId: Optional[str] = None
+    sessionId: Optional[str] = None
+    summary: Optional[str] = None
+    openQuestions: List[str] = []
+    unresolvedDecisions: List[str] = []
+    pendingActions: List[str] = []
+    recentStateNote: Optional[str] = None
+    importantPeople: List[str] = []
+    activeTopics: List[str] = []
+    doNotOverdo: List[str] = []
+    createdAt: Optional[str] = None
+    expiresAt: Optional[str] = None
+    sourceTurnRefs: List[Dict[str, Any]] = []
+    status: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+
+
 class PurgeUserRequest(BaseModel):
     tenantId: str
     userId: str

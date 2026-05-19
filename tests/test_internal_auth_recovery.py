@@ -72,6 +72,11 @@ def _enforce_internal_auth(monkeypatch):
             "/internal/debug/attention",
             {"params": {"tenantId": "default", "userId": "u1"}},
         ),
+        (
+            "get",
+            "/internal/debug/session-handover",
+            {"params": {"tenantId": "default", "userId": "u1"}},
+        ),
     ],
 )
 async def test_internal_auth_rejects_missing_and_wrong_tokens(_enforce_internal_auth, method, path, kwargs):

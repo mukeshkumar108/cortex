@@ -26,6 +26,7 @@ from .config import get_settings
 from .openrouter_client import get_llm_client
 from .episodic_memory import upsert_session_episode_embeddings
 from .canonicalization import stable_short_hash
+from .fast_handover import persist_fast_handover_packet
 from . import loops
 
 logger = logging.getLogger(__name__)
@@ -739,6 +740,23 @@ class SessionManager:
                         session_id,
                     )
                     return
+                try:
+                    await persist_fast_handover_packet(
+                        conn,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        session_id=session_id,
+                        messages=messages_payload,
+                        created_at=reference_time,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "fast handover packet write failed tenant=%s user=%s session=%s err=%s",
+                        tenant_id,
+                        user_id,
+                        session_id,
+                        e,
+                    )
                 await conn.execute(
                     """
                     INSERT INTO graphiti_outbox (

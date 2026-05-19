@@ -131,6 +131,34 @@ async def test_schema_migration():
             """
         )
         assert relationship_status_domains_idx == "idx_memory_relationship_links_user_status_domains"
+
+        handover_table = await conn.fetchval("SELECT to_regclass('public.session_handover_packets')")
+        assert handover_table == "session_handover_packets"
+
+        handover_cols = await conn.fetch(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'session_handover_packets'
+            """
+        )
+        handover_col_names = {row["column_name"] for row in handover_cols}
+        assert {
+            "tenant_id",
+            "user_id",
+            "session_id",
+            "summary",
+            "open_questions",
+            "unresolved_decisions",
+            "pending_actions",
+            "recent_state_note",
+            "important_people",
+            "active_topics",
+            "do_not_overdo",
+            "expires_at",
+            "source_turn_refs",
+            "status",
+        }.issubset(handover_col_names)
     finally:
         await conn.close()
 

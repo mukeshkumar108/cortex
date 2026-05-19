@@ -117,16 +117,42 @@ Attention preview sits *on top* of baseline memory. It does not replace it. It q
 
 ## 10. Fast handover / quick new session behaviour
 
-**Problem:** If a user closes a session and starts a new one 30 seconds later, the deep synthesis (Passes 1-5) may not have completed.
+**Problem:** If a user closes a session and starts a new one quickly, the deep synthesis passes may not have finished yet. That creates a continuity gap: the companion can miss the obvious "where we just left off" cues even though the raw transcript already exists.
 
-**Current Behavior:** 
-Synapse relies on the `living_context` and `/session/startbrief` payloads. However, if deep synthesis hasn't run, the latest transcript data might be missing from the canonical tables.
+**Fast Handover Packet:**
+Synapse now writes a short-lived `session_handover_packets` record on the fast session path. It is generated directly from the current session transcript, without waiting for Pass 3/4/5.
 
-**Target Direction (Session Handover Packet):**
-We need a formal, short-lived "handover packet" bridging the gap. It should include:
-*   The raw summary of the immediately preceding session (if synthesis is pending).
-*   Any open questions or unresolved explicit decisions from the last 15 minutes.
-*   A TTL (Time-To-Live) of ~1-2 hours, after which the deep synthesis is guaranteed to have caught up.
+What it contains:
+*   `summary`
+*   `open_questions`
+*   `unresolved_decisions`
+*   `pending_actions`
+*   `recent_state_note`
+*   `important_people`
+*   `active_topics`
+*   `do_not_overdo`
+*   `source_turn_refs`
+
+Why it exists:
+*   It bridges the immediate continuity gap.
+*   It gives Sophie or another companion a bounded "pickup point" before deep synthesis catches up.
+*   It is explicitly **not** durable identity, living context, or long-term profile memory.
+
+How it differs from Pass 4 / Pass 5:
+*   **Fast Handover:** immediate, deterministic, transcript-local, short TTL, conservative.
+*   **Pass 4 Identity:** durable synthesis of who the user is across sessions.
+*   **Pass 5 Living Context:** broader recent-state synthesis across multiple sessions and recent changes.
+
+Expiry rules:
+*   Default TTL is short-lived: currently ~18 hours.
+*   Expired packets are ignored by default when retrieving the latest packet.
+*   Recent state is treated as provisional and should be re-checked before acting on it.
+
+Current limitations:
+*   It uses deterministic heuristics, not deep semantic synthesis.
+*   It should capture obvious next actions and open questions well, but it will miss subtler narrative continuity.
+*   It intentionally avoids turning flippant or momentary mood statements into durable truth.
+*   It is retrievable for internal/debug continuity checks; it is not delivery automation.
 
 ## 11. Serving surfaces today
 
