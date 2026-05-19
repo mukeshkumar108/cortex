@@ -570,6 +570,39 @@ class AttentionOutcomeResponse(BaseModel):
     createdAt: Optional[str] = None
 
 
+class TimelineEventItem(BaseModel):
+    id: str
+    tenant_id: str
+    user_id: str
+    event_type: str
+    domain: str
+    title: str
+    summary: Optional[str] = None
+    source_table: str
+    source_id: str
+    occurred_at: Optional[str] = None
+    first_seen_at: Optional[str] = None
+    last_seen_at: Optional[str] = None
+    expires_at: Optional[str] = None
+    status: Optional[str] = None
+    confidence: Optional[float] = None
+    salience: Optional[float] = None
+    evidence_refs: List[Dict[str, Any]] = []
+    related_object_ids: List[str] = []
+    related_link_ids: List[str] = []
+    freshness: str
+    gaps: List[str] = []
+    missing_metadata: List[str] = []
+
+
+class TimelineReadModelResponse(BaseModel):
+    tenantId: str
+    userId: str
+    asOf: str
+    items: List[TimelineEventItem] = []
+    metadata: Dict[str, Any] = {}
+
+
 class SessionChangeItem(BaseModel):
     id: int
     kind: str

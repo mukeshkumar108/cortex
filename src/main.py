@@ -54,6 +54,7 @@ from .models import (
     AttentionPreviewResponse,
     AttentionOutcomeRecordRequest,
     AttentionOutcomeResponse,
+    TimelineReadModelResponse,
     SessionChangeItem,
     SessionChangesResponse,
     EntityCandidateItem,
@@ -167,6 +168,7 @@ from .google_calendar_import import GoogleCalendarImportError, import_google_cal
 from .attention_preview import build_attention_preview
 from .attention_outcomes import record_attention_outcome
 from .fast_handover import get_latest_fast_handover_packet
+from .timeline_read_model import build_timeline_read_model
 
 # Configure logging
 logging.basicConfig(
@@ -17153,6 +17155,40 @@ async def debug_record_attention_outcome(
     except Exception as e:
         logger.error("Debug attention outcome record failed: %s", e)
         raise HTTPException(status_code=500, detail="Debug attention outcome record failed")
+
+
+@app.get("/internal/debug/timeline", response_model=TimelineReadModelResponse)
+async def debug_timeline_read_model(
+    tenantId: str = "default",
+    userId: str | None = None,
+    limit: int = 50,
+    since: str | None = None,
+    includeExpired: bool = False,
+    domain: str | None = None,
+    sourceTable: str | None = None,
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    if not _normalize_text(userId):
+        raise HTTPException(status_code=400, detail="userId is required")
+    tenant_id = _normalize_text(_canonical_tenant_id(tenantId)) or tenantId
+    try:
+        payload = await build_timeline_read_model(
+            db,
+            tenant_id=tenant_id,
+            user_id=_normalize_text(userId),
+            limit=limit,
+            since=_parse_iso_datetime(since) if since else None,
+            include_expired=includeExpired,
+            domain=domain,
+            source_table=sourceTable,
+        )
+        return TimelineReadModelResponse(**payload)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Debug timeline read model failed: %s", e)
+        raise HTTPException(status_code=500, detail="Debug timeline read model failed")
 
 
 @app.post("/internal/debug/proactive-shadow/rebuild")

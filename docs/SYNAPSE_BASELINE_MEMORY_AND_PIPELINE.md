@@ -162,12 +162,14 @@ Current limitations:
 | `/signals/pack` | Compact proactive steering hints. | Active. |
 | `/memory/query` | Targeted recall (factual, episodic). | Active. |
 | `/internal/debug/attention` | Read-only dynamic queue of Attention Items. | **Active (v1).** Filters by Companion Profile, hides expired items, supports `includeExpired=true`. |
+| `/internal/debug/timeline` | Read-only normalized recent memory timeline across existing tables. | **Active (v1).** Internal/debug only; exposes freshness, first/last seen timing, expiry, and source-table provenance for state decay inspection. |
 | `/actions/items` | Mutations on actionable objects. | Active. |
 | `/user/model` | Synthesized durable user profile. | Legacy. Being replaced by Identity/Profile passes. |
 
 ## 12. What is still missing
 
 *   **Outcome Feedback:** A lightweight internal attention outcome loop now exists for debug/preview filtering, but it is not full memory management or upstream object mutation yet.
+*   **Timeline Is Still a Read Model:** `/internal/debug/timeline` now exposes recent memory rows with freshness heuristics, but it does not yet mutate upstream objects or provide a canonical decay engine by itself.
 *   **Candidate Fragmentation:** `actionable_candidates`, `follow_up_candidates`, etc., still exist as separate tables rather than being unified into primary objects with `status='detected'`.
 *   **Missing Metadata:** Some primary objects still lack `primary_domain` enforcement.
 *   **Evidence Refs in Attention Preview:** While `source_object_ids` and `source_link_ids` are mapped best-effort, exact turn-level `evidence_refs` are sometimes lost in the candidate abstraction layer.
