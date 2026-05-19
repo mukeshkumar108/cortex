@@ -159,6 +159,45 @@ async def test_schema_migration():
             "source_turn_refs",
             "status",
         }.issubset(handover_col_names)
+
+        attention_outcomes_table = await conn.fetchval("SELECT to_regclass('public.attention_outcomes')")
+        assert attention_outcomes_table == "attention_outcomes"
+
+        attention_outcome_cols = await conn.fetch(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'attention_outcomes'
+            """
+        )
+        attention_outcome_col_names = {row["column_name"] for row in attention_outcome_cols}
+        assert {
+            "tenant_id",
+            "user_id",
+            "companion_id",
+            "attention_item_id",
+            "source_table",
+            "source_id",
+            "outcome_type",
+            "outcome_reason",
+            "surface_mode",
+            "action_policy",
+            "occurred_at",
+            "snoozed_until",
+            "suppress_until",
+            "metadata",
+        }.issubset(attention_outcome_col_names)
+
+        attention_outcome_item_idx = await conn.fetchval(
+            """
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = 'attention_outcomes'
+              AND indexname = 'idx_attention_outcomes_user_item_occurred'
+            """
+        )
+        assert attention_outcome_item_idx == "idx_attention_outcomes_user_item_occurred"
     finally:
         await conn.close()
 
