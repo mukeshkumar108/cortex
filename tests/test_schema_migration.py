@@ -92,6 +92,45 @@ async def test_schema_migration():
             )
             names = {row["column_name"] for row in cols}
             assert "distinct_session_count" in names
+
+        relationship_cols = await conn.fetch(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'memory_relationship_links'
+            """
+        )
+        relationship_col_names = {row["column_name"] for row in relationship_cols}
+        assert {
+            "source_domain",
+            "target_domain",
+            "status",
+            "strength",
+            "valid_from",
+            "valid_until",
+            "expires_at",
+        }.issubset(relationship_col_names)
+
+        relationship_status_constraint = await conn.fetchval(
+            """
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid = 'memory_relationship_links'::regclass
+              AND conname = 'memory_relationship_links_status_check'
+            """
+        )
+        assert relationship_status_constraint == "memory_relationship_links_status_check"
+
+        relationship_status_domains_idx = await conn.fetchval(
+            """
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = 'memory_relationship_links'
+              AND indexname = 'idx_memory_relationship_links_user_status_domains'
+            """
+        )
+        assert relationship_status_domains_idx == "idx_memory_relationship_links_user_status_domains"
     finally:
         await conn.close()
 

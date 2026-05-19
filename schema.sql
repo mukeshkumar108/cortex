@@ -646,14 +646,22 @@ CREATE TABLE IF NOT EXISTS memory_relationship_links (
   link_id BIGSERIAL PRIMARY KEY,
   tenant_id TEXT NOT NULL DEFAULT 'default',
   user_id TEXT NOT NULL,
+  source_domain TEXT,
   source_type TEXT NOT NULL,
   source_id TEXT NOT NULL,
+  target_domain TEXT,
   target_type TEXT NOT NULL,
   target_id TEXT NOT NULL,
   relationship_type TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('detected', 'confirmed', 'active', 'stale', 'dismissed', 'archived', 'contradicted')),
   confidence DOUBLE PRECISION,
+  strength DOUBLE PRECISION,
   source_session_ids TEXT[] NOT NULL DEFAULT '{}',
   source_turn_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
+  valid_from TIMESTAMPTZ,
+  valid_until TIMESTAMPTZ,
+  expires_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -662,6 +670,9 @@ CREATE TABLE IF NOT EXISTS memory_relationship_links (
 
 CREATE INDEX IF NOT EXISTS idx_memory_relationship_links_user_source
   ON memory_relationship_links (tenant_id, user_id, source_type, source_id);
+
+CREATE INDEX IF NOT EXISTS idx_memory_relationship_links_user_status_domains
+  ON memory_relationship_links (tenant_id, user_id, status, source_domain, target_domain);
 
 CREATE TABLE IF NOT EXISTS always_on_memory_packets (
   tenant_id TEXT NOT NULL,

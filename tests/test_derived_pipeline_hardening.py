@@ -17,6 +17,7 @@ from src.derived_pipeline import (
     PASS_RETROSPECTIVE_V1,
     build_pass4_identity_packet,
     build_pass5_living_packet,
+    _write_relationship_link,
     run_pass1_5_entities,
     run_pass2_actionable,
     run_pass1_triage,
@@ -1178,6 +1179,188 @@ async def test_derived_pipeline_schema_exists():
             assert {"lifecycle_state", "evidence_turn_refs", "memory_layer", "access_count"}.issubset(names)
         finally:
             await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_write_relationship_link_backwards_compatible_defaults():
+    async with app.router.lifespan_context(app):
+        user_id = _unique("link-user")
+
+        await _write_relationship_link(
+            db=db,
+            tenant_id="default",
+            user_id=user_id,
+            source_type="entity",
+            source_id="jordan",
+            target_type="session",
+            target_id="sess-1",
+            relationship_type="mentioned_in",
+            source_session_ids=["sess-1"],
+            source_turn_refs=[{"session_id": "sess-1", "turn_index": 0}],
+            confidence=0.7,
+            metadata={"entity_name": "Jordan"},
+        )
+
+        row = await db.fetchone(
+            """
+            SELECT source_domain, target_domain, status, strength, valid_from, valid_until, expires_at, confidence
+            FROM memory_relationship_links
+            WHERE tenant_id='default' AND user_id=$1
+            """,
+            user_id,
+        )
+        assert row["source_domain"] is None
+        assert row["target_domain"] is None
+        assert row["status"] == "active"
+        assert row["strength"] is None
+        assert row["valid_from"] is None
+        assert row["valid_until"] is None
+        assert row["expires_at"] is None
+        assert float(row["confidence"] or 0.0) == 0.7
+
+
+@pytest.mark.asyncio
+async def test_write_relationship_link_supports_domains_lifecycle_and_upsert_merge():
+    async with app.router.lifespan_context(app):
+        user_id = _unique("link-user")
+        valid_from = datetime.now(timezone.utc) - timedelta(days=2)
+        valid_until = datetime.now(timezone.utc) + timedelta(days=5)
+        expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+
+        await _write_relationship_link(
+            db=db,
+            tenant_id="default",
+            user_id=user_id,
+            source_domain="workstream",
+            source_type="thread",
+            source_id="thread-1",
+            target_domain="people",
+            target_type="entity",
+            target_id="riley",
+            relationship_type="involves",
+            source_session_ids=["sess-1"],
+            source_turn_refs=[{"session_id": "sess-1", "turn_index": 0}],
+            status="detected",
+            confidence=0.4,
+            strength=0.65,
+            valid_from=valid_from,
+            valid_until=valid_until,
+            expires_at=expires_at,
+            metadata={"entity_name": "Riley"},
+        )
+        await _write_relationship_link(
+            db=db,
+            tenant_id="default",
+            user_id=user_id,
+            source_domain="workstream",
+            source_type="thread",
+            source_id="thread-1",
+            target_domain="people",
+            target_type="entity",
+            target_id="riley",
+            relationship_type="involves",
+            source_session_ids=["sess-2", "sess-1"],
+            source_turn_refs=[{"session_id": "sess-2", "turn_index": 1}],
+            confidence=0.9,
+            metadata={"entity_name": "Riley v2"},
+        )
+
+        row = await db.fetchone(
+            """
+            SELECT source_domain, target_domain, status, strength, valid_from, valid_until, expires_at,
+                   confidence, source_session_ids, source_turn_refs, metadata
+            FROM memory_relationship_links
+            WHERE tenant_id='default' AND user_id=$1
+              AND source_type='thread' AND source_id='thread-1'
+              AND target_type='entity' AND target_id='riley'
+              AND relationship_type='involves'
+            """,
+            user_id,
+        )
+        assert row["source_domain"] == "workstream"
+        assert row["target_domain"] == "people"
+        assert row["status"] == "detected"
+        assert float(row["strength"] or 0.0) == 0.65
+        assert row["valid_from"] == valid_from
+        assert row["valid_until"] == valid_until
+        assert row["expires_at"] == expires_at
+        assert float(row["confidence"] or 0.0) == 0.9
+        assert set(row["source_session_ids"]) == {"sess-1", "sess-2"}
+        assert len(row["source_turn_refs"]) == 2
+        assert row["metadata"] == {"entity_name": "Riley"}
+
+
+@pytest.mark.asyncio
+async def test_pass3_thread_entity_links_write_domains(monkeypatch):
+    async with app.router.lifespan_context(app):
+        settings = get_settings()
+        settings.derived_pipeline_llm_enabled = True
+        tenant_id = "default"
+        user_id = _unique("thread-link-user")
+        session_id = _unique("thread-link-session")
+        text = "I need to keep coordinating with Riley because this situation is still open."
+        messages = [{"role": "user", "text": text, "timestamp": "2026-04-21T10:00:00Z"}]
+        await db.execute(
+            """
+            INSERT INTO session_classifications (
+                session_id, user_id, session_date, is_memory_worthy, session_kind,
+                one_line_summary, entity_mentions, run_entity_pass, run_threads_pass,
+                identity_relevant, emotional_weight, processed_at, model_used,
+                raw_triage_output, context_relevant
+            )
+            VALUES ($1,$2,NOW(),true,'personal','thread link',$3::text[],false,true,false,
+                    'high',NOW(),'fixture',$4::jsonb,true)
+            """,
+            session_id,
+            user_id,
+            ["Riley"],
+            {"thread_signals": [text]},
+        )
+
+        async def _actions_stub(**_kwargs):
+            return [
+                {
+                    "action": "CREATE",
+                    "title": "Coordinate with Riley",
+                    "detail": text,
+                    "category": "relationship",
+                    "priority": "high",
+                    "related_entities": ["Riley"],
+                    "unresolvedness": "open",
+                    "follow_up_value": "high",
+                    "evidence_strength": "strong",
+                    "why_this_matters_later": "Riley remains part of the active situation.",
+                }
+            ]
+
+        monkeypatch.setattr(derived_pipeline, "extract_thread_actions", _actions_stub, raising=True)
+
+        await run_pass3_threads(
+            db=db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            messages=messages,
+            settings=settings,
+        )
+
+        row = await db.fetchone(
+            """
+            SELECT source_domain, target_domain, status, source_type, target_type, relationship_type
+            FROM memory_relationship_links
+            WHERE tenant_id=$1 AND user_id=$2
+            ORDER BY link_id DESC
+            LIMIT 1
+            """,
+            tenant_id,
+            user_id,
+        )
+        assert row["source_domain"] == "workstream"
+        assert row["target_domain"] == "people"
+        assert row["status"] == "active"
+        assert row["source_type"] == "thread"
+        assert row["target_type"] == "entity"
+        assert row["relationship_type"] == "involves"
 
 
 @pytest.mark.asyncio

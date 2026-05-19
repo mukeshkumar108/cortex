@@ -2358,14 +2358,21 @@ async def _write_relationship_link(
     db: Database,
     tenant_id: str,
     user_id: str,
+    source_domain: Optional[str] = None,
     source_type: str,
     source_id: str,
+    target_domain: Optional[str] = None,
     target_type: str,
     target_id: str,
     relationship_type: str,
     source_session_ids: Sequence[str],
     source_turn_refs: Sequence[Dict[str, Any]],
+    status: str = "active",
     confidence: float = 0.6,
+    strength: Optional[float] = None,
+    valid_from: Optional[datetime] = None,
+    valid_until: Optional[datetime] = None,
+    expires_at: Optional[datetime] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     if not all(normalize_text(v) for v in (source_type, source_id, target_type, target_id, relationship_type)):
@@ -2373,16 +2380,19 @@ async def _write_relationship_link(
     await db.execute(
         """
         INSERT INTO memory_relationship_links (
-          tenant_id, user_id, source_type, source_id, target_type, target_id,
-          relationship_type, confidence, source_session_ids, source_turn_refs,
-          metadata, created_at, updated_at
+          tenant_id, user_id, source_domain, source_type, source_id, target_domain, target_type, target_id,
+          relationship_type, status, confidence, strength, source_session_ids, source_turn_refs,
+          metadata, valid_from, valid_until, expires_at, created_at, updated_at
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::text[],$10::jsonb,$11::jsonb,NOW(),NOW())
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::text[],$14::jsonb,$15::jsonb,$16,$17,$18,NOW(),NOW())
         ON CONFLICT (
           tenant_id, user_id, source_type, source_id, target_type, target_id, relationship_type
         )
         DO UPDATE SET
           confidence=GREATEST(memory_relationship_links.confidence, EXCLUDED.confidence),
+          source_domain=COALESCE(memory_relationship_links.source_domain, EXCLUDED.source_domain),
+          target_domain=COALESCE(memory_relationship_links.target_domain, EXCLUDED.target_domain),
+          strength=COALESCE(memory_relationship_links.strength, EXCLUDED.strength),
           source_session_ids=(
             SELECT ARRAY(
               SELECT DISTINCT x
@@ -2391,19 +2401,29 @@ async def _write_relationship_link(
             )
           ),
           source_turn_refs=memory_relationship_links.source_turn_refs || EXCLUDED.source_turn_refs,
+          valid_from=COALESCE(memory_relationship_links.valid_from, EXCLUDED.valid_from),
+          valid_until=COALESCE(memory_relationship_links.valid_until, EXCLUDED.valid_until),
+          expires_at=COALESCE(memory_relationship_links.expires_at, EXCLUDED.expires_at),
           updated_at=NOW()
         """,
         tenant_id,
         user_id,
+        normalize_text(source_domain) if source_domain else None,
         normalize_text(source_type),
         normalize_text(source_id),
+        normalize_text(target_domain) if target_domain else None,
         normalize_text(target_type),
         normalize_text(target_id),
         normalize_text(relationship_type),
+        normalize_text(status) or "active",
         float(confidence),
+        float(strength) if strength is not None else None,
         list(source_session_ids),
         list(source_turn_refs),
         metadata or {},
+        valid_from,
+        valid_until,
+        expires_at,
     )
 
 
@@ -4275,8 +4295,10 @@ async def run_pass1_5_entities(
                 db=db,
                 tenant_id=tenant_id,
                 user_id=user_id,
+                source_domain="people",
                 source_type="entity",
                 source_id=canonical_norm,
+                target_domain="evidence",
                 target_type="session",
                 target_id=session_id,
                 relationship_type="mentioned_in",
@@ -4936,8 +4958,10 @@ async def run_pass3_threads(
                     db=db,
                     tenant_id=tenant_id,
                     user_id=user_id,
+                    source_domain="workstream",
                     source_type="thread",
                     source_id=thread_id,
+                    target_domain="people",
                     target_type="entity",
                     target_id=_canonical_name_norm(related),
                     relationship_type="involves",
