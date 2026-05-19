@@ -22,10 +22,32 @@ class FakeDB:
         self.action_item_rows: List[Dict[str, Any]] = []
         self.calendar_rows: List[Dict[str, Any]] = []
         self.living_context_row: Dict[str, Any] | None = None
+        self.outcome_rows: List[Dict[str, Any]] = []
 
     async def fetchone(self, query: str, *args):
         if "FROM living_context" in query:
             return self.living_context_row
+        if "INSERT INTO attention_outcomes" in query:
+            row = {
+                "outcome_id": f"outcome-{len(self.outcome_rows) + 1}",
+                "tenant_id": args[0],
+                "user_id": args[1],
+                "companion_id": args[2],
+                "attention_item_id": args[3],
+                "source_table": args[4],
+                "source_id": args[5],
+                "outcome_type": args[6],
+                "outcome_reason": args[7],
+                "surface_mode": args[8],
+                "action_policy": args[9],
+                "snoozed_until": args[10],
+                "suppress_until": args[11],
+                "metadata": args[12] or {},
+                "occurred_at": NOW,
+                "created_at": NOW,
+            }
+            self.outcome_rows.append(row)
+            return row
         return None
 
     async def fetch(self, query: str, *args):
@@ -41,6 +63,8 @@ class FakeDB:
             return self.action_item_rows
         if "FROM calendar_items" in query:
             return self.calendar_rows
+        if "FROM attention_outcomes" in query:
+            return self.outcome_rows
         return []
 
 
@@ -339,7 +363,13 @@ async def test_internal_attention_endpoint_uses_auth_and_passes_include_expired(
     async with AsyncClient(transport=ASGITransport(app=main_module.app), base_url="http://test") as client:
         response = await client.get(
             "/internal/debug/attention",
-            params={"tenantId": "default", "userId": "u1", "companionId": "sophie", "includeExpired": "true"},
+            params={
+                "tenantId": "default",
+                "userId": "u1",
+                "companionId": "sophie",
+                "includeExpired": "true",
+                "includeSuppressed": "true",
+            },
             headers={"X-Internal-Token": "test-token"},
         )
 
@@ -348,3 +378,225 @@ async def test_internal_attention_endpoint_uses_auth_and_passes_include_expired(
     assert data["userId"] == "u1"
     assert data["metadata"]["returnedCount"] == 1
     assert captured["include_expired"] is True
+    assert captured["include_suppressed"] is True
+
+
+@pytest.mark.asyncio
+async def test_can_record_dismissed_attention_outcome_via_internal_endpoint(monkeypatch):
+    db = FakeDB()
+    monkeypatch.setattr(main_module, "db", db, raising=True)
+
+    async with AsyncClient(transport=ASGITransport(app=main_module.app), base_url="http://test") as client:
+        response = await client.post(
+            "/internal/debug/attention/outcome",
+            json={
+                "tenantId": "default",
+                "userId": "u1",
+                "companionId": "sophie",
+                "attentionItemId": "follow_up_candidates:11",
+                "sourceTable": "follow_up_candidates",
+                "sourceId": "11",
+                "outcomeType": "dismissed",
+                "outcomeReason": "User said this is already handled",
+                "metadata": {"source": "test"},
+            },
+            headers={"X-Internal-Token": "test-token"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["outcomeType"] == "dismissed"
+    assert payload["attentionItemId"] == "follow_up_candidates:11"
+    assert payload["sourceTable"] == "follow_up_candidates"
+    assert payload["metadata"] == {"source": "test"}
+
+
+@pytest.mark.asyncio
+async def test_dismissed_item_no_longer_appears_in_default_attention_preview():
+    db = FakeDB()
+    db.follow_up_rows = [_ashley_unwell_follow_up_row()]
+    db.outcome_rows = [
+        {
+            "outcome_id": "out-1",
+            "attention_item_id": "follow_up_candidates:11",
+            "source_table": "follow_up_candidates",
+            "source_id": "11",
+            "outcome_type": "dismissed",
+            "occurred_at": NOW - timedelta(minutes=5),
+            "created_at": NOW - timedelta(minutes=5),
+        }
+    ]
+
+    out = await build_attention_preview(db, tenant_id="default", user_id="u1", companion_id="sophie", as_of=NOW)
+
+    assert out["items"] == []
+    assert out["metadata"]["dismissedCount"] == 1
+    assert out["metadata"]["outcomeSuppressedCount"] == 1
+
+
+@pytest.mark.asyncio
+async def test_dont_bring_up_again_suppresses_matching_source():
+    db = FakeDB()
+    db.follow_up_rows = [_ashley_unwell_follow_up_row()]
+    db.outcome_rows = [
+        {
+            "outcome_id": "out-2",
+            "attention_item_id": "different-item-id",
+            "source_table": "follow_up_candidates",
+            "source_id": "11",
+            "outcome_type": "dont_bring_up_again",
+            "occurred_at": NOW - timedelta(minutes=3),
+            "created_at": NOW - timedelta(minutes=3),
+            "suppress_until": None,
+        }
+    ]
+
+    out = await build_attention_preview(db, tenant_id="default", user_id="u1", companion_id="sophie", as_of=NOW)
+
+    assert out["items"] == []
+    assert out["metadata"]["outcomeSuppressedCount"] == 1
+
+
+@pytest.mark.asyncio
+async def test_completed_item_is_hidden():
+    db = FakeDB()
+    db.actionable_rows = [_invoice_actionable_row()]
+    db.outcome_rows = [
+        {
+            "outcome_id": "out-3",
+            "attention_item_id": "actionable_candidates:21",
+            "source_table": "actionable_candidates",
+            "source_id": "21",
+            "outcome_type": "completed",
+            "occurred_at": NOW - timedelta(minutes=2),
+            "created_at": NOW - timedelta(minutes=2),
+        }
+    ]
+
+    out = await build_attention_preview(db, tenant_id="default", user_id="u1", companion_id="sophie", as_of=NOW)
+
+    assert out["items"] == []
+    assert out["metadata"]["completedCount"] == 1
+
+
+@pytest.mark.asyncio
+async def test_snoozed_item_hidden_before_snoozed_until_and_reappears_after():
+    db = FakeDB()
+    db.follow_up_rows = [_ashley_unwell_follow_up_row()]
+    snoozed_until = NOW + timedelta(hours=2)
+    db.outcome_rows = [
+        {
+            "outcome_id": "out-4",
+            "attention_item_id": "follow_up_candidates:11",
+            "source_table": "follow_up_candidates",
+            "source_id": "11",
+            "outcome_type": "snoozed",
+            "occurred_at": NOW - timedelta(minutes=1),
+            "created_at": NOW - timedelta(minutes=1),
+            "snoozed_until": snoozed_until,
+        }
+    ]
+
+    hidden = await build_attention_preview(db, tenant_id="default", user_id="u1", companion_id="sophie", as_of=NOW)
+    visible = await build_attention_preview(
+        db,
+        tenant_id="default",
+        user_id="u1",
+        companion_id="sophie",
+        as_of=snoozed_until + timedelta(minutes=1),
+    )
+
+    assert hidden["items"] == []
+    assert hidden["metadata"]["snoozedCount"] == 1
+    assert [item["title"] for item in visible["items"]] == ["Check on Ashley and the takedown"]
+
+
+@pytest.mark.asyncio
+async def test_ignored_twice_suppresses_matching_item():
+    db = FakeDB()
+    db.actionable_rows = [_invoice_actionable_row()]
+    db.outcome_rows = [
+        {
+            "outcome_id": "out-5",
+            "attention_item_id": "old-item-a",
+            "source_table": "actionable_candidates",
+            "source_id": "21",
+            "outcome_type": "ignored",
+            "occurred_at": NOW - timedelta(hours=2),
+            "created_at": NOW - timedelta(hours=2),
+        },
+        {
+            "outcome_id": "out-6",
+            "attention_item_id": "old-item-b",
+            "source_table": "actionable_candidates",
+            "source_id": "21",
+            "outcome_type": "ignored",
+            "occurred_at": NOW - timedelta(hours=1),
+            "created_at": NOW - timedelta(hours=1),
+        },
+    ]
+
+    out = await build_attention_preview(db, tenant_id="default", user_id="u1", companion_id="sophie", as_of=NOW)
+
+    assert out["items"] == []
+    assert out["metadata"]["ignoredSuppressedCount"] == 1
+
+
+@pytest.mark.asyncio
+async def test_include_suppressed_true_shows_suppressed_items():
+    db = FakeDB()
+    db.follow_up_rows = [_ashley_unwell_follow_up_row()]
+    db.outcome_rows = [
+        {
+            "outcome_id": "out-7",
+            "attention_item_id": "follow_up_candidates:11",
+            "source_table": "follow_up_candidates",
+            "source_id": "11",
+            "outcome_type": "dismissed",
+            "occurred_at": NOW - timedelta(minutes=5),
+            "created_at": NOW - timedelta(minutes=5),
+        }
+    ]
+
+    out = await build_attention_preview(
+        db,
+        tenant_id="default",
+        user_id="u1",
+        companion_id="sophie",
+        include_suppressed=True,
+        as_of=NOW,
+    )
+
+    assert len(out["items"]) == 1
+    assert out["items"][0]["status"] == "dismissed"
+
+
+@pytest.mark.asyncio
+async def test_include_expired_still_shows_stale_outcome_items():
+    db = FakeDB()
+    db.follow_up_rows = [_ashley_unwell_follow_up_row()]
+    db.outcome_rows = [
+        {
+            "outcome_id": "out-8",
+            "attention_item_id": "follow_up_candidates:11",
+            "source_table": "follow_up_candidates",
+            "source_id": "11",
+            "outcome_type": "stale",
+            "occurred_at": NOW - timedelta(minutes=5),
+            "created_at": NOW - timedelta(minutes=5),
+        }
+    ]
+
+    default_out = await build_attention_preview(db, tenant_id="default", user_id="u1", companion_id="sophie", as_of=NOW)
+    include_out = await build_attention_preview(
+        db,
+        tenant_id="default",
+        user_id="u1",
+        companion_id="sophie",
+        include_expired=True,
+        as_of=NOW,
+    )
+
+    assert default_out["items"] == []
+    assert len(include_out["items"]) == 1
+    assert include_out["items"][0]["status"] == "expired"

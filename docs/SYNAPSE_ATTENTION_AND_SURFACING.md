@@ -238,6 +238,77 @@ curl -s "http://localhost:8000/internal/debug/attention?tenantId=default&userId=
 
 Example useful output:
 
+---
+
+## 13. Attention Outcomes
+
+Synapse now includes a lightweight feedback loop for Attention Items. The goal is simple: once Sophie or another companion considers or surfaces an item, Synapse should remember what happened next so stale or unwanted items do not keep coming back.
+
+Why this exists:
+*   It prevents old emotional or situational context from resurfacing after it has gone cold.
+*   It lets Synapse distinguish "still relevant" from "already handled," "not welcome," or "try later."
+*   It creates a bounded read/write trail without introducing delivery automation or broad memory refactors.
+
+Current storage:
+*   `attention_outcomes`
+*   Internal write endpoint: `POST /internal/debug/attention/outcome`
+*   Internal read/debug preview: `GET /internal/debug/attention`
+
+Recorded outcome types:
+*   `surfaced`
+*   `acknowledged`
+*   `ignored`
+*   `dismissed`
+*   `snoozed`
+*   `completed`
+*   `helpful`
+*   `not_helpful`
+*   `dont_bring_up_again`
+*   `stale`
+*   `converted_to_task`
+*   `converted_to_draft`
+*   `expired`
+
+Matching rules:
+*   Prefer exact `attention_item_id` matching when available.
+*   Fall back to `source_table + source_id` so regenerated preview items can still inherit prior feedback.
+
+Suppression and expiry rules in preview:
+*   `completed` hides the matching item by default.
+*   `dismissed` hides the matching item by default.
+*   `dont_bring_up_again` suppresses the matching item by default.
+*   `snoozed` hides the item until `snoozed_until`.
+*   `stale` marks the item expired, which keeps it out of default preview but still visible with `includeExpired=true`.
+*   `ignored` once may lower effective ranking.
+*   `ignored` twice for the same item or source suppresses the item by default.
+
+Debug preview controls:
+*   `includeExpired=true` still reveals expired/stale items.
+*   `includeSuppressed=true` reveals dismissed/completed/snoozed/suppressed items for debugging.
+*   Preview metadata now includes:
+    *   `outcomeSuppressedCount`
+    *   `snoozedCount`
+    *   `dismissedCount`
+    *   `completedCount`
+    *   `ignoredSuppressedCount`
+    *   `includeSuppressed`
+    *   `outcomeRulesApplied`
+
+Behavioural intent:
+*   Snooze means "later, not now."
+*   Dismiss means "not this item."
+*   Completed means "underlying need is done."
+*   Don't bring up again means "respect the boundary unless something materially changes upstream."
+
+How this prevents stale repeated surfacing:
+*   Rebuilt preview items are checked against prior outcomes before they are returned.
+*   That means regenerated candidates do not automatically forget user feedback just because they were re-synthesized from the same source object or thread.
+
+Current limitations:
+*   This is still a debug/internal control surface, not a full user-facing memory management UI.
+*   Helpful/not-helpful is recorded for auditability, but does not yet drive broad promotion or demotion across the graph.
+*   The feedback loop filters preview output; it does not yet mutate upstream object state or candidate generation logic directly.
+
 ```json
 {
   "tenantId": "default",

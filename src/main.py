@@ -52,6 +52,8 @@ from .models import (
     DailyCandidatesResponse,
     ReviewQueueResponse,
     AttentionPreviewResponse,
+    AttentionOutcomeRecordRequest,
+    AttentionOutcomeResponse,
     SessionChangeItem,
     SessionChangesResponse,
     EntityCandidateItem,
@@ -163,6 +165,7 @@ from .calendar_state import (
 from .day_brief import DayBriefError, buildDayBrief
 from .google_calendar_import import GoogleCalendarImportError, import_google_calendar_events
 from .attention_preview import build_attention_preview
+from .attention_outcomes import record_attention_outcome
 from .fast_handover import get_latest_fast_handover_packet
 
 # Configure logging
@@ -214,6 +217,19 @@ USER_PREFERENCE_PATTERNS = [
 
 def _normalize_text(value: Any) -> str:
     return canonicalize_text(value, casefold=False)
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    text = _normalize_text(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid datetime: {value}") from e
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt_timezone.utc)
+    return parsed
 
 
 def _session_handover_response_from_row(row: Optional[Dict[str, Any]], *, tenant_id: str, user_id: str) -> SessionHandoverPacketResponse:
@@ -17074,6 +17090,7 @@ async def debug_attention_preview(
     companionId: str = "sophie",
     limit: int = 20,
     includeExpired: bool = False,
+    includeSuppressed: bool = False,
     x_internal_token: str | None = Header(default=None),
 ):
     _require_internal_token(x_internal_token)
@@ -17088,6 +17105,7 @@ async def debug_attention_preview(
             companion_id=companionId,
             limit=limit,
             include_expired=includeExpired,
+            include_suppressed=includeSuppressed,
         )
         return AttentionPreviewResponse(**payload)
     except HTTPException:
@@ -17095,6 +17113,46 @@ async def debug_attention_preview(
     except Exception as e:
         logger.error("Debug attention preview failed: %s", e)
         raise HTTPException(status_code=500, detail="Debug attention preview failed")
+
+
+@app.post("/internal/debug/attention/outcome", response_model=AttentionOutcomeResponse)
+async def debug_record_attention_outcome(
+    request: AttentionOutcomeRecordRequest,
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    tenant_id = _normalize_text(_canonical_tenant_id(request.tenantId)) or request.tenantId
+    user_id = _normalize_text(request.userId)
+    attention_item_id = _normalize_text(request.attentionItemId)
+    if not user_id:
+        raise HTTPException(status_code=400, detail="userId is required")
+    if not attention_item_id:
+        raise HTTPException(status_code=400, detail="attentionItemId is required")
+    try:
+        payload = await record_attention_outcome(
+            db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            companion_id=request.companionId,
+            attention_item_id=attention_item_id,
+            source_table=request.sourceTable,
+            source_id=request.sourceId,
+            outcome_type=request.outcomeType,
+            outcome_reason=request.outcomeReason,
+            surface_mode=request.surfaceMode,
+            action_policy=request.actionPolicy,
+            snoozed_until=_parse_iso_datetime(request.snoozedUntil) if request.snoozedUntil else None,
+            suppress_until=_parse_iso_datetime(request.suppressUntil) if request.suppressUntil else None,
+            metadata=request.metadata,
+        )
+        return AttentionOutcomeResponse(**payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Debug attention outcome record failed: %s", e)
+        raise HTTPException(status_code=500, detail="Debug attention outcome record failed")
 
 
 @app.post("/internal/debug/proactive-shadow/rebuild")

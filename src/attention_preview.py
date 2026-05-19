@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import Any, Dict, List, Optional
 
+from .attention_outcomes import fetch_attention_outcomes
+
 
 DEFAULT_COMPANION_ID = "sophie"
 DEFAULT_EXCLUDED_STATUSES = {"expired", "completed", "dismissed", "suppressed", "archived"}
@@ -319,6 +321,21 @@ def _sort_key(item: Dict[str, Any]) -> tuple[int, int, int, str, float]:
         ideal,
         -_recency_sort_value(item),
     )
+
+
+def _parse_ts(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=dt_timezone.utc)
+    text = _normalize_text(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt_timezone.utc)
+    return parsed
 
 
 def _increment_count(counter: Dict[str, int], key: str) -> None:
@@ -699,6 +716,110 @@ def _build_calendar_item_item(row: Dict[str, Any], *, tenant_id: str, companion_
     return item
 
 
+def _match_outcomes_for_item(item: Dict[str, Any], outcome_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    item_id = _normalize_text(item.get("id"))
+    source_table = _normalize_text(item.get("source_table"))
+    source_id = _normalize_text(item.get("source_id"))
+    matched: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in outcome_rows:
+        outcome_id = _normalize_text(row.get("outcome_id"))
+        if outcome_id and outcome_id in seen:
+            continue
+        row_attention_item_id = _normalize_text(row.get("attention_item_id"))
+        row_source_table = _normalize_text(row.get("source_table"))
+        row_source_id = _normalize_text(row.get("source_id"))
+        item_match = bool(item_id and row_attention_item_id == item_id)
+        source_match = bool(source_table and source_id and row_source_table == source_table and row_source_id == source_id)
+        if not item_match and not source_match:
+            continue
+        if outcome_id:
+            seen.add(outcome_id)
+        matched.append(row)
+    matched.sort(
+        key=lambda row: (
+            _parse_ts(row.get("occurred_at")) or datetime.min.replace(tzinfo=dt_timezone.utc),
+            _parse_ts(row.get("created_at")) or datetime.min.replace(tzinfo=dt_timezone.utc),
+        ),
+        reverse=True,
+    )
+    return matched
+
+
+def _apply_outcome_rules(
+    item: Dict[str, Any],
+    *,
+    now: datetime,
+    outcome_rows: List[Dict[str, Any]],
+) -> tuple[Dict[str, Any], Dict[str, int]]:
+    updated = dict(item)
+    diagnostics = {
+        "outcomeSuppressedCount": 0,
+        "snoozedCount": 0,
+        "dismissedCount": 0,
+        "completedCount": 0,
+        "ignoredSuppressedCount": 0,
+    }
+    if not outcome_rows:
+        return updated, diagnostics
+
+    ignored_count = sum(1 for row in outcome_rows if _normalize_text(row.get("outcome_type")).lower() == "ignored")
+    if ignored_count == 1:
+        updated["priority"] = max(0, int(updated.get("priority") or 0) - 10)
+        updated["urgency"] = max(0, int(updated.get("urgency") or 0) - 5)
+
+    for row in outcome_rows:
+        outcome_type = _normalize_text(row.get("outcome_type")).lower()
+        snoozed_until = _parse_ts(row.get("snoozed_until"))
+        suppress_until = _parse_ts(row.get("suppress_until"))
+        suppress_active = suppress_until is None or suppress_until > now
+
+        if outcome_type == "completed":
+            updated["status"] = "completed"
+            diagnostics["completedCount"] = 1
+            diagnostics["outcomeSuppressedCount"] = 1
+            return updated, diagnostics
+        if outcome_type == "dismissed":
+            updated["status"] = "dismissed"
+            diagnostics["dismissedCount"] = 1
+            diagnostics["outcomeSuppressedCount"] = 1
+            return updated, diagnostics
+        if outcome_type == "dont_bring_up_again" and suppress_active:
+            updated["status"] = "suppressed"
+            diagnostics["outcomeSuppressedCount"] = 1
+            return updated, diagnostics
+        if outcome_type == "stale":
+            updated["status"] = "expired"
+            return updated, diagnostics
+        if outcome_type == "expired":
+            updated["status"] = "expired"
+            return updated, diagnostics
+        if outcome_type == "snoozed" and snoozed_until and snoozed_until > now:
+            updated["status"] = "snoozed"
+            updated["earliest_surface_at"] = snoozed_until.isoformat()
+            updated["ideal_surface_at"] = snoozed_until.isoformat()
+            diagnostics["snoozedCount"] = 1
+            diagnostics["outcomeSuppressedCount"] = 1
+            return updated, diagnostics
+        if outcome_type in {"surfaced", "acknowledged", "helpful", "not_helpful", "converted_to_task", "converted_to_draft"}:
+            continue
+
+    if ignored_count >= 2:
+        updated["status"] = "suppressed"
+        diagnostics["ignoredSuppressedCount"] = 1
+        diagnostics["outcomeSuppressedCount"] = 1
+    return updated, diagnostics
+
+
+def _should_include_item(*, status: str, include_expired: bool, include_suppressed: bool) -> bool:
+    normalized = _normalize_text(status).lower()
+    if normalized == "expired":
+        return include_expired
+    if normalized in {"completed", "dismissed", "suppressed", "archived", "snoozed"}:
+        return include_suppressed
+    return normalized not in DEFAULT_EXCLUDED_STATUSES
+
+
 async def build_attention_preview(
     db: Any,
     *,
@@ -707,6 +828,7 @@ async def build_attention_preview(
     companion_id: str = DEFAULT_COMPANION_ID,
     limit: int = 20,
     include_expired: bool = False,
+    include_suppressed: bool = False,
     as_of: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     safe_limit = max(1, min(int(limit or 20), 200))
@@ -854,19 +976,46 @@ async def build_attention_preview(
         else:
             suppressed_count += 1
 
+    outcome_rows = await fetch_attention_outcomes(
+        db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        attention_item_ids=[_normalize_text(item.get("id")) for item in profile_filtered_items],
+        source_refs=[
+            (_normalize_text(item.get("source_table")), _normalize_text(item.get("source_id")))
+            for item in profile_filtered_items
+        ],
+    )
+
     by_status: Dict[str, int] = {}
     by_source_table: Dict[str, int] = {}
     by_attention_type: Dict[str, int] = {}
     expired_count = 0
+    outcome_suppressed_count = 0
+    snoozed_count = 0
+    dismissed_count = 0
+    completed_count = 0
+    ignored_suppressed_count = 0
     visible_items: List[Dict[str, Any]] = []
     for item in profile_filtered_items:
-        _increment_count(by_status, item.get("status"))
+        item_outcomes = _match_outcomes_for_item(item, outcome_rows)
+        adjusted_item, outcome_diagnostics = _apply_outcome_rules(item, now=now, outcome_rows=item_outcomes)
+        _increment_count(by_status, adjusted_item.get("status"))
         _increment_count(by_source_table, item.get("source_table"))
         _increment_count(by_attention_type, item.get("attention_type"))
-        if item.get("status") == "expired":
+        outcome_suppressed_count += outcome_diagnostics["outcomeSuppressedCount"]
+        snoozed_count += outcome_diagnostics["snoozedCount"]
+        dismissed_count += outcome_diagnostics["dismissedCount"]
+        completed_count += outcome_diagnostics["completedCount"]
+        ignored_suppressed_count += outcome_diagnostics["ignoredSuppressedCount"]
+        if adjusted_item.get("status") == "expired":
             expired_count += 1
-        if include_expired or _normalize_text(item.get("status")).lower() not in DEFAULT_EXCLUDED_STATUSES:
-            visible_items.append(item)
+        if _should_include_item(
+            status=adjusted_item.get("status"),
+            include_expired=include_expired,
+            include_suppressed=include_suppressed,
+        ):
+            visible_items.append(adjusted_item)
 
     visible_items.sort(key=_sort_key)
     output_items = visible_items[:safe_limit]
@@ -882,6 +1031,11 @@ async def build_attention_preview(
             "returnedCount": len(output_items),
             "suppressedCount": suppressed_count,
             "expiredCount": expired_count,
+            "outcomeSuppressedCount": outcome_suppressed_count,
+            "snoozedCount": snoozed_count,
+            "dismissedCount": dismissed_count,
+            "completedCount": completed_count,
+            "ignoredSuppressedCount": ignored_suppressed_count,
             "byStatus": by_status,
             "bySourceTable": by_source_table,
             "byAttentionType": by_attention_type,
@@ -896,6 +1050,8 @@ async def build_attention_preview(
             "livingContextUsedAsModifier": bool(living_context),
             "profileApplied": companion_key,
             "includeExpired": bool(include_expired),
+            "includeSuppressed": bool(include_suppressed),
+            "outcomeRulesApplied": True,
             "readOnly": True,
         },
     }

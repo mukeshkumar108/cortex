@@ -167,7 +167,7 @@ Current limitations:
 
 ## 12. What is still missing
 
-*   **Outcome Feedback:** The attention preview generates items, but there is no closed-loop tracking (e.g., `POST /attention/{id}/outcome`) to record if the companion actually surfaced it and if the user engaged.
+*   **Outcome Feedback:** A lightweight internal attention outcome loop now exists for debug/preview filtering, but it is not full memory management or upstream object mutation yet.
 *   **Candidate Fragmentation:** `actionable_candidates`, `follow_up_candidates`, etc., still exist as separate tables rather than being unified into primary objects with `status='detected'`.
 *   **Missing Metadata:** Some primary objects still lack `primary_domain` enforcement.
 *   **Evidence Refs in Attention Preview:** While `source_object_ids` and `source_link_ids` are mapped best-effort, exact turn-level `evidence_refs` are sometimes lost in the candidate abstraction layer.

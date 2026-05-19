@@ -535,6 +535,41 @@ class AttentionPreviewResponse(BaseModel):
     metadata: Dict[str, Any] = {}
 
 
+class AttentionOutcomeRecordRequest(BaseModel):
+    tenantId: str
+    userId: str
+    companionId: Optional[str] = None
+    attentionItemId: str
+    sourceTable: Optional[str] = None
+    sourceId: Optional[str] = None
+    outcomeType: str
+    outcomeReason: Optional[str] = None
+    surfaceMode: Optional[str] = None
+    actionPolicy: Optional[str] = None
+    snoozedUntil: Optional[str] = None
+    suppressUntil: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class AttentionOutcomeResponse(BaseModel):
+    outcomeId: str
+    tenantId: str
+    userId: str
+    companionId: Optional[str] = None
+    attentionItemId: str
+    sourceTable: Optional[str] = None
+    sourceId: Optional[str] = None
+    outcomeType: str
+    outcomeReason: Optional[str] = None
+    surfaceMode: Optional[str] = None
+    actionPolicy: Optional[str] = None
+    occurredAt: Optional[str] = None
+    snoozedUntil: Optional[str] = None
+    suppressUntil: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+    createdAt: Optional[str] = None
+
+
 class SessionChangeItem(BaseModel):
     id: int
     kind: str

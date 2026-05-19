@@ -73,6 +73,18 @@ def _enforce_internal_auth(monkeypatch):
             {"params": {"tenantId": "default", "userId": "u1"}},
         ),
         (
+            "post",
+            "/internal/debug/attention/outcome",
+            {
+                "json": {
+                    "tenantId": "default",
+                    "userId": "u1",
+                    "attentionItemId": "follow_up_candidates:11",
+                    "outcomeType": "dismissed",
+                }
+            },
+        ),
+        (
             "get",
             "/internal/debug/session-handover",
             {"params": {"tenantId": "default", "userId": "u1"}},
