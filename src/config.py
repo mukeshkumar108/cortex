@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     episodic_embedding_assistant_char_weight: float = 0.45
 
     # Session settings
+    background_loops_enabled: bool = True
+    runtime_role: str = "api"
     session_close_gap_minutes: int = 30
     rolling_summary_threshold: int = 6  # turns before compression
     graphiti_timeout: float = 0.5  # seconds for Tier 2 brief

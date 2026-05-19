@@ -12463,7 +12463,12 @@ async def _execute_post_ingest_hook(hook_name: str, payload: Dict[str, Any]) -> 
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown"""
     # Startup
-    logger.info("Starting Synapse Memory API")
+    settings = get_settings()
+    logger.info(
+        "Starting Synapse runtime role=%s background_loops_enabled=%s",
+        _runtime_role(settings),
+        _background_loops_enabled(settings),
+    )
     try:
         # Initialize database pool
         if db.pool is not None:
@@ -12490,114 +12495,7 @@ async def lifespan(app: FastAPI):
         loops.init_loop_manager(db)
         logger.info("Loop manager initialized")
 
-        settings = get_settings()
-        if settings.idle_close_enabled:
-            app.state.idle_close_task = asyncio.create_task(
-                session.idle_close_loop(
-                    graphiti_client=graphiti_client,
-                    interval_seconds=settings.idle_close_interval_seconds,
-                    idle_minutes=settings.idle_close_threshold_minutes,
-                    batch_size=settings.idle_close_batch_size
-                )
-            )
-            logger.info("Idle close loop started")
-        if settings.outbox_drain_enabled:
-            app.state.outbox_drain_task = asyncio.create_task(
-                session.drain_loop(
-                    graphiti_client=graphiti_client,
-                    interval_seconds=settings.outbox_drain_interval_seconds,
-                    limit=settings.outbox_drain_limit,
-                    budget_seconds=settings.outbox_drain_budget_seconds,
-                    per_row_timeout_seconds=settings.outbox_drain_per_row_timeout_seconds
-                )
-            )
-            logger.info("Outbox drain loop started")
-        if settings.user_model_updater_enabled:
-            app.state.user_model_updater_task = asyncio.create_task(
-                user_model_updater_loop(
-                    interval_seconds=settings.user_model_updater_interval_seconds,
-                    lookback_hours=settings.user_model_updater_lookback_hours,
-                    max_users=settings.user_model_updater_max_users,
-                    low_conf=settings.user_model_low_confidence,
-                    high_conf=settings.user_model_high_confidence
-                )
-            )
-            logger.info("User model updater loop started")
-        if settings.user_model_enrichment_enabled:
-            app.state.user_model_enrichment_task = asyncio.create_task(
-                user_model_enrichment_loop(
-                    interval_seconds=settings.user_model_enrichment_interval_seconds,
-                    max_users=settings.user_model_enrichment_max_users,
-                    min_confidence=settings.user_model_enrichment_min_confidence,
-                    daily_lookback_hours=settings.user_model_enrichment_daily_lookback_hours,
-                    weekly_lookback_days=settings.user_model_enrichment_weekly_lookback_days,
-                    retry_backoff_seconds=settings.user_model_enrichment_retry_backoff_seconds,
-                    retry_max_seconds=settings.user_model_enrichment_retry_max_seconds
-                )
-            )
-            logger.info("User model enrichment loop started")
-        if settings.loop_staleness_janitor_enabled:
-            app.state.loop_staleness_janitor_task = asyncio.create_task(
-                loop_staleness_janitor_loop(
-                    interval_seconds=settings.loop_staleness_janitor_interval_seconds
-                )
-            )
-            logger.info("Loop staleness janitor loop started")
-        if settings.derived_pipeline_silence_detection_enabled:
-            app.state.derived_silence_detection_task = asyncio.create_task(
-                derived_silence_detection_loop(
-                    interval_seconds=settings.derived_pipeline_silence_detection_interval_seconds
-                )
-            )
-            logger.info("Derived silence detector loop started")
-        if settings.derived_pipeline_audit_enabled:
-            app.state.derived_memory_audit_task = asyncio.create_task(
-                derived_memory_audit_loop(
-                    interval_seconds=settings.derived_pipeline_audit_interval_seconds
-                )
-            )
-            logger.info("Derived memory audit loop started")
-        if settings.proactive_shadow_candidates_enabled:
-            app.state.proactive_shadow_candidates_task = asyncio.create_task(
-                proactive_shadow_candidates_loop(
-                    interval_seconds=settings.proactive_shadow_candidates_interval_seconds,
-                    max_users=settings.proactive_shadow_candidates_max_users,
-                    lookback_days=settings.proactive_shadow_recent_change_lookback_days,
-                )
-            )
-            logger.info("Proactive shadow candidates loop started")
-        if settings.daily_analysis_enabled:
-            app.state.daily_analysis_task = asyncio.create_task(
-                daily_analysis_loop(
-                    interval_seconds=settings.daily_analysis_interval_seconds,
-                    target_offset_days=settings.daily_analysis_target_offset_days,
-                    max_users=settings.daily_analysis_max_users,
-                    max_turns=settings.daily_analysis_max_turns
-                )
-            )
-            logger.info("Daily analysis loop started")
-            app.state.daily_habit_dedupe_task = asyncio.create_task(
-                daily_habit_dedupe_loop(
-                    interval_seconds=settings.daily_analysis_interval_seconds,
-                    max_users=settings.daily_analysis_max_users,
-                )
-            )
-            logger.info("Daily habit dedupe loop started")
-        if settings.v2_invariant_checker_enabled:
-            app.state.v2_invariant_checker_task = asyncio.create_task(
-                v2_invariant_checker_loop(
-                    interval_seconds=settings.v2_invariant_checker_interval_seconds,
-                    auto_repair_enabled=settings.v2_invariant_checker_auto_repair_enabled,
-                )
-            )
-            logger.info("V2 invariant checker loop started")
-        if settings.v2_rollout_control_enabled and settings.v2_rollout_eval_enabled:
-            app.state.v2_rollout_evaluator_task = asyncio.create_task(
-                v2_rollout_evaluator_loop(
-                    interval_seconds=settings.v2_rollout_eval_interval_seconds,
-                )
-            )
-            logger.info("V2 rollout evaluator loop started")
+        _start_background_loop_tasks(app, settings)
 
     except Exception as e:
         logger.error(f"Failed to initialize services: {e}")
@@ -12606,104 +12504,9 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
-    logger.info("Shutting down Synapse Memory API")
+    logger.info("Shutting down Synapse runtime role=%s", getattr(app.state, "runtime_role", "api"))
     session.set_post_ingest_hook_executor(None)
-    if getattr(app.state, "idle_close_task", None):
-        app.state.idle_close_task.cancel()
-        try:
-            await app.state.idle_close_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-    if getattr(app.state, "outbox_drain_task", None):
-        app.state.outbox_drain_task.cancel()
-        try:
-            await app.state.outbox_drain_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-    if getattr(app.state, "user_model_updater_task", None):
-        app.state.user_model_updater_task.cancel()
-        try:
-            await app.state.user_model_updater_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-    if getattr(app.state, "user_model_enrichment_task", None):
-        app.state.user_model_enrichment_task.cancel()
-        try:
-            await app.state.user_model_enrichment_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-    if getattr(app.state, "loop_staleness_janitor_task", None):
-        app.state.loop_staleness_janitor_task.cancel()
-        try:
-            await app.state.loop_staleness_janitor_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-    if getattr(app.state, "derived_silence_detection_task", None):
-        app.state.derived_silence_detection_task.cancel()
-        try:
-            await app.state.derived_silence_detection_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-    if getattr(app.state, "derived_memory_audit_task", None):
-        app.state.derived_memory_audit_task.cancel()
-        try:
-            await app.state.derived_memory_audit_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-    if getattr(app.state, "proactive_shadow_candidates_task", None):
-        app.state.proactive_shadow_candidates_task.cancel()
-        try:
-            await app.state.proactive_shadow_candidates_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-    if getattr(app.state, "daily_analysis_task", None):
-        app.state.daily_analysis_task.cancel()
-        try:
-            await app.state.daily_analysis_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-    if getattr(app.state, "daily_habit_dedupe_task", None):
-        app.state.daily_habit_dedupe_task.cancel()
-        try:
-            await app.state.daily_habit_dedupe_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-    if getattr(app.state, "v2_invariant_checker_task", None):
-        app.state.v2_invariant_checker_task.cancel()
-        try:
-            await app.state.v2_invariant_checker_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-    if getattr(app.state, "v2_rollout_evaluator_task", None):
-        app.state.v2_rollout_evaluator_task.cancel()
-        try:
-            await app.state.v2_rollout_evaluator_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
+    await _cancel_background_loop_tasks(app)
     await db.close()
     logger.info("Database connection pool closed")
 
@@ -12816,6 +12619,169 @@ def _background_loop_task_status(app: FastAPI) -> List[Dict[str, Any]]:
             }
         )
     return items
+
+
+def _background_loops_enabled(settings: Any) -> bool:
+    return bool(getattr(settings, "background_loops_enabled", True))
+
+
+def _runtime_role(settings: Any) -> str:
+    value = _normalize_text(getattr(settings, "runtime_role", None))
+    return value or "api"
+
+
+def _start_background_loop_tasks(app: FastAPI, settings: Any) -> List[str]:
+    runtime_role = _runtime_role(settings)
+    app.state.runtime_role = runtime_role
+    app.state.background_loops_enabled = _background_loops_enabled(settings)
+    app.state.background_loops_started = []
+
+    if not app.state.background_loops_enabled:
+        logger.info("Background loops disabled for runtime_role=%s", runtime_role)
+        return []
+
+    started: List[str] = []
+    if settings.idle_close_enabled:
+        app.state.idle_close_task = asyncio.create_task(
+            session.idle_close_loop(
+                graphiti_client=graphiti_client,
+                interval_seconds=settings.idle_close_interval_seconds,
+                idle_minutes=settings.idle_close_threshold_minutes,
+                batch_size=settings.idle_close_batch_size
+            )
+        )
+        started.append("idle_close")
+        logger.info("Idle close loop started runtime_role=%s", runtime_role)
+    if settings.outbox_drain_enabled:
+        app.state.outbox_drain_task = asyncio.create_task(
+            session.drain_loop(
+                graphiti_client=graphiti_client,
+                interval_seconds=settings.outbox_drain_interval_seconds,
+                limit=settings.outbox_drain_limit,
+                budget_seconds=settings.outbox_drain_budget_seconds,
+                per_row_timeout_seconds=settings.outbox_drain_per_row_timeout_seconds
+            )
+        )
+        started.append("outbox_drain")
+        logger.info("Outbox drain loop started runtime_role=%s", runtime_role)
+    if settings.user_model_updater_enabled:
+        app.state.user_model_updater_task = asyncio.create_task(
+            user_model_updater_loop(
+                interval_seconds=settings.user_model_updater_interval_seconds,
+                lookback_hours=settings.user_model_updater_lookback_hours,
+                max_users=settings.user_model_updater_max_users,
+                low_conf=settings.user_model_low_confidence,
+                high_conf=settings.user_model_high_confidence
+            )
+        )
+        started.append("user_model_updater")
+        logger.info("User model updater loop started runtime_role=%s", runtime_role)
+    if settings.user_model_enrichment_enabled:
+        app.state.user_model_enrichment_task = asyncio.create_task(
+            user_model_enrichment_loop(
+                interval_seconds=settings.user_model_enrichment_interval_seconds,
+                max_users=settings.user_model_enrichment_max_users,
+                min_confidence=settings.user_model_enrichment_min_confidence,
+                daily_lookback_hours=settings.user_model_enrichment_daily_lookback_hours,
+                weekly_lookback_days=settings.user_model_enrichment_weekly_lookback_days,
+                retry_backoff_seconds=settings.user_model_enrichment_retry_backoff_seconds,
+                retry_max_seconds=settings.user_model_enrichment_retry_max_seconds
+            )
+        )
+        started.append("user_model_enrichment")
+        logger.info("User model enrichment loop started runtime_role=%s", runtime_role)
+    if settings.loop_staleness_janitor_enabled:
+        app.state.loop_staleness_janitor_task = asyncio.create_task(
+            loop_staleness_janitor_loop(
+                interval_seconds=settings.loop_staleness_janitor_interval_seconds
+            )
+        )
+        started.append("loop_staleness_janitor")
+        logger.info("Loop staleness janitor loop started runtime_role=%s", runtime_role)
+    if settings.derived_pipeline_silence_detection_enabled:
+        app.state.derived_silence_detection_task = asyncio.create_task(
+            derived_silence_detection_loop(
+                interval_seconds=settings.derived_pipeline_silence_detection_interval_seconds
+            )
+        )
+        started.append("derived_silence_detection")
+        logger.info("Derived silence detector loop started runtime_role=%s", runtime_role)
+    if settings.derived_pipeline_audit_enabled:
+        app.state.derived_memory_audit_task = asyncio.create_task(
+            derived_memory_audit_loop(
+                interval_seconds=settings.derived_pipeline_audit_interval_seconds
+            )
+        )
+        started.append("derived_memory_audit")
+        logger.info("Derived memory audit loop started runtime_role=%s", runtime_role)
+    if settings.proactive_shadow_candidates_enabled:
+        app.state.proactive_shadow_candidates_task = asyncio.create_task(
+            proactive_shadow_candidates_loop(
+                interval_seconds=settings.proactive_shadow_candidates_interval_seconds,
+                max_users=settings.proactive_shadow_candidates_max_users,
+                lookback_days=settings.proactive_shadow_recent_change_lookback_days,
+            )
+        )
+        started.append("proactive_shadow_candidates")
+        logger.info("Proactive shadow candidates loop started runtime_role=%s", runtime_role)
+    if settings.daily_analysis_enabled:
+        app.state.daily_analysis_task = asyncio.create_task(
+            daily_analysis_loop(
+                interval_seconds=settings.daily_analysis_interval_seconds,
+                target_offset_days=settings.daily_analysis_target_offset_days,
+                max_users=settings.daily_analysis_max_users,
+                max_turns=settings.daily_analysis_max_turns
+            )
+        )
+        started.append("daily_analysis")
+        logger.info("Daily analysis loop started runtime_role=%s", runtime_role)
+        app.state.daily_habit_dedupe_task = asyncio.create_task(
+            daily_habit_dedupe_loop(
+                interval_seconds=settings.daily_analysis_interval_seconds,
+                max_users=settings.daily_analysis_max_users,
+            )
+        )
+        started.append("daily_habit_dedupe")
+        logger.info("Daily habit dedupe loop started runtime_role=%s", runtime_role)
+    if settings.v2_invariant_checker_enabled:
+        app.state.v2_invariant_checker_task = asyncio.create_task(
+            v2_invariant_checker_loop(
+                interval_seconds=settings.v2_invariant_checker_interval_seconds,
+                auto_repair_enabled=settings.v2_invariant_checker_auto_repair_enabled,
+            )
+        )
+        started.append("v2_invariant_checker")
+        logger.info("V2 invariant checker loop started runtime_role=%s", runtime_role)
+    if settings.v2_rollout_control_enabled and settings.v2_rollout_eval_enabled:
+        app.state.v2_rollout_evaluator_task = asyncio.create_task(
+            v2_rollout_evaluator_loop(
+                interval_seconds=settings.v2_rollout_eval_interval_seconds,
+            )
+        )
+        started.append("v2_rollout_evaluator")
+        logger.info("V2 rollout evaluator loop started runtime_role=%s", runtime_role)
+
+    app.state.background_loops_started = started
+    logger.info(
+        "Background loops startup complete runtime_role=%s started=%s",
+        runtime_role,
+        ",".join(started) if started else "none",
+    )
+    return started
+
+
+async def _cancel_background_loop_tasks(app: FastAPI) -> None:
+    for _, attr_name in _BACKGROUND_LOOP_TASK_ATTRS:
+        task = getattr(app.state, attr_name, None)
+        if not task:
+            continue
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
 
 # CORS middleware
 app.add_middleware(
@@ -16604,7 +16570,12 @@ async def debug_background_loops(
     x_internal_token: str | None = Header(default=None)
 ):
     _require_internal_token(x_internal_token)
-    return {"loops": _background_loop_task_status(app)}
+    return {
+        "runtime_role": getattr(app.state, "runtime_role", "api"),
+        "background_loops_enabled": bool(getattr(app.state, "background_loops_enabled", False)),
+        "started_loops": list(getattr(app.state, "background_loops_started", []) or []),
+        "loops": _background_loop_task_status(app),
+    }
 
 
 @app.post("/internal/debug/close_session")
