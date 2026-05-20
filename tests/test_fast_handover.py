@@ -37,7 +37,8 @@ async def test_session_ingest_creates_handover_packet():
     tenant = f"tenant-{uuid4().hex}"
     user = f"user-{uuid4().hex}"
     session_id = f"session-{uuid4().hex}"
-    now = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    now_iso = now.isoformat().replace("+00:00", "Z")
 
     async with app.router.lifespan_context(app):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -47,11 +48,11 @@ async def test_session_ingest_creates_handover_packet():
                     "tenantId": tenant,
                     "userId": user,
                     "sessionId": session_id,
-                    "startedAt": now,
-                    "endedAt": now,
+                    "startedAt": now_iso,
+                    "endedAt": now_iso,
                     "messages": [
-                        {"role": "user", "text": "I still need to chase Acme about invoice #102.", "timestamp": now},
-                        {"role": "user", "text": "Should I draft the email today?", "timestamp": now},
+                        {"role": "user", "text": "I still need to chase Acme about invoice #102.", "timestamp": now_iso},
+                        {"role": "user", "text": "Should I draft the email today?", "timestamp": now_iso},
                     ],
                 },
             )

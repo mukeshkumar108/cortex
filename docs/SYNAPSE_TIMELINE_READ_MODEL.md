@@ -194,6 +194,8 @@ It gives Synapse a compact way to answer:
 
 That makes it easier to build better summaries without over-indexing on stale context.
 
+The current `GET /internal/debug/daily-overview` MVP now uses timeline as one of its internal ingredients. Timeline remains the debugging and freshness-inspection layer; Daily Overview is the product-shaped composition layer.
+
 ---
 
 ## 9. Current limitations

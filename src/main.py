@@ -55,6 +55,7 @@ from .models import (
     AttentionOutcomeRecordRequest,
     AttentionOutcomeResponse,
     TimelineReadModelResponse,
+    DailyOverviewResponse,
     SessionChangeItem,
     SessionChangesResponse,
     EntityCandidateItem,
@@ -169,6 +170,7 @@ from .attention_preview import build_attention_preview
 from .attention_outcomes import record_attention_outcome
 from .fast_handover import get_latest_fast_handover_packet
 from .timeline_read_model import build_timeline_read_model
+from .daily_overview import DailyOverviewError, build_daily_overview
 
 # Configure logging
 logging.basicConfig(
@@ -17189,6 +17191,42 @@ async def debug_timeline_read_model(
     except Exception as e:
         logger.error("Debug timeline read model failed: %s", e)
         raise HTTPException(status_code=500, detail="Debug timeline read model failed")
+
+
+@app.get("/internal/debug/daily-overview", response_model=DailyOverviewResponse)
+async def debug_daily_overview(
+    tenantId: str = "default",
+    userId: str | None = None,
+    companionId: str = "sophie",
+    date: str | None = None,
+    timezone: str | None = None,
+    includeExpired: bool = False,
+    limit: int = 25,
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    if not _normalize_text(userId):
+        raise HTTPException(status_code=400, detail="userId is required")
+    tenant_id = _normalize_text(_canonical_tenant_id(tenantId)) or tenantId
+    try:
+        payload = await build_daily_overview(
+            db,
+            tenant_id=tenant_id,
+            user_id=_normalize_text(userId),
+            companion_id=companionId,
+            date_value=date,
+            timezone_name=timezone,
+            include_expired=includeExpired,
+            limit=limit,
+        )
+        return DailyOverviewResponse(**payload)
+    except DailyOverviewError:
+        raise
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Debug daily overview failed: %s", e)
+        raise HTTPException(status_code=500, detail="Debug daily overview failed")
 
 
 @app.post("/internal/debug/proactive-shadow/rebuild")

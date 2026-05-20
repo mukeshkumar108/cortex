@@ -159,8 +159,8 @@ async def fetch_attention_outcomes(
                outcome_type, outcome_reason, surface_mode, action_policy, occurred_at, snoozed_until,
                suppress_until, metadata, created_at
         FROM attention_outcomes
-        WHERE tenant_id=$1
-          AND user_id=$2
+        WHERE tenant_id=$1::text
+          AND user_id=$2::text
           AND (
             attention_item_id = ANY($3::text[])
             OR (

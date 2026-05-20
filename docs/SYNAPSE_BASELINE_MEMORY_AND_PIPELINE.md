@@ -163,6 +163,7 @@ Current limitations:
 | `/memory/query` | Targeted recall (factual, episodic). | Active. |
 | `/internal/debug/attention` | Read-only dynamic queue of Attention Items. | **Active (v1).** Filters by Companion Profile, hides expired items, supports `includeExpired=true`. |
 | `/internal/debug/timeline` | Read-only normalized recent memory timeline across existing tables. | **Active (v1).** Internal/debug only; exposes freshness, first/last seen timing, expiry, and source-table provenance for state decay inspection. |
+| `/internal/debug/daily-overview` | Read-only day-shaped overview composed from schedule, obligations, attention, handover, and timeline. | **Active (MVP).** Internal/debug only; intended as the future basis for morning brief, daily planning, reminders, and proactive nudges. |
 | `/actions/items` | Mutations on actionable objects. | Active. |
 | `/user/model` | Synthesized durable user profile. | Legacy. Being replaced by Identity/Profile passes. |
 

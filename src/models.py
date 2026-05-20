@@ -603,6 +603,25 @@ class TimelineReadModelResponse(BaseModel):
     metadata: Dict[str, Any] = {}
 
 
+class DailyOverviewResponse(BaseModel):
+    tenantId: str
+    userId: str
+    companionId: str
+    date: str
+    timezone: str
+    generatedAt: str
+    readOnly: bool = True
+    sourceHealth: Dict[str, Any] = {}
+    gaps: List[str] = []
+    todaysSchedule: List[Dict[str, Any]] = []
+    tasksAndObligations: List[Dict[str, Any]] = []
+    worthAttention: List[Dict[str, Any]] = []
+    recentContinuity: Optional[Dict[str, Any]] = None
+    recentTimelineSignals: Dict[str, Any] = {}
+    suggestedFocus: Dict[str, Any] = {}
+    metadata: Dict[str, Any] = {}
+
+
 class SessionChangeItem(BaseModel):
     id: int
     kind: str

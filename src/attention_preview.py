@@ -843,7 +843,7 @@ async def build_attention_preview(
         """
         SELECT current_focus, emotional_texture, primary_tension, relationship_pulse, why_it_matters, sophie_directives
         FROM living_context
-        WHERE user_id=$1
+        WHERE user_id=$1::text
         """,
         user_id,
     )
@@ -855,11 +855,11 @@ async def build_attention_preview(
                due_iso, relevant_from_iso, relevant_until_iso, status, confidence_score, confidence,
                provenance, metadata, created_at, updated_at, proposed_due_at
         FROM actionable_candidates
-        WHERE tenant_id=$1
-          AND user_id=$2
+        WHERE tenant_id=$1::text
+          AND user_id=$2::text
           AND status IN ('detected','needs_review','confirmed')
         ORDER BY COALESCE(proposed_due_at, due_iso, relevant_until_iso, updated_at) ASC NULLS LAST, updated_at DESC
-        LIMIT $3
+        LIMIT $3::int
         """,
         tenant_id,
         user_id,
@@ -870,11 +870,11 @@ async def build_attention_preview(
         SELECT candidate_id, tenant_id, user_id, candidate_key, title, reason, priority_score, confidence,
                due_at, status, source_turn_refs, metadata, created_at, updated_at
         FROM follow_up_candidates
-        WHERE tenant_id=$1
-          AND user_id=$2
+        WHERE tenant_id=$1::text
+          AND user_id=$2::text
           AND status='shadow_open'
         ORDER BY priority_score DESC, due_at NULLS LAST, updated_at DESC
-        LIMIT $3
+        LIMIT $3::int
         """,
         tenant_id,
         user_id,
@@ -885,11 +885,11 @@ async def build_attention_preview(
         SELECT candidate_id, tenant_id, user_id, candidate_key, title, reason, priority_score, confidence,
                due_at, status, source_turn_refs, metadata, created_at, updated_at
         FROM clarification_candidates
-        WHERE tenant_id=$1
-          AND user_id=$2
+        WHERE tenant_id=$1::text
+          AND user_id=$2::text
           AND status='shadow_open'
         ORDER BY priority_score DESC, due_at NULLS LAST, updated_at DESC
-        LIMIT $3
+        LIMIT $3::int
         """,
         tenant_id,
         user_id,
@@ -899,12 +899,12 @@ async def build_attention_preview(
         """
         SELECT thread_id, user_id, title, detail, status, priority, category, source_session_ids, follow_up_after
         FROM open_threads
-        WHERE user_id=$1
+        WHERE user_id=$1::text
           AND status='open'
           AND follow_up_after IS NOT NULL
-          AND follow_up_after <= $2
+          AND follow_up_after <= $2::timestamptz
         ORDER BY follow_up_after ASC, last_updated_at DESC NULLS LAST
-        LIMIT $3
+        LIMIT $3::int
         """,
         user_id,
         now + timedelta(days=1),
@@ -914,15 +914,15 @@ async def build_attention_preview(
         """
         SELECT id, tenant_id, user_id, kind, title, notes, status, due_at, remind_at, source_ref, confidence, created_at, updated_at
         FROM action_items
-        WHERE tenant_id=$1
-          AND user_id=$2
+        WHERE tenant_id=$1::text
+          AND user_id=$2::text
           AND status='pending'
           AND (
-            (due_at IS NOT NULL AND due_at <= $3)
-            OR (remind_at IS NOT NULL AND remind_at <= $3)
+            (due_at IS NOT NULL AND due_at <= $3::timestamptz)
+            OR (remind_at IS NOT NULL AND remind_at <= $3::timestamptz)
           )
         ORDER BY COALESCE(remind_at, due_at, updated_at) ASC, updated_at DESC
-        LIMIT $4
+        LIMIT $4::int
         """,
         tenant_id,
         user_id,
@@ -933,15 +933,15 @@ async def build_attention_preview(
         """
         SELECT id, tenant_id, user_id, title, description, notes, starts_at, ends_at, status, source_ref, evidence_refs, confidence
         FROM calendar_items
-        WHERE tenant_id=$1
-          AND user_id=$2
+        WHERE tenant_id=$1::text
+          AND user_id=$2::text
           AND status='confirmed'
           AND (
-            starts_at BETWEEN $3 AND $4
-            OR (ends_at IS NOT NULL AND ends_at BETWEEN $5 AND $6)
+            starts_at BETWEEN $3::timestamptz AND $4::timestamptz
+            OR (ends_at IS NOT NULL AND ends_at BETWEEN $5::timestamptz AND $6::timestamptz)
           )
         ORDER BY starts_at ASC, updated_at DESC
-        LIMIT $7
+        LIMIT $7::int
         """,
         tenant_id,
         user_id,

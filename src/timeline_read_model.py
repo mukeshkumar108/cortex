@@ -402,8 +402,8 @@ async def _fetch_action_items(db: Any, tenant_id: str, user_id: str) -> List[Dic
                source_ref, confidence, provenance_summary, created_at, updated_at,
                completed_at, dismissed_at, cancelled_at
         FROM action_items
-        WHERE tenant_id=$1
-          AND user_id=$2
+        WHERE tenant_id=$1::text
+          AND user_id=$2::text
         ORDER BY updated_at DESC, created_at DESC
         """,
         tenant_id,
@@ -419,8 +419,8 @@ async def _fetch_action_updates(db: Any, tenant_id: str, user_id: str) -> List[D
                proposed_remind_at, evidence_summary, confidence, status, source_ref,
                created_at, updated_at, applied_at, rejected_at
         FROM action_updates
-        WHERE tenant_id=$1
-          AND user_id=$2
+        WHERE tenant_id=$1::text
+          AND user_id=$2::text
         ORDER BY updated_at DESC, created_at DESC
         """,
         tenant_id,
@@ -436,8 +436,8 @@ async def _fetch_calendar_items(db: Any, tenant_id: str, user_id: str) -> List[D
                status, source_ref, evidence_refs, confidence, provenance_summary,
                created_at, updated_at, cancelled_at, archived_at
         FROM calendar_items
-        WHERE tenant_id=$1
-          AND user_id=$2
+        WHERE tenant_id=$1::text
+          AND user_id=$2::text
         ORDER BY starts_at DESC, updated_at DESC
         """,
         tenant_id,
@@ -452,8 +452,8 @@ async def _fetch_session_changes(db: Any, tenant_id: str, user_id: str) -> List[
         SELECT change_id, tenant_id, user_id, kind, title, summary, effective_iso, provenance,
                confidence_score, status, created_at, updated_at
         FROM session_changes
-        WHERE tenant_id=$1
-          AND user_id=$2
+        WHERE tenant_id=$1::text
+          AND user_id=$2::text
         ORDER BY COALESCE(effective_iso, updated_at, created_at) DESC
         """,
         tenant_id,
@@ -468,8 +468,8 @@ async def _fetch_handover_packets(db: Any, tenant_id: str, user_id: str) -> List
         SELECT packet_id, tenant_id, user_id, session_id, summary, source_turn_refs,
                created_at, updated_at, expires_at, status
         FROM session_handover_packets
-        WHERE tenant_id=$1
-          AND user_id=$2
+        WHERE tenant_id=$1::text
+          AND user_id=$2::text
         ORDER BY created_at DESC
         """,
         tenant_id,
@@ -484,8 +484,8 @@ async def _fetch_attention_outcomes(db: Any, tenant_id: str, user_id: str) -> Li
         SELECT outcome_id, tenant_id, user_id, source_table, source_id, outcome_type,
                outcome_reason, occurred_at, snoozed_until, suppress_until, metadata, created_at
         FROM attention_outcomes
-        WHERE tenant_id=$1
-          AND user_id=$2
+        WHERE tenant_id=$1::text
+          AND user_id=$2::text
         ORDER BY occurred_at DESC, created_at DESC
         """,
         tenant_id,
@@ -500,8 +500,8 @@ async def _fetch_relationship_links(db: Any, tenant_id: str, user_id: str) -> Li
         SELECT link_id, tenant_id, user_id, source_id, target_id, relationship_type, confidence,
                source_turn_refs, created_at, updated_at, status, strength, valid_from, valid_until, expires_at
         FROM memory_relationship_links
-        WHERE tenant_id=$1
-          AND user_id=$2
+        WHERE tenant_id=$1::text
+          AND user_id=$2::text
         ORDER BY updated_at DESC, created_at DESC
         """,
         tenant_id,

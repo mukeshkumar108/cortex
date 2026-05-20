@@ -362,13 +362,13 @@ async def get_latest_fast_handover_packet(
     now = as_of or datetime.now(dt_timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=dt_timezone.utc)
-    where = ["tenant_id = $1", "user_id = $2"]
+    where = ["tenant_id = $1::text", "user_id = $2::text"]
     args: List[Any] = [tenant_id, user_id]
     if _normalize_text(session_id):
-        where.append(f"session_id = ${len(args) + 1}")
+        where.append(f"session_id = ${len(args) + 1}::text")
         args.append(session_id)
     if not include_expired:
-        where.append(f"expires_at > ${len(args) + 1}")
+        where.append(f"expires_at > ${len(args) + 1}::timestamptz")
         args.append(now)
     query = f"""
         SELECT

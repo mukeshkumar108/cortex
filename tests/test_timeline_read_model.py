@@ -148,11 +148,12 @@ async def test_internal_timeline_endpoint_requires_internal_auth(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_timeline_includes_action_calendar_attention_and_handover_events(monkeypatch):
+    runtime_now = datetime.now(timezone.utc)
     db = FakeDB()
     db.action_item_rows = [_action_item_row()]
     db.calendar_rows = [_calendar_item_row()]
     db.outcome_rows = [_attention_outcome_row()]
-    db.handover_rows = [_handover_row()]
+    db.handover_rows = [_handover_row(created_at=runtime_now - timedelta(hours=2), expires_at=runtime_now + timedelta(hours=12))]
     monkeypatch.setattr(main_module, "db", db, raising=True)
     monkeypatch.setattr(main_module, "get_settings", lambda: SimpleNamespace(internal_token="test-token"), raising=True)
 
