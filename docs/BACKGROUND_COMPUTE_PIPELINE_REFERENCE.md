@@ -13,7 +13,7 @@ Configured in `src/main.py` lifespan startup and `src/config.py` defaults.
   - Interval default: every 300s
   - Purpose: fast heuristic updates to `user_model` from recent transcript + loops
 - `user_model_enrichment_loop`
-  - Enabled by default: `user_model_enrichment_enabled=true`
+  - Enabled by default: `user_model_enrichment_enabled=false`
   - Interval default: every 900s
   - Purpose: LLM-based structured enrichment + narrative refresh + hygiene
 - `loop_staleness_janitor_loop`
@@ -21,15 +21,28 @@ Configured in `src/main.py` lifespan startup and `src/config.py` defaults.
   - Interval default: every 86400s
   - Purpose: age-based loop status transitions (`active` -> `stale`/`needs_review`)
 - `daily_analysis_loop`
-  - Enabled by default: `daily_analysis_enabled=true`
+  - Enabled by default: `daily_analysis_enabled=false`
   - Interval default: every 86400s
   - Purpose: compute prior-day themes/scores/steering in `daily_analysis`
 - `daily_habit_dedupe_loop`
   - Runs alongside daily analysis loop (same interval)
   - Purpose: dedupe/flag uncertain daily habit loops
+- `derived_memory_audit_loop`
+  - Enabled by default: `derived_pipeline_audit_enabled=false`
+- `proactive_shadow_candidates_loop`
+  - Enabled by default: `proactive_shadow_candidates_enabled=false`
+- `v2_invariant_checker_loop`
+  - Enabled by default: `v2_invariant_checker_enabled=false`
 - Optional ops loops
   - `idle_close_loop` (default disabled)
-  - `drain_loop` outbox drainer (default disabled)
+  - `drain_loop` outbox drainer (worker default enabled in compose)
+
+Runtime ownership:
+
+- `api` runtime does not start broad background compute.
+- `worker` runtime owns the full loop set.
+- If the API is misconfigured with loops enabled, only `idle_close` and `outbox_drain` are allowed to start.
+- LLM-heavy loops (`user_model_enrichment`, `daily_analysis`, `daily_habit_dedupe`) apply a startup delay via `LLM_BACKGROUND_LOOPS_STARTUP_DELAY_SECONDS` before the first run.
 
 ## 2) Session Ingest and Outbox Jobs
 
@@ -367,4 +380,3 @@ Note: `_summarize_session_bridge(...)` calls `task="session_bridge"`, which is n
 3. Check `daily_analysis.metadata.input_mode` and `quality_flag` for fallback indicators.
 4. Check `user_model` field-level `updated_at`, `source`, `confidence` inside sections used for hints.
 5. Use startbrief provenance (`startbrief_history` and `evidence` block) to verify what was actually used in that response.
-

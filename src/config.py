@@ -1,9 +1,16 @@
-from pydantic_settings import BaseSettings
+from pydantic import AliasChoices, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 from typing import Optional
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="allow",
+    )
+
     # Database
     database_url: str = "postgresql://synapse:password@postgres:5432/synapse"
 
@@ -48,8 +55,22 @@ class Settings(BaseSettings):
     episodic_embedding_assistant_char_weight: float = 0.45
 
     # Session settings
-    background_loops_enabled: bool = True
-    runtime_role: str = "api"
+    background_loops_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "background_loops_enabled",
+            "BACKGROUND_LOOPS_ENABLED",
+            "SYNAPSE_BACKGROUND_LOOPS_ENABLED",
+        ),
+    )
+    runtime_role: str = Field(
+        default="api",
+        validation_alias=AliasChoices(
+            "runtime_role",
+            "RUNTIME_ROLE",
+            "SYNAPSE_RUNTIME_ROLE",
+        ),
+    )
     session_close_gap_minutes: int = 30
     rolling_summary_threshold: int = 6  # turns before compression
     graphiti_timeout: float = 0.5  # seconds for Tier 2 brief
@@ -70,7 +91,7 @@ class Settings(BaseSettings):
     user_model_updater_max_users: int = 100
     user_model_low_confidence: float = 0.55
     user_model_high_confidence: float = 0.9
-    user_model_enrichment_enabled: bool = True
+    user_model_enrichment_enabled: bool = False
     user_model_enrichment_interval_seconds: int = 900
     user_model_enrichment_daily_lookback_hours: int = 24
     user_model_enrichment_weekly_lookback_days: int = 7
@@ -80,7 +101,7 @@ class Settings(BaseSettings):
     user_model_enrichment_retry_max_seconds: int = 86400
     loop_staleness_janitor_enabled: bool = True
     loop_staleness_janitor_interval_seconds: int = 86400
-    daily_analysis_enabled: bool = True
+    daily_analysis_enabled: bool = False
     daily_analysis_interval_seconds: int = 86400
     daily_analysis_target_offset_days: int = 1
     daily_analysis_max_users: int = 500
@@ -88,6 +109,7 @@ class Settings(BaseSettings):
     daily_analysis_max_sessions: int = 12
     daily_analysis_prompt_char_budget: int = 7000
     daily_analysis_low_confidence_threshold: float = 0.6
+    llm_background_loops_startup_delay_seconds: int = 300
     session_bridge_ttl_minutes: int = 30
     v2_dual_write_enabled: bool = True
     v2_dual_write_fail_open: bool = True
@@ -112,13 +134,13 @@ class Settings(BaseSettings):
     derived_pipeline_staleness_review_enabled: bool = False
     derived_pipeline_silence_detection_enabled: bool = True
     derived_pipeline_silence_detection_interval_seconds: int = 86400
-    derived_pipeline_audit_enabled: bool = True
+    derived_pipeline_audit_enabled: bool = False
     derived_pipeline_audit_interval_seconds: int = 86400
     always_on_memory_packet_enabled: bool = True
     always_on_memory_packet_llm_enabled: bool = True
     always_on_memory_packet_model_version: str = "amazon/nova-micro-v1"
     always_on_memory_packet_target_chars: int = 2400
-    proactive_shadow_candidates_enabled: bool = True
+    proactive_shadow_candidates_enabled: bool = False
     proactive_shadow_candidates_interval_seconds: int = 3600
     proactive_shadow_candidates_max_users: int = 300
     proactive_shadow_recent_change_lookback_days: int = 30
@@ -132,7 +154,7 @@ class Settings(BaseSettings):
     retrieval_shadow_read_sample_rate: float = 0.0
     retrieval_shadow_read_blocking: bool = False
     retrieval_shadow_read_endpoint_enabled: bool = True
-    v2_invariant_checker_enabled: bool = True
+    v2_invariant_checker_enabled: bool = False
     v2_invariant_checker_interval_seconds: int = 900
     v2_invariant_checker_auto_repair_enabled: bool = True
     v2_rollout_control_enabled: bool = True
@@ -148,11 +170,6 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     internal_token: Optional[str] = None
     admin_api_key: Optional[str] = None
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        extra = "allow"
 
     def get_database_url(self) -> str:
         """Build database URL from environment variables"""

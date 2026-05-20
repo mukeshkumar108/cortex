@@ -17,6 +17,9 @@ This document describes the current safe runtime split between the HTTP API and 
   - loop manager init
 - Does **not** start background loops when:
   - `SYNAPSE_BACKGROUND_LOOPS_ENABLED=false`
+- Even if background loops are enabled by mistake, only the safe loops are allowed in `api`:
+  - `idle_close`
+  - `outbox_drain`
 
 ### Worker process
 
@@ -26,6 +29,7 @@ This document describes the current safe runtime split between the HTTP API and 
 - Reuses the same app/module startup path
 - Starts background loops when:
   - `SYNAPSE_BACKGROUND_LOOPS_ENABLED=true`
+- Refuses startup unless `SYNAPSE_RUNTIME_ROLE=worker`
 
 ## Environment flags
 
@@ -33,6 +37,23 @@ This document describes the current safe runtime split between the HTTP API and 
 - `SYNAPSE_BACKGROUND_LOOPS_ENABLED=true|false`
 
 The per-loop feature flags still apply. The top-level background loop gate only decides whether this process starts any loop tasks at all.
+
+Current dogfood-safe defaults:
+
+- API:
+  - `SYNAPSE_RUNTIME_ROLE=api`
+  - `SYNAPSE_BACKGROUND_LOOPS_ENABLED=false`
+- Worker:
+  - `SYNAPSE_RUNTIME_ROLE=worker`
+  - `SYNAPSE_BACKGROUND_LOOPS_ENABLED=true`
+  - `OUTBOX_DRAIN_ENABLED=true`
+  - `USER_MODEL_UPDATER_ENABLED=true`
+  - `USER_MODEL_ENRICHMENT_ENABLED=false`
+  - `DAILY_ANALYSIS_ENABLED=false`
+  - `DERIVED_PIPELINE_AUDIT_ENABLED=false`
+  - `PROACTIVE_SHADOW_CANDIDATES_ENABLED=false`
+  - `V2_INVARIANT_CHECKER_ENABLED=false`
+  - `LLM_BACKGROUND_LOOPS_STARTUP_DELAY_SECONDS=300`
 
 ## Current loop inventory
 
@@ -99,6 +120,8 @@ Worker logs should show:
 - startup role
 - whether background loops are enabled
 - the final list of started loops
+- any skipped loops when the runtime role is `api`
+- per-loop run metrics for LLM-heavy loops when enabled
 
 ## Deploy safely
 

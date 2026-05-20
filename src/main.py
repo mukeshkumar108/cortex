@@ -6539,7 +6539,7 @@ async def _run_user_model_updater_once(
     max_users: int,
     low_conf: float,
     high_conf: float
-) -> int:
+) -> Dict[str, int]:
     users = await db.fetch(
         """
         WITH recent_sessions AS (
@@ -6571,10 +6571,18 @@ async def _run_user_model_updater_once(
         lookback_hours,
         max_users
     )
+    counts = {
+        "users_considered": len(users or []),
+        "users_processed": 0,
+        "users_updated": 0,
+        "users_failed": 0,
+        "llm_calls_attempted": 0,
+        "llm_calls_succeeded": 0,
+        "llm_calls_failed": 0,
+    }
     if not users:
-        return 0
+        return counts
 
-    updates = 0
     for row in users:
         tenant_id = row.get("tenant_id")
         user_id = row.get("user_id")
@@ -6584,6 +6592,7 @@ async def _run_user_model_updater_once(
             async with _user_model_write_claim(tenant_id=tenant_id, user_id=user_id) as claimed:
                 if not claimed:
                     continue
+                counts["users_processed"] += 1
                 texts = await _get_recent_user_texts(tenant_id, user_id, limit_sessions=6)
                 active_loops = await loops.get_top_loops_for_startbrief(
                     tenant_id=tenant_id,
@@ -6623,11 +6632,12 @@ async def _run_user_model_updater_once(
                     model=merged,
                     source="auto_updater"
                 )
-                updates += 1
+                counts["users_updated"] += 1
         except Exception as e:
             logger.error(f"user model updater failed for {tenant_id}:{user_id}: {e}")
+            counts["users_failed"] += 1
             continue
-    return updates
+    return counts
 
 
 async def user_model_updater_loop(
@@ -6639,14 +6649,22 @@ async def user_model_updater_loop(
 ) -> None:
     while True:
         try:
-            updates = await _run_user_model_updater_once(
+            started_at = perf_counter()
+            counts = await _run_user_model_updater_once(
                 lookback_hours=lookback_hours,
                 max_users=max_users,
                 low_conf=low_conf,
                 high_conf=high_conf
             )
-            if updates:
-                logger.info("user model updater applied updates=%s", updates)
+            if counts.get("users_processed") or counts.get("users_updated") or counts.get("users_failed"):
+                logger.info(
+                    "loop=user_model_updater users_considered=%s users_processed=%s users_updated=%s users_failed=%s llm_calls_attempted=0 llm_calls_succeeded=0 llm_calls_failed=0 elapsed_ms=%s",
+                    counts.get("users_considered", 0),
+                    counts.get("users_processed", 0),
+                    counts.get("users_updated", 0),
+                    counts.get("users_failed", 0),
+                    int((perf_counter() - started_at) * 1000),
+                )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -7291,7 +7309,12 @@ async def _generate_user_model_enrichment_proposal(
     window_end: datetime,
     session_summaries: List[Dict[str, Any]],
     min_confidence: float
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    llm_counts = {
+        "llm_calls_attempted": 0,
+        "llm_calls_succeeded": 0,
+        "llm_calls_failed": 0,
+    }
     transcript_inputs = await _load_enrichment_transcript_inputs(
         tenant_id=tenant_id,
         user_id=user_id,
@@ -7303,7 +7326,7 @@ async def _generate_user_model_enrichment_proposal(
         max_chars=10000 if mode == "daily" else 18000,
     )
     if not transcript_inputs:
-        return {}
+        return {}, llm_counts
     llm = get_llm_client()
     prompt = (
         "You are enriching a long-lived user profile from memory evidence.\n"
@@ -7348,15 +7371,20 @@ async def _generate_user_model_enrichment_proposal(
         f"SESSION_INDEX_JSON (ranking-only):\n{json.dumps(session_summaries, ensure_ascii=True)}\n\n"
         f"RAW_TRANSCRIPT_USER_TURNS_JSON:\n{json.dumps(transcript_inputs, ensure_ascii=True)}\n"
     )
+    llm_counts["llm_calls_attempted"] += 1
     raw = await llm._call_llm(
         prompt=prompt,
         max_tokens=900,
         temperature=0.1,
         task="user_model_enrichment",
     )
+    if raw:
+        llm_counts["llm_calls_succeeded"] += 1
+    else:
+        llm_counts["llm_calls_failed"] += 1
     payload = _safe_parse_json_object(raw) if raw else None
     if not payload:
-        return {}
+        return {}, llm_counts
     proposal = _proposal_from_enrichment_payload(
         payload=payload,
         min_confidence=min_confidence,
@@ -7488,12 +7516,17 @@ async def _generate_user_model_enrichment_proposal(
             f"TOP_5_LOOPS_JSON:\n{json.dumps(loops_payload, ensure_ascii=True)}\n\n"
             f"LATEST_DAILY_ANALYSIS_JSON:\n{json.dumps(daily_payload, ensure_ascii=True)}\n"
         )
+        llm_counts["llm_calls_attempted"] += 1
         narrative_raw = await llm._call_llm(
             prompt=narrative_prompt,
             max_tokens=520,
             temperature=0.1,
             task="user_model_enrichment",
         )
+        if narrative_raw:
+            llm_counts["llm_calls_succeeded"] += 1
+        else:
+            llm_counts["llm_calls_failed"] += 1
         narrative_payload = _safe_parse_json_object(narrative_raw) if narrative_raw else None
         if isinstance(narrative_payload, dict):
             narrative_stable = _normalize_text(narrative_payload.get("narrative_stable"))
@@ -7518,7 +7551,7 @@ async def _generate_user_model_enrichment_proposal(
                 proposal["narrative"] = combined[:1200]
     except Exception as e:
         logger.warning("user model enrichment narrative generation failed tenant=%s user=%s error=%s", tenant_id, user_id, e)
-    return proposal
+    return proposal, llm_counts
 
 
 async def _update_enrichment_state_success(tenant_id: str, user_id: str, mode: str) -> None:
@@ -7658,7 +7691,15 @@ async def _run_user_model_enrichment_for_user(
     retry_backoff_seconds: int,
     retry_max_seconds: int,
     now: Optional[datetime] = None
-) -> bool:
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "changed": False,
+        "processed": False,
+        "skipped": False,
+        "llm_calls_attempted": 0,
+        "llm_calls_succeeded": 0,
+        "llm_calls_failed": 0,
+    }
     now_dt = now or datetime.utcnow().replace(tzinfo=dt_timezone.utc)
     if now_dt.tzinfo is None:
         now_dt = now_dt.replace(tzinfo=dt_timezone.utc)
@@ -7673,7 +7714,9 @@ async def _run_user_model_enrichment_for_user(
     try:
         async with _user_model_write_claim(tenant_id=tenant_id, user_id=user_id, ttl_seconds=240) as claimed:
             if not claimed:
-                return False
+                result["skipped"] = True
+                return result
+            result["processed"] = True
             session_nodes = await fetch_recent_session_summaries(
                 db,
                 tenant_id=tenant_id,
@@ -7686,7 +7729,7 @@ async def _run_user_model_enrichment_for_user(
                 window_end=window_end,
             )
 
-            proposal = await _generate_user_model_enrichment_proposal(
+            proposal, llm_counts = await _generate_user_model_enrichment_proposal(
                 tenant_id=tenant_id,
                 user_id=user_id,
                 mode=mode,
@@ -7695,6 +7738,7 @@ async def _run_user_model_enrichment_for_user(
                 session_summaries=session_summaries,
                 min_confidence=min_confidence,
             )
+            result.update(llm_counts)
             existing = await db.fetchone(
                 """
                 SELECT model, narrative_stable, narrative_current
@@ -7717,8 +7761,9 @@ async def _run_user_model_enrichment_for_user(
                     model=merged,
                     source="llm_session_enricher",
                 )
+            result["changed"] = changed
             await _update_enrichment_state_success(tenant_id=tenant_id, user_id=user_id, mode=mode)
-            return changed
+            return result
     except Exception as e:
         await _update_enrichment_state_failure(
             tenant_id=tenant_id,
@@ -7746,14 +7791,23 @@ async def _run_user_model_enrichment_mode_once(
         daily_lookback_hours=daily_lookback_hours,
         weekly_lookback_days=weekly_lookback_days,
     )
-    counts = {"selected": len(users or []), "updated": 0, "failed": 0}
+    counts = {
+        "selected": len(users or []),
+        "processed": 0,
+        "updated": 0,
+        "failed": 0,
+        "skipped": 0,
+        "llm_calls_attempted": 0,
+        "llm_calls_succeeded": 0,
+        "llm_calls_failed": 0,
+    }
     for row in users or []:
         tenant_id = row.get("tenant_id")
         user_id = row.get("user_id")
         if not tenant_id or not user_id:
             continue
         try:
-            changed = await _run_user_model_enrichment_for_user(
+            result = await _run_user_model_enrichment_for_user(
                 tenant_id=tenant_id,
                 user_id=user_id,
                 mode=mode,
@@ -7761,7 +7815,12 @@ async def _run_user_model_enrichment_mode_once(
                 retry_backoff_seconds=retry_backoff_seconds,
                 retry_max_seconds=retry_max_seconds,
             )
-            if changed:
+            counts["processed"] += int(bool(result.get("processed")))
+            counts["skipped"] += int(bool(result.get("skipped")))
+            counts["llm_calls_attempted"] += int(result.get("llm_calls_attempted") or 0)
+            counts["llm_calls_succeeded"] += int(result.get("llm_calls_succeeded") or 0)
+            counts["llm_calls_failed"] += int(result.get("llm_calls_failed") or 0)
+            if result.get("changed"):
                 counts["updated"] += 1
         except Exception as e:
             logger.error("user model enrichment failed mode=%s tenant=%s user=%s error=%s", mode, tenant_id, user_id, e)
@@ -7795,7 +7854,7 @@ async def _run_user_model_enrichment_backfill_once(
         if not tenant_id or not user_id:
             continue
         try:
-            changed = await _run_user_model_enrichment_for_user(
+            result = await _run_user_model_enrichment_for_user(
                 tenant_id=tenant_id,
                 user_id=user_id,
                 mode="backfill",
@@ -7803,7 +7862,7 @@ async def _run_user_model_enrichment_backfill_once(
                 retry_backoff_seconds=retry_backoff_seconds,
                 retry_max_seconds=retry_max_seconds,
             )
-            if changed:
+            if result.get("changed"):
                 counts["updated"] += 1
         except Exception as e:
             logger.error("user model enrichment backfill failed tenant=%s user=%s error=%s", tenant_id, user_id, e)
@@ -7955,11 +8014,14 @@ async def user_model_enrichment_loop(
     daily_lookback_hours: int,
     weekly_lookback_days: int,
     retry_backoff_seconds: int,
-    retry_max_seconds: int
+    retry_max_seconds: int,
+    startup_delay_seconds: int = 0,
 ) -> None:
     last_hygiene_run: Optional[datetime] = None
+    await _sleep_before_llm_loop_start("user_model_enrichment", startup_delay_seconds)
     while True:
         try:
+            started_at = perf_counter()
             daily_counts = await _run_user_model_enrichment_mode_once(
                 mode="daily",
                 max_users=max_users,
@@ -7990,20 +8052,21 @@ async def user_model_enrichment_loop(
                 )
                 last_hygiene_run = now_dt
 
-            if (
-                daily_counts.get("updated")
-                or weekly_counts.get("updated")
-                or hygiene_counts.get("updated")
-                or daily_counts.get("failed")
-                or weekly_counts.get("failed")
-                or hygiene_counts.get("failed")
-            ):
-                logger.info(
-                    "user model enrichment loop daily=%s weekly=%s hygiene=%s",
-                    daily_counts,
-                    weekly_counts,
-                    hygiene_counts,
-                )
+            logger.info(
+                "loop=user_model_enrichment users_considered=%s users_processed=%s users_updated=%s users_failed=%s llm_calls_attempted=%s llm_calls_succeeded=%s llm_calls_failed=%s skipped_due_to_throttle=%s hygiene_selected=%s hygiene_updated=%s hygiene_failed=%s elapsed_ms=%s",
+                int(daily_counts.get("selected", 0)) + int(weekly_counts.get("selected", 0)),
+                int(daily_counts.get("processed", 0)) + int(weekly_counts.get("processed", 0)),
+                int(daily_counts.get("updated", 0)) + int(weekly_counts.get("updated", 0)),
+                int(daily_counts.get("failed", 0)) + int(weekly_counts.get("failed", 0)),
+                int(daily_counts.get("llm_calls_attempted", 0)) + int(weekly_counts.get("llm_calls_attempted", 0)),
+                int(daily_counts.get("llm_calls_succeeded", 0)) + int(weekly_counts.get("llm_calls_succeeded", 0)),
+                int(daily_counts.get("llm_calls_failed", 0)) + int(weekly_counts.get("llm_calls_failed", 0)),
+                int(daily_counts.get("skipped", 0)) + int(weekly_counts.get("skipped", 0)),
+                hygiene_counts.get("selected", 0),
+                hygiene_counts.get("updated", 0),
+                hygiene_counts.get("failed", 0),
+                int((perf_counter() - started_at) * 1000),
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -8619,13 +8682,18 @@ async def _get_user_daily_session_summaries(
     return _trim_daily_summary_inputs(rows, max_sessions=max_sessions, char_budget=prompt_char_budget)
 
 
-async def _generate_daily_analysis(
+async def _generate_daily_analysis_with_stats(
     turns: List[Dict[str, str]],
     session_summaries: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    llm_counts = {
+        "llm_calls_attempted": 0,
+        "llm_calls_succeeded": 0,
+        "llm_calls_failed": 0,
+    }
     use_summaries = bool(session_summaries)
     if not turns and not use_summaries:
-        return _fallback_daily_analysis(turns)
+        return _fallback_daily_analysis(turns), llm_counts
     llm = get_llm_client()
     transcript = "\n".join(f"{t['role']}: {t['text']}" for t in turns)
     summary_rows = session_summaries or []
@@ -8690,12 +8758,17 @@ async def _generate_daily_analysis(
         rejection_turns = turns
 
     for attempt in range(2):
+        llm_counts["llm_calls_attempted"] += 1
         raw = await llm._call_llm(
             prompt=prompt,
             max_tokens=500,
             temperature=0.15,
             task="daily_analysis"
         )
+        if raw:
+            llm_counts["llm_calls_succeeded"] += 1
+        else:
+            llm_counts["llm_calls_failed"] += 1
         parsed = _safe_parse_json_object(raw) if raw else None
         if not parsed:
             continue
@@ -8703,7 +8776,7 @@ async def _generate_daily_analysis(
         evidence_terms = _extract_summary_evidence_terms(summary_rows, normalized.get("themes")) if use_summaries else _extract_transcript_keywords(rejection_turns, limit=16)
         reasons = _daily_analysis_rejection_reasons(normalized, rejection_turns, evidence_terms=evidence_terms)
         if not reasons:
-            return normalized
+            return normalized, llm_counts
         prompt = (
             "Previous output was rejected. Regenerate a better JSON response.\n"
             f"Rejection reasons: {'; '.join(reasons)}\n"
@@ -8718,7 +8791,18 @@ async def _generate_daily_analysis(
                 f"TRANSCRIPT:\n{transcript}\n"
             )
         )
-    return _fallback_daily_analysis(turns)
+    return _fallback_daily_analysis(turns), llm_counts
+
+
+async def _generate_daily_analysis(
+    turns: List[Dict[str, str]],
+    session_summaries: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    analysis, _ = await _generate_daily_analysis_with_stats(
+        turns=turns,
+        session_summaries=session_summaries,
+    )
+    return analysis
 
 
 async def _upsert_daily_analysis(
@@ -8799,13 +8883,21 @@ async def _run_daily_analysis_once(
     target_date: date,
     max_users: int,
     max_turns: int
-) -> int:
+) -> Dict[str, int]:
     day_start = datetime.combine(target_date, datetime.min.time())
     day_end = day_start + timedelta(days=1)
     users = await _get_daily_analysis_users(day_start, day_end, max_users=max_users)
+    counts = {
+        "users_considered": len(users or []),
+        "users_processed": 0,
+        "users_updated": 0,
+        "users_failed": 0,
+        "llm_calls_attempted": 0,
+        "llm_calls_succeeded": 0,
+        "llm_calls_failed": 0,
+    }
     if not users:
-        return 0
-    updates = 0
+        return counts
     for row in users:
         tenant_id = row.get("tenant_id")
         user_id = row.get("user_id")
@@ -8832,10 +8924,14 @@ async def _run_daily_analysis_once(
             used_turn_tail = not bool(session_summaries)
             if not session_summaries and not turns:
                 continue
-            analysis = await _generate_daily_analysis(
+            counts["users_processed"] += 1
+            analysis, llm_counts = await _generate_daily_analysis_with_stats(
                 turns=turns,
                 session_summaries=session_summaries if session_summaries else None,
             )
+            counts["llm_calls_attempted"] += int(llm_counts.get("llm_calls_attempted") or 0)
+            counts["llm_calls_succeeded"] += int(llm_counts.get("llm_calls_succeeded") or 0)
+            counts["llm_calls_failed"] += int(llm_counts.get("llm_calls_failed") or 0)
             if used_turn_tail and analysis.get("source") == "llm":
                 analysis["source"] = "fallback_raw_turns"
             salience_counts = {"high": 0, "medium": 0, "low": 0}
@@ -8874,10 +8970,11 @@ async def _run_daily_analysis_once(
                 analysis=analysis,
                 metadata=metadata
             )
-            updates += 1
+            counts["users_updated"] += 1
         except Exception as e:
             logger.error(f"daily analysis failed for {tenant_id}:{user_id}: {e}")
-    return updates
+            counts["users_failed"] += 1
+    return counts
 
 
 async def _run_daily_analysis_for_user(
@@ -8957,19 +9054,32 @@ async def daily_analysis_loop(
     interval_seconds: int,
     target_offset_days: int,
     max_users: int,
-    max_turns: int
+    max_turns: int,
+    startup_delay_seconds: int = 0,
 ) -> None:
+    await _sleep_before_llm_loop_start("daily_analysis", startup_delay_seconds)
     while True:
         try:
+            started_at = perf_counter()
             offset = max(0, int(target_offset_days))
             target_date = (datetime.utcnow() - timedelta(days=offset)).date()
-            updates = await _run_daily_analysis_once(
+            counts = await _run_daily_analysis_once(
                 target_date=target_date,
                 max_users=max_users,
                 max_turns=max_turns
             )
-            if updates:
-                logger.info("daily analysis updated users=%s target_date=%s", updates, target_date.isoformat())
+            logger.info(
+                "loop=daily_analysis target_date=%s users_considered=%s users_processed=%s users_updated=%s users_failed=%s llm_calls_attempted=%s llm_calls_succeeded=%s llm_calls_failed=%s elapsed_ms=%s",
+                target_date.isoformat(),
+                counts.get("users_considered", 0),
+                counts.get("users_processed", 0),
+                counts.get("users_updated", 0),
+                counts.get("users_failed", 0),
+                counts.get("llm_calls_attempted", 0),
+                counts.get("llm_calls_succeeded", 0),
+                counts.get("llm_calls_failed", 0),
+                int((perf_counter() - started_at) * 1000),
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -9069,7 +9179,7 @@ async def _run_habit_dedupe_for_user(
         user_id,
     )
     if not rows:
-        return {"staled": 0, "flagged": 0}
+        return {"staled": 0, "flagged": 0, "llm_calls_attempted": 0, "llm_calls_succeeded": 0, "llm_calls_failed": 0}
 
     habits_payload: List[Dict[str, Any]] = []
     valid_ids: set[str] = set()
@@ -9092,7 +9202,7 @@ async def _run_habit_dedupe_for_user(
             }
         )
     if not habits_payload:
-        return {"staled": 0, "flagged": 0}
+        return {"staled": 0, "flagged": 0, "llm_calls_attempted": 0, "llm_calls_succeeded": 0, "llm_calls_failed": 0}
 
     prompt = (
         "Given these active daily habits for one user, identify:\n"
@@ -9117,12 +9227,15 @@ async def _run_habit_dedupe_for_user(
         f"HABITS_JSON: {json.dumps(habits_payload, ensure_ascii=True)}"
     )
     llm_client = get_llm_client()
+    llm_calls_attempted = 1
     raw = await llm_client._call_llm(
         prompt=prompt,
         max_tokens=900,
         temperature=0.1,
         task="loops",
     )
+    llm_calls_succeeded = 1 if raw else 0
+    llm_calls_failed = 0 if raw else 1
     parsed = _safe_parse_json_object(raw) if raw else None
     plan = _normalize_habit_dedupe_plan(parsed, valid_ids=valid_ids)
 
@@ -9210,7 +9323,13 @@ async def _run_habit_dedupe_for_user(
         if row:
             flagged_count += 1
 
-    return {"staled": stale_count, "flagged": flagged_count}
+    return {
+        "staled": stale_count,
+        "flagged": flagged_count,
+        "llm_calls_attempted": llm_calls_attempted,
+        "llm_calls_succeeded": llm_calls_succeeded,
+        "llm_calls_failed": llm_calls_failed,
+    }
 
 
 async def _run_daily_habit_dedupe_once(
@@ -9238,7 +9357,17 @@ async def _run_daily_habit_dedupe_once(
         run_date,
         max(1, int(max_users)),
     )
-    counts = {"users_seen": len(users or []), "users_updated": 0, "staled": 0, "flagged": 0}
+    counts = {
+        "users_seen": len(users or []),
+        "users_processed": 0,
+        "users_updated": 0,
+        "staled": 0,
+        "flagged": 0,
+        "users_failed": 0,
+        "llm_calls_attempted": 0,
+        "llm_calls_succeeded": 0,
+        "llm_calls_failed": 0,
+    }
     for row in users or []:
         tenant_id = _normalize_text(row.get("tenant_id"))
         user_id = _normalize_text(row.get("user_id"))
@@ -9250,38 +9379,51 @@ async def _run_daily_habit_dedupe_once(
                 user_id=user_id,
                 run_date=run_date,
             )
+            counts["users_processed"] += 1
             await _mark_habit_dedupe_run_state(tenant_id=tenant_id, user_id=user_id, run_date=run_date)
             staled = int((result or {}).get("staled") or 0)
             flagged = int((result or {}).get("flagged") or 0)
+            counts["llm_calls_attempted"] += int((result or {}).get("llm_calls_attempted") or 0)
+            counts["llm_calls_succeeded"] += int((result or {}).get("llm_calls_succeeded") or 0)
+            counts["llm_calls_failed"] += int((result or {}).get("llm_calls_failed") or 0)
             counts["staled"] += staled
             counts["flagged"] += flagged
             if staled or flagged:
                 counts["users_updated"] += 1
         except Exception as e:
             logger.error("habit dedupe failed tenant=%s user=%s error=%s", tenant_id, user_id, e)
+            counts["users_failed"] += 1
     return counts
 
 
 async def daily_habit_dedupe_loop(
     interval_seconds: int,
     max_users: int,
+    startup_delay_seconds: int = 0,
 ) -> None:
+    await _sleep_before_llm_loop_start("daily_habit_dedupe", startup_delay_seconds)
     while True:
         try:
+            started_at = perf_counter()
             run_date = datetime.utcnow().date()
             counts = await _run_daily_habit_dedupe_once(
                 run_date=run_date,
                 max_users=max_users,
             )
-            if counts.get("users_updated"):
-                logger.info(
-                    "daily habit dedupe run_date=%s users_seen=%s users_updated=%s staled=%s flagged=%s",
-                    run_date.isoformat(),
-                    counts.get("users_seen"),
-                    counts.get("users_updated"),
-                    counts.get("staled"),
-                    counts.get("flagged"),
-                )
+            logger.info(
+                "loop=daily_habit_dedupe run_date=%s users_considered=%s users_processed=%s users_updated=%s users_failed=%s llm_calls_attempted=%s llm_calls_succeeded=%s llm_calls_failed=%s staled=%s flagged=%s elapsed_ms=%s",
+                run_date.isoformat(),
+                counts.get("users_seen", 0),
+                counts.get("users_processed", 0),
+                counts.get("users_updated", 0),
+                counts.get("users_failed", 0),
+                counts.get("llm_calls_attempted", 0),
+                counts.get("llm_calls_succeeded", 0),
+                counts.get("llm_calls_failed", 0),
+                counts.get("staled", 0),
+                counts.get("flagged", 0),
+                int((perf_counter() - started_at) * 1000),
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -12737,18 +12879,38 @@ def _runtime_role(settings: Any) -> str:
     return value or "api"
 
 
+_SAFE_API_BACKGROUND_LOOPS = {"idle_close", "outbox_drain"}
+
+
+def _loop_allowed_for_runtime_role(loop_name: str, runtime_role: str) -> bool:
+    if runtime_role == "worker":
+        return True
+    return loop_name in _SAFE_API_BACKGROUND_LOOPS
+
+
+async def _sleep_before_llm_loop_start(loop_name: str, startup_delay_seconds: int) -> None:
+    delay = max(0, int(startup_delay_seconds or 0))
+    if delay <= 0:
+        return
+    logger.info("%s startup delay seconds=%s", loop_name, delay)
+    await asyncio.sleep(delay)
+
+
 def _start_background_loop_tasks(app: FastAPI, settings: Any) -> List[str]:
     runtime_role = _runtime_role(settings)
     app.state.runtime_role = runtime_role
     app.state.background_loops_enabled = _background_loops_enabled(settings)
     app.state.background_loops_started = []
+    app.state.background_loops_skipped = []
 
     if not app.state.background_loops_enabled:
         logger.info("Background loops disabled for runtime_role=%s", runtime_role)
         return []
 
     started: List[str] = []
-    if settings.idle_close_enabled:
+    skipped: List[str] = []
+
+    if settings.idle_close_enabled and _loop_allowed_for_runtime_role("idle_close", runtime_role):
         app.state.idle_close_task = asyncio.create_task(
             session.idle_close_loop(
                 graphiti_client=graphiti_client,
@@ -12759,7 +12921,10 @@ def _start_background_loop_tasks(app: FastAPI, settings: Any) -> List[str]:
         )
         started.append("idle_close")
         logger.info("Idle close loop started runtime_role=%s", runtime_role)
-    if settings.outbox_drain_enabled:
+    elif settings.idle_close_enabled:
+        skipped.append("idle_close")
+
+    if settings.outbox_drain_enabled and _loop_allowed_for_runtime_role("outbox_drain", runtime_role):
         app.state.outbox_drain_task = asyncio.create_task(
             session.drain_loop(
                 graphiti_client=graphiti_client,
@@ -12771,7 +12936,10 @@ def _start_background_loop_tasks(app: FastAPI, settings: Any) -> List[str]:
         )
         started.append("outbox_drain")
         logger.info("Outbox drain loop started runtime_role=%s", runtime_role)
-    if settings.user_model_updater_enabled:
+    elif settings.outbox_drain_enabled:
+        skipped.append("outbox_drain")
+
+    if settings.user_model_updater_enabled and _loop_allowed_for_runtime_role("user_model_updater", runtime_role):
         app.state.user_model_updater_task = asyncio.create_task(
             user_model_updater_loop(
                 interval_seconds=settings.user_model_updater_interval_seconds,
@@ -12783,7 +12951,10 @@ def _start_background_loop_tasks(app: FastAPI, settings: Any) -> List[str]:
         )
         started.append("user_model_updater")
         logger.info("User model updater loop started runtime_role=%s", runtime_role)
-    if settings.user_model_enrichment_enabled:
+    elif settings.user_model_updater_enabled:
+        skipped.append("user_model_updater")
+
+    if settings.user_model_enrichment_enabled and _loop_allowed_for_runtime_role("user_model_enrichment", runtime_role):
         app.state.user_model_enrichment_task = asyncio.create_task(
             user_model_enrichment_loop(
                 interval_seconds=settings.user_model_enrichment_interval_seconds,
@@ -12792,12 +12963,16 @@ def _start_background_loop_tasks(app: FastAPI, settings: Any) -> List[str]:
                 daily_lookback_hours=settings.user_model_enrichment_daily_lookback_hours,
                 weekly_lookback_days=settings.user_model_enrichment_weekly_lookback_days,
                 retry_backoff_seconds=settings.user_model_enrichment_retry_backoff_seconds,
-                retry_max_seconds=settings.user_model_enrichment_retry_max_seconds
+                retry_max_seconds=settings.user_model_enrichment_retry_max_seconds,
+                startup_delay_seconds=settings.llm_background_loops_startup_delay_seconds,
             )
         )
         started.append("user_model_enrichment")
         logger.info("User model enrichment loop started runtime_role=%s", runtime_role)
-    if settings.loop_staleness_janitor_enabled:
+    elif settings.user_model_enrichment_enabled:
+        skipped.append("user_model_enrichment")
+
+    if settings.loop_staleness_janitor_enabled and _loop_allowed_for_runtime_role("loop_staleness_janitor", runtime_role):
         app.state.loop_staleness_janitor_task = asyncio.create_task(
             loop_staleness_janitor_loop(
                 interval_seconds=settings.loop_staleness_janitor_interval_seconds
@@ -12805,7 +12980,10 @@ def _start_background_loop_tasks(app: FastAPI, settings: Any) -> List[str]:
         )
         started.append("loop_staleness_janitor")
         logger.info("Loop staleness janitor loop started runtime_role=%s", runtime_role)
-    if settings.derived_pipeline_silence_detection_enabled:
+    elif settings.loop_staleness_janitor_enabled:
+        skipped.append("loop_staleness_janitor")
+
+    if settings.derived_pipeline_silence_detection_enabled and _loop_allowed_for_runtime_role("derived_silence_detection", runtime_role):
         app.state.derived_silence_detection_task = asyncio.create_task(
             derived_silence_detection_loop(
                 interval_seconds=settings.derived_pipeline_silence_detection_interval_seconds
@@ -12813,7 +12991,10 @@ def _start_background_loop_tasks(app: FastAPI, settings: Any) -> List[str]:
         )
         started.append("derived_silence_detection")
         logger.info("Derived silence detector loop started runtime_role=%s", runtime_role)
-    if settings.derived_pipeline_audit_enabled:
+    elif settings.derived_pipeline_silence_detection_enabled:
+        skipped.append("derived_silence_detection")
+
+    if settings.derived_pipeline_audit_enabled and _loop_allowed_for_runtime_role("derived_memory_audit", runtime_role):
         app.state.derived_memory_audit_task = asyncio.create_task(
             derived_memory_audit_loop(
                 interval_seconds=settings.derived_pipeline_audit_interval_seconds
@@ -12821,7 +13002,10 @@ def _start_background_loop_tasks(app: FastAPI, settings: Any) -> List[str]:
         )
         started.append("derived_memory_audit")
         logger.info("Derived memory audit loop started runtime_role=%s", runtime_role)
-    if settings.proactive_shadow_candidates_enabled:
+    elif settings.derived_pipeline_audit_enabled:
+        skipped.append("derived_memory_audit")
+
+    if settings.proactive_shadow_candidates_enabled and _loop_allowed_for_runtime_role("proactive_shadow_candidates", runtime_role):
         app.state.proactive_shadow_candidates_task = asyncio.create_task(
             proactive_shadow_candidates_loop(
                 interval_seconds=settings.proactive_shadow_candidates_interval_seconds,
@@ -12831,13 +13015,17 @@ def _start_background_loop_tasks(app: FastAPI, settings: Any) -> List[str]:
         )
         started.append("proactive_shadow_candidates")
         logger.info("Proactive shadow candidates loop started runtime_role=%s", runtime_role)
-    if settings.daily_analysis_enabled:
+    elif settings.proactive_shadow_candidates_enabled:
+        skipped.append("proactive_shadow_candidates")
+
+    if settings.daily_analysis_enabled and _loop_allowed_for_runtime_role("daily_analysis", runtime_role):
         app.state.daily_analysis_task = asyncio.create_task(
             daily_analysis_loop(
                 interval_seconds=settings.daily_analysis_interval_seconds,
                 target_offset_days=settings.daily_analysis_target_offset_days,
                 max_users=settings.daily_analysis_max_users,
-                max_turns=settings.daily_analysis_max_turns
+                max_turns=settings.daily_analysis_max_turns,
+                startup_delay_seconds=settings.llm_background_loops_startup_delay_seconds,
             )
         )
         started.append("daily_analysis")
@@ -12846,11 +13034,15 @@ def _start_background_loop_tasks(app: FastAPI, settings: Any) -> List[str]:
             daily_habit_dedupe_loop(
                 interval_seconds=settings.daily_analysis_interval_seconds,
                 max_users=settings.daily_analysis_max_users,
+                startup_delay_seconds=settings.llm_background_loops_startup_delay_seconds,
             )
         )
         started.append("daily_habit_dedupe")
         logger.info("Daily habit dedupe loop started runtime_role=%s", runtime_role)
-    if settings.v2_invariant_checker_enabled:
+    elif settings.daily_analysis_enabled:
+        skipped.extend(["daily_analysis", "daily_habit_dedupe"])
+
+    if settings.v2_invariant_checker_enabled and _loop_allowed_for_runtime_role("v2_invariant_checker", runtime_role):
         app.state.v2_invariant_checker_task = asyncio.create_task(
             v2_invariant_checker_loop(
                 interval_seconds=settings.v2_invariant_checker_interval_seconds,
@@ -12859,7 +13051,10 @@ def _start_background_loop_tasks(app: FastAPI, settings: Any) -> List[str]:
         )
         started.append("v2_invariant_checker")
         logger.info("V2 invariant checker loop started runtime_role=%s", runtime_role)
-    if settings.v2_rollout_control_enabled and settings.v2_rollout_eval_enabled:
+    elif settings.v2_invariant_checker_enabled:
+        skipped.append("v2_invariant_checker")
+
+    if settings.v2_rollout_control_enabled and settings.v2_rollout_eval_enabled and _loop_allowed_for_runtime_role("v2_rollout_evaluator", runtime_role):
         app.state.v2_rollout_evaluator_task = asyncio.create_task(
             v2_rollout_evaluator_loop(
                 interval_seconds=settings.v2_rollout_eval_interval_seconds,
@@ -12867,12 +13062,16 @@ def _start_background_loop_tasks(app: FastAPI, settings: Any) -> List[str]:
         )
         started.append("v2_rollout_evaluator")
         logger.info("V2 rollout evaluator loop started runtime_role=%s", runtime_role)
+    elif settings.v2_rollout_control_enabled and settings.v2_rollout_eval_enabled:
+        skipped.append("v2_rollout_evaluator")
 
     app.state.background_loops_started = started
+    app.state.background_loops_skipped = skipped
     logger.info(
-        "Background loops startup complete runtime_role=%s started=%s",
+        "Background loops startup complete runtime_role=%s started=%s skipped=%s",
         runtime_role,
         ",".join(started) if started else "none",
+        ",".join(skipped) if skipped else "none",
     )
     return started
 

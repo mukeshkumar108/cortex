@@ -13,6 +13,9 @@ async def _run_worker() -> None:
     settings = get_settings()
     if not bool(getattr(settings, "background_loops_enabled", True)):
         raise RuntimeError("Background worker started with background loops disabled")
+    runtime_role = str(getattr(settings, "runtime_role", "") or "").strip().lower() or "api"
+    if runtime_role != "worker":
+        raise RuntimeError(f"Background worker requires runtime_role=worker, got {runtime_role}")
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -24,7 +27,7 @@ async def _run_worker() -> None:
 
     logger.info(
         "Starting Synapse background worker role=%s background_loops_enabled=%s",
-        getattr(settings, "runtime_role", "worker"),
+        runtime_role,
         bool(getattr(settings, "background_loops_enabled", True)),
     )
     async with app.router.lifespan_context(app):
