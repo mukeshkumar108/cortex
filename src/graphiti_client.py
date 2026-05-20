@@ -426,6 +426,11 @@ class GraphitiClient:
         """Initialize Graphiti with FalkorDB connection"""
         if self._initialized:
             return
+        if not bool(getattr(self.settings, "graphiti_enabled", False)):
+            self.client = None
+            self._initialized = True
+            logger.info("Graphiti disabled; skipping FalkorDB initialization")
+            return
 
         try:
             logger.info("Initializing Graphiti client")

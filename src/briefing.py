@@ -10,7 +10,9 @@ from typing import Optional, List
 import logging
 from .models import BriefResponse, TemporalAuthority, Fact, Entity
 from .graphiti_client import GraphitiClient
+from .db import Database
 from . import session
+from .session_summaries import fetch_recent_session_summaries
 from .utils import get_time_of_day, format_time_gap
 
 logger = logging.getLogger(__name__)
@@ -23,7 +25,8 @@ async def build_briefing(
     session_id: Optional[str],
     query: Optional[str],
     now: datetime,
-    graphiti_client: GraphitiClient
+    graphiti_client: GraphitiClient,
+    database: Optional[Database] = None,
 ) -> BriefResponse:
     """
     Build a minimal briefing for session start.
@@ -60,6 +63,24 @@ async def build_briefing(
         nudge_candidates: List = []
         active_loops = []
 
+        if database is not None:
+            try:
+                summaries = await fetch_recent_session_summaries(
+                    database,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    limit=3,
+                )
+            except Exception as e:
+                logger.info("briefing session_summaries lookup failed: %s", e)
+                summaries = []
+            if summaries:
+                latest = summaries[0]
+                episode_bridge = (
+                    latest.get("bridge_text")
+                    or ((latest.get("attributes") or {}).get("bridge_text") if isinstance(latest.get("attributes"), dict) else None)
+                )
+
         # 4. METADATA
         metadata = {
             "queryTime": now.isoformat(),
@@ -67,7 +88,8 @@ async def build_briefing(
             "hasRollingSummary": bool(rolling_summary),
             "graphitiFacts": len(semantic_context),
             "graphitiEntities": len(entities),
-            "loopsCount": 0
+            "loopsCount": 0,
+            "hasSessionSummaryBridge": bool(episode_bridge),
         }
 
         return BriefResponse(
@@ -98,4 +120,3 @@ def _build_temporal_authority(now: datetime) -> TemporalAuthority:
         timeOfDay=get_time_of_day(now.hour),
         timeSinceLastInteraction=None
     )
-

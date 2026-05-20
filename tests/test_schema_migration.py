@@ -2,7 +2,7 @@ import os
 import asyncpg
 import pytest
 
-from src.main import app
+from src.main import app, db
 
 
 def _db_url() -> str:
@@ -12,232 +12,273 @@ def _db_url() -> str:
     password = os.getenv("POSTGRES_PASSWORD", "password")
     return f"postgresql://synapse:{password}@postgres:5432/synapse"
 
-
 @pytest.mark.asyncio
 async def test_schema_migration():
     async with app.router.lifespan_context(app):
         pass
 
-    conn = await asyncpg.connect(_db_url())
-    try:
-        identity_cache = await conn.fetchval("SELECT to_regclass('public.identity_cache')")
-        assert identity_cache == "identity_cache"
+    identity_cache = await db.fetchval("SELECT to_regclass('public.identity_cache')")
+    assert identity_cache == "identity_cache"
 
-        outbox = await conn.fetchval("SELECT to_regclass('public.graphiti_outbox')")
-        assert outbox == "graphiti_outbox"
+    outbox = await db.fetchval("SELECT to_regclass('public.graphiti_outbox')")
+    assert outbox == "graphiti_outbox"
 
-        cols = await conn.fetch(
+    cols = await db.fetch(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'session_buffer'
+        """
+    )
+    col_names = {row["column_name"] for row in cols}
+    assert "rolling_summary" in col_names
+    assert "closed_at" in col_names
+
+    outbox_cols = await db.fetch(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'graphiti_outbox'
+        """
+    )
+    outbox_col_names = {row["column_name"] for row in outbox_cols}
+    assert "folded_at" in outbox_col_names
+    assert "next_attempt_at" in outbox_col_names
+    assert "job_type" in outbox_col_names
+    assert "payload" in outbox_col_names
+    assert "dedupe_key" in outbox_col_names
+
+    constraint = await db.fetchval(
+        """
+        SELECT conname
+        FROM pg_constraint
+        WHERE conrelid = 'session_buffer'::regclass
+          AND conname = 'session_buffer_messages_len_check'
+        """
+    )
+    assert constraint == "session_buffer_messages_len_check"
+
+    outbox_constraint = await db.fetchval(
+        """
+        SELECT conname
+        FROM pg_constraint
+        WHERE conrelid = 'graphiti_outbox'::regclass
+          AND conname = 'graphiti_outbox_pending_attempts_next_attempt'
+        """
+    )
+    assert outbox_constraint == "graphiti_outbox_pending_attempts_next_attempt"
+
+    dedupe_constraint = await db.fetchval(
+        """
+        SELECT conname
+        FROM pg_constraint
+        WHERE conrelid = 'graphiti_outbox'::regclass
+          AND conname = 'graphiti_outbox_dedupe_key_unique'
+        """
+    )
+    assert dedupe_constraint == "graphiti_outbox_dedupe_key_unique"
+
+    for table in ["entity_profiles", "open_threads", "derived_assertions"]:
+        cols = await db.fetch(
             """
             SELECT column_name
             FROM information_schema.columns
-            WHERE table_name = 'session_buffer'
-            """
+            WHERE table_name=$1
+            """,
+            table,
         )
-        col_names = {row["column_name"] for row in cols}
-        assert "rolling_summary" in col_names
-        assert "closed_at" in col_names
+        names = {row["column_name"] for row in cols}
+        assert "distinct_session_count" in names
 
-        outbox_cols = await conn.fetch(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'graphiti_outbox'
-            """
-        )
-        outbox_col_names = {row["column_name"] for row in outbox_cols}
-        assert "folded_at" in outbox_col_names
-        assert "next_attempt_at" in outbox_col_names
-        assert "job_type" in outbox_col_names
-        assert "payload" in outbox_col_names
-        assert "dedupe_key" in outbox_col_names
+    relationship_cols = await db.fetch(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'memory_relationship_links'
+        """
+    )
+    relationship_col_names = {row["column_name"] for row in relationship_cols}
+    assert {
+        "source_domain",
+        "target_domain",
+        "status",
+        "strength",
+        "valid_from",
+        "valid_until",
+        "expires_at",
+    }.issubset(relationship_col_names)
 
-        constraint = await conn.fetchval(
-            """
-            SELECT conname
-            FROM pg_constraint
-            WHERE conrelid = 'session_buffer'::regclass
-              AND conname = 'session_buffer_messages_len_check'
-            """
-        )
-        assert constraint == "session_buffer_messages_len_check"
+    relationship_status_constraint = await db.fetchval(
+        """
+        SELECT conname
+        FROM pg_constraint
+        WHERE conrelid = 'memory_relationship_links'::regclass
+          AND conname = 'memory_relationship_links_status_check'
+        """
+    )
+    assert relationship_status_constraint == "memory_relationship_links_status_check"
 
-        outbox_constraint = await conn.fetchval(
-            """
-            SELECT conname
-            FROM pg_constraint
-            WHERE conrelid = 'graphiti_outbox'::regclass
-              AND conname = 'graphiti_outbox_pending_attempts_next_attempt'
-            """
-        )
-        assert outbox_constraint == "graphiti_outbox_pending_attempts_next_attempt"
+    relationship_status_domains_idx = await db.fetchval(
+        """
+        SELECT indexname
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'memory_relationship_links'
+          AND indexname = 'idx_memory_relationship_links_user_status_domains'
+        """
+    )
+    assert relationship_status_domains_idx == "idx_memory_relationship_links_user_status_domains"
 
-        dedupe_constraint = await conn.fetchval(
-            """
-            SELECT conname
-            FROM pg_constraint
-            WHERE conrelid = 'graphiti_outbox'::regclass
-              AND conname = 'graphiti_outbox_dedupe_key_unique'
-            """
-        )
-        assert dedupe_constraint == "graphiti_outbox_dedupe_key_unique"
+    handover_table = await db.fetchval("SELECT to_regclass('public.session_handover_packets')")
+    assert handover_table == "session_handover_packets"
 
-        for table in ["entity_profiles", "open_threads", "derived_assertions"]:
-            cols = await conn.fetch(
-                """
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_name=$1
-                """,
-                table,
-            )
-            names = {row["column_name"] for row in cols}
-            assert "distinct_session_count" in names
+    handover_cols = await db.fetch(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'session_handover_packets'
+        """
+    )
+    handover_col_names = {row["column_name"] for row in handover_cols}
+    assert {
+        "tenant_id",
+        "user_id",
+        "session_id",
+        "summary",
+        "open_questions",
+        "unresolved_decisions",
+        "pending_actions",
+        "recent_state_note",
+        "important_people",
+        "active_topics",
+        "do_not_overdo",
+        "expires_at",
+        "source_turn_refs",
+        "status",
+    }.issubset(handover_col_names)
 
-        relationship_cols = await conn.fetch(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'memory_relationship_links'
-            """
-        )
-        relationship_col_names = {row["column_name"] for row in relationship_cols}
-        assert {
-            "source_domain",
-            "target_domain",
-            "status",
-            "strength",
-            "valid_from",
-            "valid_until",
-            "expires_at",
-        }.issubset(relationship_col_names)
+    attention_outcomes_table = await db.fetchval("SELECT to_regclass('public.attention_outcomes')")
+    assert attention_outcomes_table == "attention_outcomes"
 
-        relationship_status_constraint = await conn.fetchval(
-            """
-            SELECT conname
-            FROM pg_constraint
-            WHERE conrelid = 'memory_relationship_links'::regclass
-              AND conname = 'memory_relationship_links_status_check'
-            """
-        )
-        assert relationship_status_constraint == "memory_relationship_links_status_check"
+    attention_outcome_cols = await db.fetch(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'attention_outcomes'
+        """
+    )
+    attention_outcome_col_names = {row["column_name"] for row in attention_outcome_cols}
+    assert {
+        "tenant_id",
+        "user_id",
+        "companion_id",
+        "attention_item_id",
+        "source_table",
+        "source_id",
+        "outcome_type",
+        "outcome_reason",
+        "surface_mode",
+        "action_policy",
+        "occurred_at",
+        "snoozed_until",
+        "suppress_until",
+        "metadata",
+    }.issubset(attention_outcome_col_names)
 
-        relationship_status_domains_idx = await conn.fetchval(
-            """
-            SELECT indexname
-            FROM pg_indexes
-            WHERE schemaname = 'public'
-              AND tablename = 'memory_relationship_links'
-              AND indexname = 'idx_memory_relationship_links_user_status_domains'
-            """
-        )
-        assert relationship_status_domains_idx == "idx_memory_relationship_links_user_status_domains"
+    attention_outcome_item_idx = await db.fetchval(
+        """
+        SELECT indexname
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'attention_outcomes'
+          AND indexname = 'idx_attention_outcomes_user_item_occurred'
+        """
+    )
+    assert attention_outcome_item_idx == "idx_attention_outcomes_user_item_occurred"
 
-        handover_table = await conn.fetchval("SELECT to_regclass('public.session_handover_packets')")
-        assert handover_table == "session_handover_packets"
+    timeline_events_table = await db.fetchval("SELECT to_regclass('public.timeline_events')")
+    assert timeline_events_table == "timeline_events"
 
-        handover_cols = await conn.fetch(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'session_handover_packets'
-            """
-        )
-        handover_col_names = {row["column_name"] for row in handover_cols}
-        assert {
-            "tenant_id",
-            "user_id",
-            "session_id",
-            "summary",
-            "open_questions",
-            "unresolved_decisions",
-            "pending_actions",
-            "recent_state_note",
-            "important_people",
-            "active_topics",
-            "do_not_overdo",
-            "expires_at",
-            "source_turn_refs",
-            "status",
-        }.issubset(handover_col_names)
+    timeline_event_cols = await db.fetch(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'timeline_events'
+        """
+    )
+    timeline_event_col_names = {row["column_name"] for row in timeline_event_cols}
+    assert {
+        "tenant_id",
+        "user_id",
+        "timeline_type",
+        "event_type",
+        "domain",
+        "occurred_at",
+        "observed_at",
+        "status",
+        "object_refs",
+        "evidence_refs",
+        "user_corrected",
+        "effect",
+        "metadata",
+    }.issubset(timeline_event_col_names)
 
-        attention_outcomes_table = await conn.fetchval("SELECT to_regclass('public.attention_outcomes')")
-        assert attention_outcomes_table == "attention_outcomes"
+    timeline_event_type_idx = await db.fetchval(
+        """
+        SELECT indexname
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'timeline_events'
+          AND indexname = 'idx_timeline_events_user_type_occurred'
+        """
+    )
+    assert timeline_event_type_idx == "idx_timeline_events_user_type_occurred"
 
-        attention_outcome_cols = await conn.fetch(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'attention_outcomes'
-            """
-        )
-        attention_outcome_col_names = {row["column_name"] for row in attention_outcome_cols}
-        assert {
-            "tenant_id",
-            "user_id",
-            "companion_id",
-            "attention_item_id",
-            "source_table",
-            "source_id",
-            "outcome_type",
-            "outcome_reason",
-            "surface_mode",
-            "action_policy",
-            "occurred_at",
-            "snoozed_until",
-            "suppress_until",
-            "metadata",
-        }.issubset(attention_outcome_col_names)
+    session_summaries_table = await db.fetchval("SELECT to_regclass('public.session_summaries')")
+    assert session_summaries_table == "session_summaries"
 
-        attention_outcome_item_idx = await conn.fetchval(
-            """
-            SELECT indexname
-            FROM pg_indexes
-            WHERE schemaname = 'public'
-              AND tablename = 'attention_outcomes'
-              AND indexname = 'idx_attention_outcomes_user_item_occurred'
-            """
-        )
-        assert attention_outcome_item_idx == "idx_attention_outcomes_user_item_occurred"
+    session_summary_cols = await db.fetch(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'session_summaries'
+        """
+    )
+    session_summary_col_names = {row["column_name"] for row in session_summary_cols}
+    assert {
+        "summary_id",
+        "tenant_id",
+        "user_id",
+        "session_id",
+        "summary_text",
+        "bridge_text",
+        "key_points",
+        "decisions",
+        "unresolved_items",
+        "pending_actions",
+        "people_mentioned",
+        "events_mentioned",
+        "state_signals",
+        "topics",
+        "do_not_overinfer",
+        "evidence_refs",
+        "extra_attributes",
+        "model",
+        "status",
+        "created_at",
+        "updated_at",
+    }.issubset(session_summary_col_names)
 
-        timeline_events_table = await conn.fetchval("SELECT to_regclass('public.timeline_events')")
-        assert timeline_events_table == "timeline_events"
-
-        timeline_event_cols = await conn.fetch(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'timeline_events'
-            """
-        )
-        timeline_event_col_names = {row["column_name"] for row in timeline_event_cols}
-        assert {
-            "tenant_id",
-            "user_id",
-            "timeline_type",
-            "event_type",
-            "domain",
-            "occurred_at",
-            "observed_at",
-            "status",
-            "object_refs",
-            "evidence_refs",
-            "user_corrected",
-            "effect",
-            "metadata",
-        }.issubset(timeline_event_col_names)
-
-        timeline_event_type_idx = await conn.fetchval(
-            """
-            SELECT indexname
-            FROM pg_indexes
-            WHERE schemaname = 'public'
-              AND tablename = 'timeline_events'
-              AND indexname = 'idx_timeline_events_user_type_occurred'
-            """
-        )
-        assert timeline_event_type_idx == "idx_timeline_events_user_type_occurred"
-    finally:
-        await conn.close()
+    session_summary_unique_idx = await db.fetchval(
+        """
+        SELECT indexname
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'session_summaries'
+          AND indexname = 'idx_session_summaries_tenant_user_session'
+        """
+    )
+    assert session_summary_unique_idx == "idx_session_summaries_tenant_user_session"
 
 
 @pytest.mark.asyncio

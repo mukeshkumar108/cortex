@@ -1105,7 +1105,7 @@ class SessionManager:
                     await self._mark_outbox_folded(row["id"])
                     current_summary = new_summary
 
-                if self.settings.graphiti_per_turn:
+                if self.settings.graphiti_per_turn and bool(getattr(self.settings, "graphiti_enabled", False)):
                     try:
                         episode_name = self._build_episode_name(
                             tenant_id=tenant_id,
@@ -1144,7 +1144,8 @@ class SessionManager:
                 else:
                     await self._mark_outbox_sent(row["id"])
                     logger.info(
-                        f"Janitor marked outbox {row['id']} sent (per-turn disabled)"
+                        "Janitor marked outbox %s sent (per-turn Graphiti skipped)",
+                        row["id"],
                     )
 
         except Exception as e:
@@ -1443,21 +1444,23 @@ class SessionManager:
             )
         reference_time = self._parse_payload_reference_time(payload)
         episode_name = f"session_raw_{row['session_id']}"
-        response = await graphiti_client.add_session_episode(
-            tenant_id=row["tenant_id"],
-            user_id=row["user_id"],
-            messages=messages,
-            reference_time=reference_time,
-            episode_name=episode_name,
-            metadata={
-                "session_id": row["session_id"],
-                "started_at": payload.get("started_at"),
-                "ended_at": payload.get("ended_at"),
-                "episode_type": "session_raw",
-            }
-        )
-        if not self._is_success_response(response):
-            self._raise_for_graphiti_response_failure(response, context="session_raw_episode")
+        response: Optional[Dict[str, Any]] = None
+        if bool(getattr(self.settings, "graphiti_enabled", False)):
+            response = await graphiti_client.add_session_episode(
+                tenant_id=row["tenant_id"],
+                user_id=row["user_id"],
+                messages=messages,
+                reference_time=reference_time,
+                episode_name=episode_name,
+                metadata={
+                    "session_id": row["session_id"],
+                    "started_at": payload.get("started_at"),
+                    "ended_at": payload.get("ended_at"),
+                    "episode_type": "session_raw",
+                }
+            )
+            if not self._is_success_response(response):
+                self._raise_for_graphiti_response_failure(response, context="session_raw_episode")
         try:
             await self._infer_habit_daily_log_from_episode(
                 tenant_id=row["tenant_id"],
@@ -1751,10 +1754,10 @@ class SessionManager:
                     except Exception as e:
                         await self._mark_outbox_failed(row["id"], str(e))
                         counts["pending"] += 1
-                        continue
+                continue
 
                 try:
-                    if self.settings.graphiti_per_turn:
+                    if self.settings.graphiti_per_turn and bool(getattr(self.settings, "graphiti_enabled", False)):
                         episode_name = self._build_episode_name(
                             tenant_id=row["tenant_id"],
                             user_id=row["user_id"],

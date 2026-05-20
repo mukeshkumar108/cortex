@@ -95,6 +95,11 @@ from .session import EvidenceContractError
 from .briefing import build_briefing
 from .migrate import run_migrations
 from .openrouter_client import get_llm_client
+from .session_summaries import (
+    build_summary_extra_attributes,
+    fetch_recent_session_summaries,
+    upsert_session_summary,
+)
 from .memory_taxonomy import (
     classify_memory_semantic_fallback,
     classify_memory_candidates_semantic,
@@ -4698,6 +4703,26 @@ async def _load_recent_session_summaries_from_classifications(
     return out
 
 
+async def _load_recent_session_summaries(
+    *,
+    tenant_id: str,
+    user_id: str,
+    limit: int = 12,
+) -> List[Dict[str, Any]]:
+    rows = await fetch_recent_session_summaries(
+        db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        limit=limit,
+    )
+    if rows:
+        return rows
+    return await _load_recent_session_summaries_from_classifications(
+        user_id=user_id,
+        limit=limit,
+    )
+
+
 async def _build_startbrief_entity_hints_from_profiles(
     *,
     user_id: str,
@@ -7649,7 +7674,8 @@ async def _run_user_model_enrichment_for_user(
         async with _user_model_write_claim(tenant_id=tenant_id, user_id=user_id, ttl_seconds=240) as claimed:
             if not claimed:
                 return False
-            session_nodes = await graphiti_client.get_recent_session_summary_nodes(
+            session_nodes = await fetch_recent_session_summaries(
+                db,
                 tenant_id=tenant_id,
                 user_id=user_id,
                 limit=60 if mode == "daily" else 200,
@@ -8534,7 +8560,8 @@ async def _get_user_daily_session_summaries(
     max_sessions: int,
     prompt_char_budget: int,
 ) -> List[Dict[str, Any]]:
-    nodes = await graphiti_client.get_recent_session_summary_nodes(
+    nodes = await fetch_recent_session_summaries(
+        db,
         tenant_id=tenant_id,
         user_id=user_id,
         limit=max(max_sessions * 4, 40),
@@ -12221,32 +12248,48 @@ async def _execute_post_ingest_hook(hook_name: str, payload: Dict[str, Any]) -> 
         summary_text = (summary_payload or {}).get("summary_text")
         if not summary_text:
             return True
-        response = await graphiti_client.add_session_summary(
+        summary_extra_attributes = build_summary_extra_attributes(
+            summary_payload=summary_payload or {},
+            reference_time=reference_time,
+            episode_uuid=_normalize_text(payload.get("episode_uuid")) or None,
+        )
+        await upsert_session_summary(
+            db,
             tenant_id=tenant_id,
             user_id=user_id,
             session_id=session_id,
             summary_text=summary_text,
             bridge_text=(summary_payload or {}).get("bridge_text"),
-            reference_time=reference_time,
-            episode_uuid=_normalize_text(payload.get("episode_uuid")) or None,
-            extra_attributes={
-                "summary_quality_tier": (summary_payload or {}).get("summary_quality_tier"),
-                "summary_source": (summary_payload or {}).get("summary_source"),
-                "summary_facts": (summary_payload or {}).get("summary_facts"),
-                "tone": (summary_payload or {}).get("tone"),
-                "moment": (summary_payload or {}).get("moment"),
-                "decisions": (summary_payload or {}).get("decisions") or [],
-                "unresolved": (summary_payload or {}).get("unresolved") or [],
-                "index_text": (summary_payload or {}).get("index_text") or "",
-                "salience": (summary_payload or {}).get("salience") or "low",
-            },
-            replace_existing_session=True
+            decisions=(summary_payload or {}).get("decisions") or [],
+            unresolved_items=(summary_payload or {}).get("unresolved") or [],
+            state_signals=[
+                value
+                for value in (
+                    (summary_payload or {}).get("tone"),
+                    (summary_payload or {}).get("moment"),
+                )
+                if _normalize_text(value)
+            ],
+            extra_attributes=summary_extra_attributes,
+            model=_normalize_text(get_settings().openrouter_model_summary) or None,
         )
-        if isinstance(response, dict) and response.get("success") is False:
-            session.SessionManager._raise_for_graphiti_response_failure(
-                response,
-                context="session_summary_hook"
+        if bool(get_settings().graphiti_enabled):
+            response = await graphiti_client.add_session_summary(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=session_id,
+                summary_text=summary_text,
+                bridge_text=(summary_payload or {}).get("bridge_text"),
+                reference_time=reference_time,
+                episode_uuid=_normalize_text(payload.get("episode_uuid")) or None,
+                extra_attributes=summary_extra_attributes,
+                replace_existing_session=True
             )
+            if isinstance(response, dict) and response.get("success") is False:
+                session.SessionManager._raise_for_graphiti_response_failure(
+                    response,
+                    context="session_summary_hook"
+                )
         return True
 
     if hook_name == session.POST_INGEST_HOOK_OPEN_LOOPS:
@@ -12544,9 +12587,12 @@ async def lifespan(app: FastAPI):
         await run_migrations(db)
         logger.info("Migrations completed")
 
-        # Initialize Graphiti
+        # Initialize Graphiti (no-op when disabled)
         await graphiti_client.initialize()
-        logger.info("Graphiti client initialized")
+        if bool(settings.graphiti_enabled):
+            logger.info("Graphiti client initialized")
+        else:
+            logger.info("Graphiti disabled for this runtime")
 
         # Initialize managers
         session.init_session_manager(db)
@@ -12919,7 +12965,8 @@ async def brief(request: BriefRequest):
             session_id=request.sessionId,
             query=request.query,
             now=now,
-            graphiti_client=graphiti_client
+            graphiti_client=graphiti_client,
+            database=db,
         )
 
         return response
@@ -15067,7 +15114,8 @@ async def session_brief(
         if now:
             reference_now = datetime.fromisoformat(now.replace("Z", "+00:00"))
 
-        recent_rows = await _load_recent_session_summaries_from_classifications(
+        recent_rows = await _load_recent_session_summaries(
+            tenant_id=tenantId,
             user_id=userId,
             limit=10,
         )
@@ -15229,7 +15277,8 @@ async def session_startbrief(
         session_id = sessionId or await _get_latest_session_id(tenantId, userId)
 
         # Strict cutover source: Postgres-derived session classifications only.
-        recent_session_summaries = await _load_recent_session_summaries_from_classifications(
+        recent_session_summaries = await _load_recent_session_summaries(
+            tenant_id=tenantId,
             user_id=userId,
             limit=10,
         )

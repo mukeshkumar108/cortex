@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://synapse:password@postgres:5432/synapse"
 
     # FalkorDB
+    graphiti_enabled: bool = False
     falkordb_host: str = "falkordb"
     falkordb_port: int = 6379
 
