@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import Any, Dict, List, Optional
 
 from .attention_outcomes import fetch_attention_outcomes
+from .timeline_events import SUPPRESSING_EFFECTS, fetch_timeline_event_rows, timeline_event_matches_target
 
 
 DEFAULT_COMPANION_ID = "sophie"
@@ -811,6 +812,67 @@ def _apply_outcome_rules(
     return updated, diagnostics
 
 
+def _match_timeline_corrections_for_item(item: Dict[str, Any], event_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    source_table = _normalize_text(item.get("source_table"))
+    source_id = _normalize_text(item.get("source_id"))
+    object_ids = [_normalize_text(value) for value in item.get("source_object_ids") or [] if _normalize_text(value)]
+    matched: List[Dict[str, Any]] = []
+    for row in event_rows:
+        if not bool(row.get("user_corrected")) and _normalize_text(row.get("effect")).lower() not in SUPPRESSING_EFFECTS:
+            continue
+        if timeline_event_matches_target(
+            row,
+            source_table=source_table,
+            source_id=source_id,
+            target_id=source_id,
+            object_ids=object_ids,
+        ):
+            matched.append(row)
+    matched.sort(
+        key=lambda row: (
+            _parse_ts(row.get("occurred_at")) or datetime.min.replace(tzinfo=dt_timezone.utc),
+            _parse_ts(row.get("updated_at")) or datetime.min.replace(tzinfo=dt_timezone.utc),
+        ),
+        reverse=True,
+    )
+    return matched
+
+
+def _apply_timeline_correction_rules(item: Dict[str, Any], *, correction_rows: List[Dict[str, Any]]) -> tuple[Dict[str, Any], Dict[str, int]]:
+    updated = dict(item)
+    diagnostics = {
+        "timelineCorrectionSuppressedCount": 0,
+        "timelineCorrectionMarkedDoneCount": 0,
+        "timelineCorrectionCorrectedCount": 0,
+    }
+    if not correction_rows:
+        return updated, diagnostics
+    gaps = list(updated.get("gaps") or [])
+    for row in correction_rows:
+        effect = _normalize_text(row.get("effect")).lower()
+        if effect == "suppress_related":
+            gaps.append("suppressed_by_user_correction")
+            updated["status"] = "suppressed"
+            updated["gaps"] = gaps
+            diagnostics["timelineCorrectionSuppressedCount"] = 1
+            return updated, diagnostics
+        if effect == "mark_done":
+            gaps.append("completed_by_user_correction")
+            updated["status"] = "completed"
+            updated["gaps"] = gaps
+            diagnostics["timelineCorrectionMarkedDoneCount"] = 1
+            diagnostics["timelineCorrectionSuppressedCount"] = 1
+            return updated, diagnostics
+        if effect in {"correct", "forget"}:
+            gaps.append("corrected_by_user")
+            updated["status"] = "suppressed"
+            updated["gaps"] = gaps
+            diagnostics["timelineCorrectionCorrectedCount"] = 1
+            diagnostics["timelineCorrectionSuppressedCount"] = 1
+            return updated, diagnostics
+    return updated, diagnostics
+
+
 def _should_include_item(*, status: str, include_expired: bool, include_suppressed: bool) -> bool:
     normalized = _normalize_text(status).lower()
     if normalized == "expired":
@@ -986,12 +1048,19 @@ async def build_attention_preview(
             for item in profile_filtered_items
         ],
     )
+    timeline_correction_rows = await fetch_timeline_event_rows(
+        db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        limit=max(safe_limit * 3, 50),
+    )
 
     by_status: Dict[str, int] = {}
     by_source_table: Dict[str, int] = {}
     by_attention_type: Dict[str, int] = {}
     expired_count = 0
     outcome_suppressed_count = 0
+    timeline_correction_suppressed_count = 0
     snoozed_count = 0
     dismissed_count = 0
     completed_count = 0
@@ -1000,10 +1069,13 @@ async def build_attention_preview(
     for item in profile_filtered_items:
         item_outcomes = _match_outcomes_for_item(item, outcome_rows)
         adjusted_item, outcome_diagnostics = _apply_outcome_rules(item, now=now, outcome_rows=item_outcomes)
+        item_corrections = _match_timeline_corrections_for_item(adjusted_item, timeline_correction_rows)
+        adjusted_item, correction_diagnostics = _apply_timeline_correction_rules(adjusted_item, correction_rows=item_corrections)
         _increment_count(by_status, adjusted_item.get("status"))
         _increment_count(by_source_table, item.get("source_table"))
         _increment_count(by_attention_type, item.get("attention_type"))
         outcome_suppressed_count += outcome_diagnostics["outcomeSuppressedCount"]
+        timeline_correction_suppressed_count += correction_diagnostics["timelineCorrectionSuppressedCount"]
         snoozed_count += outcome_diagnostics["snoozedCount"]
         dismissed_count += outcome_diagnostics["dismissedCount"]
         completed_count += outcome_diagnostics["completedCount"]
@@ -1032,6 +1104,7 @@ async def build_attention_preview(
             "suppressedCount": suppressed_count,
             "expiredCount": expired_count,
             "outcomeSuppressedCount": outcome_suppressed_count,
+            "timelineCorrectionSuppressedCount": timeline_correction_suppressed_count,
             "snoozedCount": snoozed_count,
             "dismissedCount": dismissed_count,
             "completedCount": completed_count,

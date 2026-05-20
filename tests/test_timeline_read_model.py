@@ -23,8 +23,11 @@ class FakeDB:
         self.handover_rows: List[Dict[str, Any]] = []
         self.outcome_rows: List[Dict[str, Any]] = []
         self.relationship_rows: List[Dict[str, Any]] = []
+        self.timeline_event_rows: List[Dict[str, Any]] = []
 
     async def fetch(self, query: str, *args):
+        if "FROM timeline_events" in query:
+            return self.timeline_event_rows
         if "FROM action_items" in query:
             return self.action_item_rows
         if "FROM action_updates" in query:
@@ -131,6 +134,39 @@ def _handover_row(*, created_at: datetime = NOW - timedelta(hours=2), expires_at
     }
 
 
+def _timeline_event_row() -> Dict[str, Any]:
+    return {
+        "event_id": "evt-1",
+        "tenant_id": "default",
+        "user_id": "u1",
+        "timeline_type": "interaction",
+        "event_type": "user_correction",
+        "domain": "state",
+        "title": "User corrected stale state",
+        "summary": "That assumption was wrong.",
+        "occurred_at": NOW - timedelta(minutes=10),
+        "observed_at": NOW - timedelta(minutes=10),
+        "valid_from": NOW - timedelta(minutes=10),
+        "valid_until": None,
+        "expires_at": None,
+        "status": "confirmed",
+        "confidence": 0.98,
+        "salience": 0.8,
+        "actor": "user",
+        "subject": "state:angry",
+        "object_refs": [{"targetType": "state", "targetId": "state:angry"}],
+        "source_table": "session_changes",
+        "source_id": "901",
+        "evidence_refs": [{"session_id": "s3", "turn_id": "t9"}],
+        "user_corrected": True,
+        "user_visible": True,
+        "effect": "correct",
+        "metadata": {"command": "thats_wrong"},
+        "created_at": NOW - timedelta(minutes=10),
+        "updated_at": NOW - timedelta(minutes=10),
+    }
+
+
 @pytest.mark.asyncio
 async def test_internal_timeline_endpoint_requires_internal_auth(monkeypatch):
     called: Dict[str, Any] = {}
@@ -154,19 +190,22 @@ async def test_timeline_includes_action_calendar_attention_and_handover_events(m
     db.calendar_rows = [_calendar_item_row()]
     db.outcome_rows = [_attention_outcome_row()]
     db.handover_rows = [_handover_row(created_at=runtime_now - timedelta(hours=2), expires_at=runtime_now + timedelta(hours=12))]
+    db.timeline_event_rows = [_timeline_event_row()]
     monkeypatch.setattr(main_module, "db", db, raising=True)
     monkeypatch.setattr(main_module, "get_settings", lambda: SimpleNamespace(internal_token="test-token"), raising=True)
 
     async with AsyncClient(transport=ASGITransport(app=main_module.app), base_url="http://test") as client:
         response = await client.get(
             "/internal/debug/timeline",
-            params={"tenantId": "default", "userId": "u1", "limit": 10},
+            params={"tenantId": "default", "userId": "u1", "limit": 10, "includeExpired": True},
             headers={"X-Internal-Token": "test-token"},
         )
 
     assert response.status_code == 200
     items = response.json()["items"]
     by_source = {item["source_table"]: item for item in items}
+    assert by_source["timeline_events"]["event_type"] == "user_correction"
+    assert by_source["timeline_events"]["timeline_type"] == "interaction"
     assert by_source["action_items"]["event_type"] == "obligation_item"
     assert by_source["action_items"]["domain"] == "obligations"
     assert by_source["calendar_items"]["event_type"] == "calendar_event"
@@ -256,6 +295,25 @@ async def test_filtering_by_domain_works():
     assert len(out["items"]) == 1
     assert out["items"][0]["source_table"] == "calendar_items"
     assert out["items"][0]["domain"] == "events"
+
+
+@pytest.mark.asyncio
+async def test_filtering_by_timeline_type_works():
+    db = FakeDB()
+    db.timeline_event_rows = [_timeline_event_row()]
+    db.calendar_rows = [_calendar_item_row()]
+
+    out = await build_timeline_read_model(
+        db,
+        tenant_id="default",
+        user_id="u1",
+        timeline_type="interaction",
+        as_of=NOW,
+    )
+
+    assert len(out["items"]) == 1
+    assert out["items"][0]["source_table"] == "timeline_events"
+    assert out["metadata"]["byTimelineType"]["interaction"] == 1
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,7 @@
 # Synapse Daily Overview MVP
 
 **Status:** Internal / Debug / Read-Only  
-**Date:** 2026-05-19
+**Date:** 2026-05-20
 
 ## 1. What Daily Overview is
 
@@ -61,6 +61,7 @@ Top-level response sections:
 - `worthAttention`
 - `recentContinuity`
 - `recentTimelineSignals`
+- `stateDecay`
 - `suggestedFocus`
 - `metadata`
 
@@ -73,6 +74,7 @@ Daily Overview deliberately avoids:
 - treating cancelled, archived, dismissed, or done items as active
 - turning handover packets into durable identity memory
 - over-personalising from volatile living context
+- presenting stale emotional state as if it is current
 - hiding evidence gaps
 - silently promoting smoke/demo/test rows into real user-day context
 
@@ -94,7 +96,19 @@ Daily Overview v1 does not:
 
 The summary fields are deterministic and rule-based.
 
-## 7. Example response
+## 7. State Decay in Daily Overview
+
+Daily Overview now composes `GET /internal/debug/state-decay` logic internally and exposes a `stateDecay` section.
+
+That section is used to:
+
+- expose current vs. provisional vs. stale state notes
+- add suppressions like `Do not present stale emotional state as current.`
+- keep stale emotional context out of `suggestedFocus.primary_focus`
+
+If stale state exists, it should appear in warnings and suppressions, not as the main framing for the day.
+
+## 8. Example response
 
 ```json
 {
@@ -164,7 +178,7 @@ The summary fields are deterministic and rule-based.
 }
 ```
 
-## 8. How this will be used later
+## 9. How this will be used later
 
 This read model is intended to become the internal basis for:
 
@@ -176,10 +190,11 @@ This read model is intended to become the internal basis for:
 
 Those future surfaces should consume this read model or a close successor rather than re-deriving day context from scratch.
 
-## 9. Known gaps
+## 10. Known gaps
 
 - task prioritisation is still shallow and source-dependent
 - timeline freshness remains heuristic, not canonical truth
+- state decay is heuristic and conservative, not a full memory management system
 - some rows still lack strong `evidence_refs`
 - duplicate concepts across sections are not deeply deduplicated yet
 - companion policy is still static/profile-based, not full runtime policy objects

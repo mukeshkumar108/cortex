@@ -29,6 +29,7 @@ class FakeDB:
         self.session_change_rows: List[Dict[str, Any]] = []
         self.action_update_rows: List[Dict[str, Any]] = []
         self.relationship_rows: List[Dict[str, Any]] = []
+        self.timeline_event_rows: List[Dict[str, Any]] = []
 
     async def fetchone(self, query: str, *args):
         if "FROM identity_cache" in query:
@@ -48,6 +49,8 @@ class FakeDB:
     async def fetch(self, query: str, *args):
         if "FROM actionable_candidates" in query:
             return self.actionable_rows
+        if "FROM timeline_events" in query:
+            return self.timeline_event_rows
         if "FROM follow_up_candidates" in query:
             return self.follow_up_rows
         if "FROM clarification_candidates" in query:
@@ -260,6 +263,39 @@ def _session_change_row(*, title: str, effective_iso: datetime, updated_at: date
     }
 
 
+def _timeline_state_event(*, title: str, summary: str, occurred_at: datetime, status: str = "active") -> Dict[str, Any]:
+    return {
+        "event_id": "evt-state-1",
+        "tenant_id": "default",
+        "user_id": "u1",
+        "timeline_type": "interaction",
+        "event_type": "state_signal",
+        "domain": "state",
+        "title": title,
+        "summary": summary,
+        "occurred_at": occurred_at,
+        "observed_at": occurred_at,
+        "valid_from": occurred_at,
+        "valid_until": None,
+        "expires_at": None,
+        "status": status,
+        "confidence": 0.75,
+        "salience": 0.5,
+        "actor": "system",
+        "subject": "state:stress",
+        "object_refs": [{"targetType": "state", "targetId": "state:stress"}],
+        "source_table": "session_changes",
+        "source_id": "901",
+        "evidence_refs": [{"session_id": "s-state", "turn_id": "t1"}],
+        "user_corrected": False,
+        "user_visible": True,
+        "effect": None,
+        "metadata": {"single_session": False},
+        "created_at": occurred_at,
+        "updated_at": occurred_at,
+    }
+
+
 @pytest.mark.asyncio
 async def test_endpoint_requires_internal_auth(monkeypatch):
     called: Dict[str, Any] = {}
@@ -318,6 +354,26 @@ async def test_includes_due_today_action_item():
     out = await build_daily_overview(db, tenant_id="default", user_id="u1", date_value="2026-05-19", timezone_name="UTC", as_of=NOW)
 
     assert [item["title"] for item in out["tasksAndObligations"]] == ["Submit report"]
+
+
+@pytest.mark.asyncio
+async def test_daily_overview_includes_state_decay_and_avoids_stale_state_as_primary_focus():
+    db = FakeDB()
+    db.timeline_event_rows = [
+        _timeline_state_event(
+            title="Old stress note",
+            summary="The user was stressed after the meeting.",
+            occurred_at=NOW - timedelta(days=3),
+        )
+    ]
+    db.action_item_rows = [_task_row("Submit report", due_at=NOW + timedelta(hours=2))]
+
+    out = await build_daily_overview(db, tenant_id="default", user_id="u1", date_value="2026-05-19", timezone_name="UTC", as_of=NOW)
+
+    assert "stateDecay" in out
+    assert len(out["stateDecay"]["stale_state_warnings"]) == 1
+    assert out["suggestedFocus"]["primary_focus"] == "fresh_operational_items_only"
+    assert out["stateDecay"]["suppressions"] == ["Do not present stale emotional state as current."]
     assert out["tasksAndObligations"][0]["bucket"] == "due_today"
 
 

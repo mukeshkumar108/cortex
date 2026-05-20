@@ -56,6 +56,9 @@ from .models import (
     AttentionOutcomeResponse,
     TimelineReadModelResponse,
     DailyOverviewResponse,
+    StateDecayResponse,
+    MemoryCorrectionRequest,
+    MemoryCorrectionResponse,
     SessionChangeItem,
     SessionChangesResponse,
     EntityCandidateItem,
@@ -169,6 +172,8 @@ from .google_calendar_import import GoogleCalendarImportError, import_google_cal
 from .attention_preview import build_attention_preview
 from .attention_outcomes import record_attention_outcome
 from .fast_handover import get_latest_fast_handover_packet
+from .memory_corrections import record_memory_correction
+from .state_decay import build_state_decay_report
 from .timeline_read_model import build_timeline_read_model
 from .daily_overview import DailyOverviewError, build_daily_overview
 
@@ -17168,6 +17173,7 @@ async def debug_timeline_read_model(
     includeExpired: bool = False,
     domain: str | None = None,
     sourceTable: str | None = None,
+    timelineType: str | None = None,
     x_internal_token: str | None = Header(default=None),
 ):
     _require_internal_token(x_internal_token)
@@ -17184,6 +17190,7 @@ async def debug_timeline_read_model(
             include_expired=includeExpired,
             domain=domain,
             source_table=sourceTable,
+            timeline_type=timelineType,
         )
         return TimelineReadModelResponse(**payload)
     except HTTPException:
@@ -17191,6 +17198,71 @@ async def debug_timeline_read_model(
     except Exception as e:
         logger.error("Debug timeline read model failed: %s", e)
         raise HTTPException(status_code=500, detail="Debug timeline read model failed")
+
+
+@app.get("/internal/debug/state-decay", response_model=StateDecayResponse)
+async def debug_state_decay(
+    tenantId: str = "default",
+    userId: str | None = None,
+    companionId: str = "sophie",
+    includeHistorical: bool = False,
+    limit: int = 25,
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    if not _normalize_text(userId):
+        raise HTTPException(status_code=400, detail="userId is required")
+    tenant_id = _normalize_text(_canonical_tenant_id(tenantId)) or tenantId
+    try:
+        payload = await build_state_decay_report(
+            db,
+            tenant_id=tenant_id,
+            user_id=_normalize_text(userId),
+            companion_id=companionId,
+            include_historical=includeHistorical,
+            limit=limit,
+        )
+        return StateDecayResponse(**payload)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Debug state decay failed: %s", e)
+        raise HTTPException(status_code=500, detail="Debug state decay failed")
+
+
+@app.post("/internal/debug/memory/correction", response_model=MemoryCorrectionResponse)
+async def debug_memory_correction(
+    request: MemoryCorrectionRequest,
+    x_internal_token: str | None = Header(default=None),
+):
+    _require_internal_token(x_internal_token)
+    tenant_id = _normalize_text(_canonical_tenant_id(request.tenantId)) or request.tenantId
+    user_id = _normalize_text(request.userId)
+    if not user_id:
+        raise HTTPException(status_code=400, detail="userId is required")
+    try:
+        payload = await record_memory_correction(
+            db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            companion_id=request.companionId or "sophie",
+            command=request.command,
+            target_type=request.targetType,
+            target_id=request.targetId,
+            source_table=request.sourceTable,
+            source_id=request.sourceId,
+            note=request.note,
+            evidence_refs=request.evidenceRefs,
+            metadata=request.metadata,
+        )
+        return MemoryCorrectionResponse(**payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Debug memory correction failed: %s", e)
+        raise HTTPException(status_code=500, detail="Debug memory correction failed")
 
 
 @app.get("/internal/debug/daily-overview", response_model=DailyOverviewResponse)

@@ -4,6 +4,8 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import Any, Dict, List, Optional
 
+from .timeline_events import fetch_timeline_event_rows, normalize_timeline_event
+
 
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
@@ -105,6 +107,7 @@ def _event_base(
     source_id: str,
     tenant_id: str,
     user_id: str,
+    timeline_type: str,
     event_type: str,
     domain: str,
     title: str,
@@ -127,6 +130,7 @@ def _event_base(
         "id": f"{source_table}:{source_id}",
         "tenant_id": tenant_id,
         "user_id": user_id,
+        "timeline_type": timeline_type,
         "event_type": event_type,
         "domain": domain,
         "title": _normalize_text(title) or f"{source_table} event",
@@ -164,6 +168,7 @@ def _action_item_event(row: Dict[str, Any], *, as_of: datetime) -> Dict[str, Any
         source_id=_normalize_text(row.get("id")),
         tenant_id=_normalize_text(row.get("tenant_id")),
         user_id=_normalize_text(row.get("user_id")),
+        timeline_type="interaction",
         event_type="obligation_item",
         domain=domain,
         title=_normalize_text(row.get("title")),
@@ -197,6 +202,7 @@ def _action_update_event(row: Dict[str, Any], *, as_of: datetime) -> Dict[str, A
         source_id=_normalize_text(row.get("id")),
         tenant_id=_normalize_text(row.get("tenant_id")),
         user_id=_normalize_text(row.get("user_id")),
+        timeline_type="interaction",
         event_type="obligation_update",
         domain="obligations",
         title=f"Action update: {_normalize_text(row.get('proposed_change')) or 'change'}",
@@ -230,6 +236,7 @@ def _calendar_item_event(row: Dict[str, Any], *, as_of: datetime) -> Dict[str, A
         source_id=_normalize_text(row.get("id")),
         tenant_id=_normalize_text(row.get("tenant_id")),
         user_id=_normalize_text(row.get("user_id")),
+        timeline_type="calendar_event",
         event_type="calendar_event",
         domain="events",
         title=_normalize_text(row.get("title")),
@@ -265,6 +272,7 @@ def _session_change_event(row: Dict[str, Any], *, as_of: datetime) -> Dict[str, 
         source_id=_normalize_text(row.get("change_id")),
         tenant_id=_normalize_text(row.get("tenant_id")),
         user_id=_normalize_text(row.get("user_id")),
+        timeline_type="user_life",
         event_type="session_change",
         domain=domain,
         title=_normalize_text(row.get("title")),
@@ -298,6 +306,7 @@ def _handover_event(row: Dict[str, Any], *, as_of: datetime) -> Dict[str, Any]:
         source_id=_normalize_text(row.get("packet_id")),
         tenant_id=_normalize_text(row.get("tenant_id")),
         user_id=_normalize_text(row.get("user_id")),
+        timeline_type="system",
         event_type="handover",
         domain="handover",
         title="Session handover packet",
@@ -334,6 +343,7 @@ def _attention_outcome_event(row: Dict[str, Any], *, as_of: datetime) -> Dict[st
         source_id=_normalize_text(row.get("outcome_id")),
         tenant_id=_normalize_text(row.get("tenant_id")),
         user_id=_normalize_text(row.get("user_id")),
+        timeline_type="system",
         event_type="attention_feedback",
         domain="attention_feedback",
         title=f"Attention outcome: {_normalize_text(row.get('outcome_type')) or 'unknown'}",
@@ -368,6 +378,7 @@ def _relationship_link_event(row: Dict[str, Any], *, as_of: datetime) -> Dict[st
         source_id=_normalize_text(row.get("link_id")),
         tenant_id=_normalize_text(row.get("tenant_id")),
         user_id=_normalize_text(row.get("user_id")),
+        timeline_type="relationship",
         event_type="relationship_link",
         domain="relationship",
         title=f"{_normalize_text(row.get('relationship_type')) or 'link'}: {_normalize_text(row.get('source_id'))} -> {_normalize_text(row.get('target_id'))}",
@@ -392,6 +403,32 @@ def _relationship_link_event(row: Dict[str, Any], *, as_of: datetime) -> Dict[st
         as_of=as_of,
         reinforced=_ensure_utc(row.get("updated_at")) and _ensure_utc(row.get("created_at")) and _ensure_utc(row.get("updated_at")) > _ensure_utc(row.get("created_at")),
     )
+    return event
+
+
+def _timeline_event_item(row: Dict[str, Any], *, as_of: datetime) -> Dict[str, Any]:
+    event = normalize_timeline_event(row)
+    occurred_at = _ensure_utc(row.get("occurred_at"))
+    observed_at = _ensure_utc(row.get("observed_at"))
+    created_at = _ensure_utc(row.get("created_at"))
+    updated_at = _ensure_utc(row.get("updated_at"))
+    expires_at = _ensure_utc(row.get("expires_at"))
+    event["freshness"] = _derive_freshness(
+        status=_normalize_text(event.get("status")) or "active",
+        occurred_at=occurred_at or observed_at,
+        first_seen_at=created_at or observed_at,
+        last_seen_at=updated_at or observed_at or created_at,
+        expires_at=expires_at,
+        as_of=as_of,
+        reinforced=bool(updated_at and created_at and updated_at > created_at),
+    )
+    if not event["timeline_type"]:
+        event["gaps"].append("timeline_type_unknown")
+        event["missing_metadata"].append("timeline_type")
+    if not event["evidence_refs"]:
+        event["gaps"].append("evidence_refs_unknown")
+        if "evidence_refs" not in event["missing_metadata"]:
+            event["missing_metadata"].append("evidence_refs")
     return event
 
 
@@ -524,15 +561,19 @@ def _apply_filters(
     include_expired: bool,
     domain: Optional[str],
     source_table: Optional[str],
+    timeline_type: Optional[str],
     as_of: datetime,
 ) -> List[Dict[str, Any]]:
     normalized_domain = _normalize_text(domain).lower()
     normalized_source_table = _normalize_text(source_table).lower()
+    normalized_timeline_type = _normalize_text(timeline_type).lower()
     filtered: List[Dict[str, Any]] = []
     for event in events:
         if normalized_domain and _normalize_text(event.get("domain")).lower() != normalized_domain:
             continue
         if normalized_source_table and _normalize_text(event.get("source_table")).lower() != normalized_source_table:
+            continue
+        if normalized_timeline_type and _normalize_text(event.get("timeline_type")).lower() != normalized_timeline_type:
             continue
         if not include_expired and _is_expired_event(event, as_of=as_of):
             continue
@@ -560,6 +601,7 @@ def _build_metadata(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     by_source = Counter(_normalize_text(item.get("source_table")) for item in events if _normalize_text(item.get("source_table")))
     by_domain = Counter(_normalize_text(item.get("domain")) for item in events if _normalize_text(item.get("domain")))
     by_freshness = Counter(_normalize_text(item.get("freshness")) for item in events if _normalize_text(item.get("freshness")))
+    by_timeline_type = Counter(_normalize_text(item.get("timeline_type")) for item in events if _normalize_text(item.get("timeline_type")))
     occurred_times = [
         _ensure_utc(item.get("occurred_at"))
         for item in events
@@ -572,6 +614,7 @@ def _build_metadata(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         "bySourceTable": dict(by_source),
         "byDomain": dict(by_domain),
         "byFreshness": dict(by_freshness),
+        "byTimelineType": dict(by_timeline_type),
         "oldestOccurredAt": oldest,
         "newestOccurredAt": newest,
         "readOnly": True,
@@ -588,6 +631,7 @@ async def build_timeline_read_model(
     include_expired: bool = False,
     domain: Optional[str] = None,
     source_table: Optional[str] = None,
+    timeline_type: Optional[str] = None,
     as_of: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     safe_limit = max(1, min(int(limit or DEFAULT_LIMIT), MAX_LIMIT))
@@ -602,14 +646,19 @@ async def build_timeline_read_model(
     handovers = [_handover_event(row, as_of=effective_as_of) for row in await _fetch_handover_packets(db, tenant_id, user_id)]
     outcomes = [_attention_outcome_event(row, as_of=effective_as_of) for row in await _fetch_attention_outcomes(db, tenant_id, user_id)]
     relationship_links = [_relationship_link_event(row, as_of=effective_as_of) for row in await _fetch_relationship_links(db, tenant_id, user_id)]
+    timeline_events = [
+        _timeline_event_item(row, as_of=effective_as_of)
+        for row in await fetch_timeline_event_rows(db, tenant_id=tenant_id, user_id=user_id)
+    ]
 
-    all_events = action_items + action_updates + calendar_items + session_changes + handovers + outcomes + relationship_links
+    all_events = timeline_events + action_items + action_updates + calendar_items + session_changes + handovers + outcomes + relationship_links
     filtered = _apply_filters(
         all_events,
         since=since,
         include_expired=include_expired,
         domain=domain,
         source_table=source_table,
+        timeline_type=timeline_type,
         as_of=effective_as_of,
     )
     sorted_events = _sort_events(filtered)[:safe_limit]

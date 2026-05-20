@@ -23,6 +23,7 @@ class FakeDB:
         self.calendar_rows: List[Dict[str, Any]] = []
         self.living_context_row: Dict[str, Any] | None = None
         self.outcome_rows: List[Dict[str, Any]] = []
+        self.timeline_event_rows: List[Dict[str, Any]] = []
 
     async def fetchone(self, query: str, *args):
         if "FROM living_context" in query:
@@ -65,6 +66,8 @@ class FakeDB:
             return self.calendar_rows
         if "FROM attention_outcomes" in query:
             return self.outcome_rows
+        if "FROM timeline_events" in query:
+            return self.timeline_event_rows
         return []
 
 
@@ -149,6 +152,42 @@ def _expired_smoke_row() -> Dict[str, Any]:
         "confidence": 0.5,
         "created_at": NOW - timedelta(days=14),
         "updated_at": NOW - timedelta(days=10),
+    }
+
+
+def _suppression_timeline_event_row() -> Dict[str, Any]:
+    return {
+        "event_id": "evt-1",
+        "tenant_id": "default",
+        "user_id": "u1",
+        "timeline_type": "interaction",
+        "event_type": "user_dont_bring_up_again",
+        "domain": "state",
+        "title": "User asked not to bring this up again",
+        "summary": "Stop surfacing this follow-up.",
+        "occurred_at": NOW - timedelta(minutes=10),
+        "observed_at": NOW - timedelta(minutes=10),
+        "valid_from": NOW - timedelta(minutes=10),
+        "valid_until": None,
+        "expires_at": None,
+        "status": "active",
+        "confidence": 1.0,
+        "salience": 0.9,
+        "actor": "user",
+        "subject": "11",
+        "object_refs": [
+            {"targetType": "attention_item", "targetId": "11"},
+            {"sourceTable": "follow_up_candidates", "sourceId": "11"},
+        ],
+        "source_table": "follow_up_candidates",
+        "source_id": "11",
+        "evidence_refs": [{"session_id": "s1", "turn_id": "t9"}],
+        "user_corrected": True,
+        "user_visible": True,
+        "effect": "suppress_related",
+        "metadata": {"command": "dont_bring_that_up_again", "targetId": "11"},
+        "created_at": NOW - timedelta(minutes=10),
+        "updated_at": NOW - timedelta(minutes=10),
     }
 
 
@@ -301,6 +340,27 @@ async def test_ranking_prefers_useful_items_before_expired_and_then_priority():
         "Lower priority follow-up",
         "Ancient smoke reminder",
     ]
+
+
+@pytest.mark.asyncio
+async def test_timeline_correction_suppresses_matching_attention_item():
+    db = FakeDB()
+    db.follow_up_rows = [_ashley_unwell_follow_up_row()]
+    db.timeline_event_rows = [_suppression_timeline_event_row()]
+
+    hidden = await build_attention_preview(db, tenant_id="default", user_id="u1", companion_id="sophie", as_of=NOW)
+    visible = await build_attention_preview(
+        db,
+        tenant_id="default",
+        user_id="u1",
+        companion_id="sophie",
+        include_suppressed=True,
+        as_of=NOW,
+    )
+
+    assert hidden["items"] == []
+    assert visible["items"][0]["status"] == "suppressed"
+    assert visible["metadata"]["timelineCorrectionSuppressedCount"] == 1
 
 
 @pytest.mark.asyncio

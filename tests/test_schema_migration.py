@@ -198,6 +198,44 @@ async def test_schema_migration():
             """
         )
         assert attention_outcome_item_idx == "idx_attention_outcomes_user_item_occurred"
+
+        timeline_events_table = await conn.fetchval("SELECT to_regclass('public.timeline_events')")
+        assert timeline_events_table == "timeline_events"
+
+        timeline_event_cols = await conn.fetch(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'timeline_events'
+            """
+        )
+        timeline_event_col_names = {row["column_name"] for row in timeline_event_cols}
+        assert {
+            "tenant_id",
+            "user_id",
+            "timeline_type",
+            "event_type",
+            "domain",
+            "occurred_at",
+            "observed_at",
+            "status",
+            "object_refs",
+            "evidence_refs",
+            "user_corrected",
+            "effect",
+            "metadata",
+        }.issubset(timeline_event_col_names)
+
+        timeline_event_type_idx = await conn.fetchval(
+            """
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = 'timeline_events'
+              AND indexname = 'idx_timeline_events_user_type_occurred'
+            """
+        )
+        assert timeline_event_type_idx == "idx_timeline_events_user_type_occurred"
     finally:
         await conn.close()
 

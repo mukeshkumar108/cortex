@@ -1,7 +1,7 @@
 # Synapse Baseline Memory and Pipeline
 
 **Status:** Current Architecture  
-**Date:** 2026-05-19
+**Date:** 2026-05-20
 
 ---
 
@@ -102,6 +102,7 @@ The pipeline is highly deterministic in its routing (checking DB states before c
 | **Primary Objects** | `action_items`, `calendar_items`, `entity_profiles`, `open_threads`, `durable_profile_facts` |
 | **Candidates** | `actionable_candidates`, `follow_up_candidates`, `clarification_candidates` |
 | **Snapshots** | `living_context`, `identity_profile`, `always_on_memory_packets` |
+| **Canonical Events** | `timeline_events`, `attention_outcomes`, `session_handover_packets` |
 | **Links** | `memory_relationship_links` (Phase 1 implemented: supports domains, status, temporal validity) |
 | **Caches** | `identity_cache`, `episodic_memory_embeddings` |
 | **Legacy** | `loops`, `user_model`, `graphiti_outbox` |
@@ -162,15 +163,18 @@ Current limitations:
 | `/signals/pack` | Compact proactive steering hints. | Active. |
 | `/memory/query` | Targeted recall (factual, episodic). | Active. |
 | `/internal/debug/attention` | Read-only dynamic queue of Attention Items. | **Active (v1).** Filters by Companion Profile, hides expired items, supports `includeExpired=true`. |
-| `/internal/debug/timeline` | Read-only normalized recent memory timeline across existing tables. | **Active (v1).** Internal/debug only; exposes freshness, first/last seen timing, expiry, and source-table provenance for state decay inspection. |
-| `/internal/debug/daily-overview` | Read-only day-shaped overview composed from schedule, obligations, attention, handover, and timeline. | **Active (MVP).** Internal/debug only; intended as the future basis for morning brief, daily planning, reminders, and proactive nudges. |
+| `/internal/debug/timeline` | Read-only normalized recent memory timeline across canonical and existing tables. | **Active (v1).** Internal/debug only; now includes canonical `timeline_events`, freshness, `timelineType`, expiry, and source provenance for trust-layer inspection. |
+| `/internal/debug/state-decay` | Read-only state freshness classifier for stale/current/provisional/historical context. | **Active (v1).** Internal/debug only; explicit suppression layer for stale emotional state. |
+| `/internal/debug/daily-overview` | Read-only day-shaped overview composed from schedule, obligations, attention, handover, timeline, and state decay. | **Active (MVP).** Internal/debug only; intended as the future basis for morning brief, daily planning, reminders, and proactive nudges. |
+| `/internal/debug/memory/correction` | Internal correction write path for user memory overrides. | **Active (v1).** Writes canonical `timeline_events` and bounded side effects only. |
 | `/actions/items` | Mutations on actionable objects. | Active. |
 | `/user/model` | Synthesized durable user profile. | Legacy. Being replaced by Identity/Profile passes. |
 
 ## 12. What is still missing
 
 *   **Outcome Feedback:** A lightweight internal attention outcome loop now exists for debug/preview filtering, but it is not full memory management or upstream object mutation yet.
-*   **Timeline Is Still a Read Model:** `/internal/debug/timeline` now exposes recent memory rows with freshness heuristics, but it does not yet mutate upstream objects or provide a canonical decay engine by itself.
+*   **Timeline Is Still a Read Model:** `/internal/debug/timeline` now exposes recent memory rows plus canonical `timeline_events`, but broad semantic propagation from corrections is still intentionally conservative.
+*   **Trust Layer Is Bounded:** user correction now takes precedence through canonical timeline events and read-model suppression, but `forget_that` does not physically delete legacy memory rows yet.
 *   **Candidate Fragmentation:** `actionable_candidates`, `follow_up_candidates`, etc., still exist as separate tables rather than being unified into primary objects with `status='detected'`.
 *   **Missing Metadata:** Some primary objects still lack `primary_domain` enforcement.
 *   **Evidence Refs in Attention Preview:** While `source_object_ids` and `source_link_ids` are mapped best-effort, exact turn-level `evidence_refs` are sometimes lost in the candidate abstraction layer.

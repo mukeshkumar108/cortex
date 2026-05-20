@@ -574,6 +574,7 @@ class TimelineEventItem(BaseModel):
     id: str
     tenant_id: str
     user_id: str
+    timeline_type: Optional[str] = None
     event_type: str
     domain: str
     title: str
@@ -593,6 +594,13 @@ class TimelineEventItem(BaseModel):
     freshness: str
     gaps: List[str] = []
     missing_metadata: List[str] = []
+    actor: Optional[str] = None
+    subject: Optional[str] = None
+    object_refs: List[Dict[str, Any]] = []
+    user_corrected: bool = False
+    user_visible: bool = True
+    effect: Optional[str] = None
+    metadata: Dict[str, Any] = {}
 
 
 class TimelineReadModelResponse(BaseModel):
@@ -618,8 +626,49 @@ class DailyOverviewResponse(BaseModel):
     worthAttention: List[Dict[str, Any]] = []
     recentContinuity: Optional[Dict[str, Any]] = None
     recentTimelineSignals: Dict[str, Any] = {}
+    stateDecay: Dict[str, Any] = {}
     suggestedFocus: Dict[str, Any] = {}
     metadata: Dict[str, Any] = {}
+
+
+class StateDecayResponse(BaseModel):
+    tenantId: str
+    userId: str
+    companionId: str
+    asOf: str
+    current_state_notes: List[Dict[str, Any]] = []
+    provisional_state_notes: List[Dict[str, Any]] = []
+    stale_state_warnings: List[Dict[str, Any]] = []
+    historical_state_notes: List[Dict[str, Any]] = []
+    suppressions: List[str] = []
+    tone_modifiers: List[str] = []
+    unsafe_to_surface: List[Dict[str, Any]] = []
+    evidence_refs: List[Dict[str, Any]] = []
+    gaps: List[str] = []
+    freshness: Dict[str, Any] = {}
+    confidence: Optional[float] = None
+    readOnly: bool = True
+
+
+class MemoryCorrectionRequest(BaseModel):
+    tenantId: str
+    userId: str
+    companionId: Optional[str] = None
+    command: str
+    targetType: Optional[str] = None
+    targetId: Optional[str] = None
+    sourceTable: Optional[str] = None
+    sourceId: Optional[str] = None
+    note: Optional[str] = None
+    evidenceRefs: Optional[List[Dict[str, Any]]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class MemoryCorrectionResponse(BaseModel):
+    recorded: Dict[str, Any]
+    applied_side_effects: List[Dict[str, Any]] = []
+    gaps: List[str] = []
+    readOnly: bool = False
 
 
 class SessionChangeItem(BaseModel):

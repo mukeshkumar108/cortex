@@ -1,7 +1,7 @@
 # Synapse Timeline Read Model
 
 **Status:** Internal / Debug / Read-Only  
-**Date:** 2026-05-19
+**Date:** 2026-05-20
 
 ---
 
@@ -61,7 +61,12 @@ Timeline points at evidence where available, but it does not replace the evidenc
 
 ## 4. Current source tables
 
-The initial implementation pulls timeline events from these existing tables:
+The read model now pulls timeline events from:
+
+- canonical `timeline_events`
+- existing domain tables below
+
+Existing domain sources:
 
 - `action_items`
 - `action_updates`
@@ -70,6 +75,13 @@ The initial implementation pulls timeline events from these existing tables:
 - `session_handover_packets`
 - `attention_outcomes`
 - `memory_relationship_links`
+
+`timeline_events` is the new canonical write path for:
+
+- user corrections
+- user suppressions
+- state decay/suppression markers
+- lightweight system-level timeline events
 
 Initial domain mapping:
 
@@ -100,6 +112,7 @@ Query params:
 - `includeExpired` optional, default `false`
 - `domain` optional
 - `sourceTable` optional
+- `timelineType` optional
 
 ### Response
 
@@ -134,6 +147,7 @@ It also returns summary metadata:
 - `bySourceTable`
 - `byDomain`
 - `byFreshness`
+- `byTimelineType`
 - `oldestOccurredAt`
 - `newestOccurredAt`
 - `readOnly=true`
@@ -179,6 +193,8 @@ That makes it much easier to tell the difference between:
 
 This is especially important for Sophie-style companions, where emotional or situational context should decay unless it keeps being reinforced.
 
+Trust Layer V1 now makes user corrections visible here as first-class timeline rows, so stale inferred memory can be inspected alongside the correction that overrode it.
+
 ---
 
 ## 8. Why this helps daily overview
@@ -205,6 +221,7 @@ The current `GET /internal/debug/daily-overview` MVP now uses timeline as one of
 - It does not replace `/session/startbrief`.
 - It does not change serving behavior on its own.
 - It only covers a subset of existing tables.
+- `timeline_events` exists now as the canonical event substrate, but semantic propagation from correction events is still conservative.
 - Freshness is heuristic, not canonical truth.
 - Some older tables do not expose enough timestamps or evidence to avoid `gaps` and `missing_metadata`.
 - It does not yet perform cross-table deduplication of conceptually similar events.

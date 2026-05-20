@@ -10,6 +10,7 @@ from fastapi import HTTPException
 
 from .attention_preview import build_attention_preview
 from .fast_handover import get_latest_fast_handover_packet
+from .state_decay import build_state_decay_report
 from .timeline_read_model import _derive_freshness, _ensure_utc, _normalize_text
 from .timeline_read_model import build_timeline_read_model
 
@@ -428,12 +429,13 @@ def _build_recent_timeline_section(payload: Dict[str, Any]) -> Dict[str, Any]:
     selected: List[Dict[str, Any]] = []
     for item in items:
         source_table = _normalize_text(item.get("source_table")).lower()
-        if source_table in {"attention_outcomes", "action_updates", "session_changes", "calendar_items", "action_items"}:
+        if source_table in {"attention_outcomes", "action_updates", "session_changes", "calendar_items", "action_items", "timeline_events"}:
             selected.append(
                 {
                     "title": _normalize_text(item.get("title")),
                     "event_type": _normalize_text(item.get("event_type")),
                     "domain": _normalize_text(item.get("domain")),
+                    "timeline_type": _normalize_text(item.get("timeline_type")),
                     "source_table": source_table,
                     "source_id": _normalize_text(item.get("source_id")),
                     "occurred_at": item.get("occurred_at"),
@@ -462,14 +464,12 @@ def _build_suggested_focus(
     attention_items: List[Dict[str, Any]],
     handover: Optional[Dict[str, Any]],
     timeline_section: Dict[str, Any],
+    state_decay: Dict[str, Any],
 ) -> Dict[str, Any]:
     active_tasks = [item for item in task_items if item.get("bucket") in {"due_today", "overdue"} and not item.get("diagnostic_noise")]
     overdue_tasks = [item for item in active_tasks if item.get("action_hint") == "overdue_active"]
     upcoming_events = [item for item in schedule_items if item.get("time_status") in {"upcoming", "current"} and not item.get("diagnostic_noise")]
-    stale_state_signals = [
-        item for item in timeline_section.get("items") or []
-        if item.get("domain") == "state" and item.get("freshness") in {"stale", "historical", "expired"}
-    ]
+    stale_state_signals = list(state_decay.get("stale_state_warnings") or [])
     if not active_tasks and not upcoming_events and not attention_items:
         reason = "No active items found; avoid inventing a brief."
         return {
@@ -645,6 +645,24 @@ async def build_daily_overview(
             include_expired,
         )
         raise
+    try:
+        state_decay = await build_state_decay_report(
+            db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            companion_id=companion_id,
+            include_historical=include_expired,
+            limit=min(12, safe_limit),
+            as_of=now_utc,
+        )
+    except Exception:
+        logger.exception(
+            "daily_overview.state_decay_query_failed tenant_id=%s user_id=%s include_expired=%s",
+            tenant_id,
+            user_id,
+            include_expired,
+        )
+        raise
 
     schedule_items, schedule_meta = _build_schedule_section(
         schedule_rows,
@@ -677,6 +695,7 @@ async def build_daily_overview(
         attention_meta.get("gaps") or [],
         handover_gaps,
         timeline_section.get("gaps") or [],
+        state_decay.get("gaps") or [],
     ):
         top_level_gaps.extend(group)
 
@@ -697,21 +716,25 @@ async def build_daily_overview(
         attention_items=attention_items,
         handover=handover,
         timeline_section=timeline_section,
+        state_decay=state_decay,
     )
     section_counts = {
         "schedule": len(schedule_items),
         "tasks": len(task_items),
         "worthAttention": len(attention_items),
         "recentTimelineSignals": len(timeline_section.get("items") or []),
+        "stateDecayCurrent": len(state_decay.get("current_state_notes") or []),
+        "stateDecayStale": len(state_decay.get("stale_state_warnings") or []),
         "handover": 1 if handover else 0,
     }
     metadata = {
         "counts": section_counts,
         "sourceTablesUsed": source_tables_used,
-        "staleCount": int(task_meta.get("staleCount") or 0) + int(timeline_section.get("staleCount") or 0),
+        "staleCount": int(task_meta.get("staleCount") or 0) + int(timeline_section.get("staleCount") or 0) + len(state_decay.get("stale_state_warnings") or []),
         "expiredCount": int(schedule_meta.get("expiredCount") or 0) + int(task_meta.get("expiredCount") or 0) + int(attention_meta.get("expiredCount") or 0) + int(timeline_section.get("expiredCount") or 0),
         "suppressedCount": int(attention_meta.get("suppressedCount") or 0),
         "diagnosticNoiseCount": int(schedule_meta.get("diagnosticNoiseCount") or 0) + int(task_meta.get("diagnosticNoiseCount") or 0),
+        "stateDecaySuppressions": list(state_decay.get("suppressions") or []),
         "gaps": top_level_gaps,
         "readOnly": True,
     }
@@ -737,6 +760,7 @@ async def build_daily_overview(
         "worthAttention": attention_items,
         "recentContinuity": handover,
         "recentTimelineSignals": timeline_section,
+        "stateDecay": state_decay,
         "suggestedFocus": suggested_focus,
         "metadata": metadata,
     }
